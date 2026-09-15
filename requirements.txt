@@ -1,0 +1,22 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.9.0
+pydantic-settings>=2.6.0
+httpx>=0.27.0
+python-dotenv>=1.0.1
+# openai 1.55.0 is incompatible with httpx>=0.28 (passes a removed `proxies`
+# kwarg). 3.13.0 is verified working with the httpx version above.
+openai>=3.13.0
+
+# Database (Part 2: persistent memory)
+sqlalchemy>=2.0.30
+asyncpg>=0.29
+alembic>=1.13
+pgvector>=0.3.0
+
+# Identity (Part 3: Ed25519 signing + AES-GCM key encryption)
+cryptography>=42.0
+
+# Testing
+pytest>=8.3.0
+pytest-asyncio>=0.24.0
