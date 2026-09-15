@@ -111,12 +111,23 @@ def get_autonomy_service(request: Request):
     return service
 
 
+def get_orchestrator(request: Request):
+    """Return the process-wide agent orchestrator (Part 12)."""
+    service = getattr(request.app.state, "orchestrator", None)
+    if service is None:
+        raise HTTPDependencyError(
+            "Orchestrator service is not configured (database + A2A required)."
+        )
+    return service
+
+
 __all__ = [
     "get_a2a_service",
     "get_agent",
     "get_autonomy_service",
     "get_discovery_service",
     "get_identity_service",
+    "get_orchestrator",
     "get_policy_service",
     "get_tool_service",
     "get_workflow_service",

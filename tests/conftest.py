@@ -404,6 +404,47 @@ async def db_autonomy_client(
         yield async_client
 
 
+@pytest.fixture
+def db_orchestration_app(
+    db_autonomy_app: FastAPI,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> FastAPI:
+    """DB app with orchestration service attached (Part 12 routes)."""
+    from app.orchestration.intent import IntentResolver
+    from app.orchestration.orchestrator import AgentOrchestrator
+    from app.orchestration.target_resolver import TargetResolver
+
+    intent_resolver = IntentResolver(llm_provider=db_autonomy_app.state.agent._provider)
+    target_resolver = TargetResolver(
+        session_factory=db_session_factory,
+        trusted_agents=db_autonomy_app.state.a2a_service._trusted,
+        discovery_service=getattr(db_autonomy_app.state, "discovery_service", None),
+        memory_manager=db_autonomy_app.state.agent._memory,
+    )
+    decision_engine = getattr(db_autonomy_app.state.autonomy_service, "_engine", None)
+    orchestrator = AgentOrchestrator(
+        session_factory=db_session_factory,
+        a2a_service=db_autonomy_app.state.a2a_service,
+        policy_service=db_autonomy_app.state.policy_service,
+        intent_resolver=intent_resolver,
+        target_resolver=target_resolver,
+        decision_engine=decision_engine,
+    )
+    db_autonomy_app.state.orchestrator = orchestrator
+    return db_autonomy_app
+
+
+@pytest_asyncio.fixture
+async def db_orchestration_client(
+    db_orchestration_app: FastAPI,
+) -> AsyncIterator[httpx.AsyncClient]:
+    transport = httpx.ASGITransport(app=db_orchestration_app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test"
+    ) as async_client:
+        yield async_client
+
+
 __all__ = [
     "FakeProvider",
     "LLMConfigurationError",

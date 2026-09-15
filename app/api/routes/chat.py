@@ -162,9 +162,38 @@ async def clear_session(
     },
 )
 async def chat(
+    request: Request,
     payload: ChatRequest,
     agent: NexusAgent = Depends(get_agent),
 ) -> ChatResponse:
+    # Ensure the session exists first
+    try:
+        await agent.get_session(payload.session_id)
+    except SessionNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+
+    # Check if this is a natural language agent orchestration request (Part 12)
+    orchestrator = getattr(request.app.state, "orchestrator", None)
+    if orchestrator is not None:
+        try:
+            owner_id = await agent._owner_id()
+            orch_res = await orchestrator.handle_user_message(
+                owner_id=owner_id,
+                session_id=payload.session_id,
+                message=payload.message,
+            )
+            if orch_res is not None:
+                # Orchestrator handled it; record in session history and return response
+                await agent._sessions.add_message(payload.session_id, "user", payload.message)
+                await agent._sessions.add_message(payload.session_id, "assistant", orch_res.message)
+                agent._schedule_extraction(payload.session_id, payload.message, orch_res.message)
+                return ChatResponse(session_id=payload.session_id, response=orch_res.message)
+        except Exception as exc:
+            logger.warning("orchestrator_execution_error: %s", exc, exc_info=True)
+
     try:
         reply = await agent.process_message(payload.session_id, payload.message)
     except SessionNotFoundError as exc:

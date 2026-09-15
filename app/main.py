@@ -42,6 +42,7 @@ from app.api.routes.tasks import router as tasks_router
 from app.api.routes.tools import router as tools_router
 from app.api.routes.workflows import router as workflows_router
 from app.api.routes.autonomy import router as autonomy_router
+from app.api.routes.orchestration import router as orchestration_router
 from app.a2a.rate_limit import SlidingWindowRateLimiter
 from app.a2a.service import A2AService
 from app.a2a.transport import HttpA2ATransport
@@ -336,9 +337,35 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.autonomy_service = autonomy_service
     app.state.autonomy_ok = autonomy_service is not None
 
+    # --- Orchestration (Part 12) ---------------------------------------------
+    from app.orchestration.intent import IntentResolver
+    from app.orchestration.target_resolver import TargetResolver
+    from app.orchestration.orchestrator import AgentOrchestrator
+
+    orchestrator: AgentOrchestrator | None = None
+    if session_factory is not None and a2a_service is not None and policy_service is not None:
+        intent_resolver = IntentResolver(llm_provider=app.state.agent._provider)
+        target_resolver = TargetResolver(
+            session_factory=session_factory,
+            trusted_agents=a2a_service._trusted,
+            discovery_service=discovery_service,
+            memory_manager=app.state.agent._memory,
+        )
+        decision_engine = autonomy_service._engine if autonomy_service is not None else None
+        orchestrator = AgentOrchestrator(
+            session_factory=session_factory,
+            a2a_service=a2a_service,
+            policy_service=policy_service,
+            intent_resolver=intent_resolver,
+            target_resolver=target_resolver,
+            decision_engine=decision_engine,
+        )
+    app.state.orchestrator = orchestrator
+    app.state.orchestration_ok = orchestrator is not None
+
     logger.info(
         "nexus_started env=%s provider=%s model=%s base_url=%s llm_configured=%s "
-        "database=%s memory=%s embedding=%s identity=%s tools=%s a2a=%s discovery=%s workflows=%s autonomy=%s",
+        "database=%s memory=%s embedding=%s identity=%s tools=%s a2a=%s discovery=%s workflows=%s autonomy=%s orchestration=%s",
         settings.nexus_env,
         app.state.agent.provider_name,
         settings.llm_model,
@@ -353,6 +380,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "ready" if app.state.discovery_ok else "unavailable",
         "ready" if app.state.workflows_ok else "unavailable",
         "ready" if app.state.autonomy_ok else "unavailable",
+        "ready" if app.state.orchestration_ok else "unavailable",
     )
     if not settings.llm_configured:
         logger.warning(
@@ -407,6 +435,7 @@ def create_app() -> FastAPI:
     app.include_router(tasks_router)
     app.include_router(workflows_router)
     app.include_router(autonomy_router)
+    app.include_router(orchestration_router)
 
     @app.exception_handler(HTTPDependencyError)
     async def _dependency_handler(
