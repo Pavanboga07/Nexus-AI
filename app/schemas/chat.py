@@ -21,6 +21,7 @@ class HealthResponse(BaseModel):
     tools: bool = False
     a2a: bool = False
     autonomy: bool = False
+    gateway: bool = False
 
 
 class SessionCreateResponse(BaseModel):

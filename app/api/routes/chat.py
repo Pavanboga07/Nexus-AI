@@ -60,6 +60,7 @@ async def health(
     tools_ok: bool = getattr(request.app.state, "tools_ok", False)
     a2a_ok: bool = getattr(request.app.state, "a2a_ok", False)
     autonomy_ok: bool = getattr(request.app.state, "autonomy_ok", False)
+    gateway_ok: bool = getattr(request.app.state, "gateway_ok", False)
     return HealthResponse(
         status="ok",
         version=__version__,
@@ -72,6 +73,7 @@ async def health(
         tools=tools_ok,
         a2a=a2a_ok,
         autonomy=autonomy_ok,
+        gateway=gateway_ok,
     )
 
 

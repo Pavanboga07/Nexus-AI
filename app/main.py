@@ -226,16 +226,43 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         and identity_service.ready
         and policy_service is not None
     ):
+        http_transport = HttpA2ATransport(
+            timeout_seconds=settings.nexus_a2a_timeout_seconds,
+            max_response_bytes=settings.nexus_a2a_max_message_bytes,
+            allow_local=settings.nexus_a2a_allow_local_endpoints,
+        )
+
+        gateway_client = None
+        transport: A2ATransport = http_transport
+
+        if settings.nexus_gateway_url:
+            from app.a2a.gateway_client import GatewayA2ATransport, GatewayClient
+
+            async def _handle_gateway_inbound(envelope):
+                if a2a_service is not None and owner_id is not None:
+                    return await a2a_service.handle_inbound(owner_id, envelope)
+                return None
+
+            gateway_client = GatewayClient(
+                gateway_url=settings.nexus_gateway_url,
+                identity_service=identity_service,
+                owner_id=owner_id,
+                inbound_handler=_handle_gateway_inbound,
+            )
+            transport = GatewayA2ATransport(
+                http_transport=http_transport,
+                gateway_client=gateway_client,
+            )
+            app.state.gateway_client = gateway_client
+            await gateway_client.start()
+            logger.info("gateway_relay_active url=%s", settings.nexus_gateway_url)
+
         a2a_service = A2AService(
             session_factory=session_factory,
             identity_service=identity_service,
             policy_service=policy_service,
             memory_manager=app.state.agent._memory,
-            transport=HttpA2ATransport(
-                timeout_seconds=settings.nexus_a2a_timeout_seconds,
-                max_response_bytes=settings.nexus_a2a_max_message_bytes,
-                allow_local=settings.nexus_a2a_allow_local_endpoints,
-            ),
+            transport=transport,
             rate_limiter=SlidingWindowRateLimiter(
                 settings.nexus_a2a_rate_limit_per_minute
             ),
@@ -249,6 +276,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
     app.state.a2a_service = a2a_service
     app.state.a2a_ok = a2a_service is not None
+    app.state.gateway_ok = gateway_client is not None
 
     # --- Discovery (Part 7) ---------------------------------------------------
     # Agent discovery and card hosting. Requires identity (card signing) and
@@ -335,6 +363,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        if getattr(app.state, "gateway_client", None) is not None:
+            await app.state.gateway_client.stop()
         await app.state.agent.aclose()
         if app.state.engine is not None:
             await app.state.engine.dispose()

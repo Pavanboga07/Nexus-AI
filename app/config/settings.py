@@ -159,6 +159,10 @@ class Settings(BaseSettings):
     nexus_autonomy_max_remote_tasks: int = Field(default=5, ge=0, le=20)
     nexus_autonomy_max_tool_calls: int = Field(default=10, ge=0, le=50)
 
+    # --- Gateway Relay (Part 11) --------------------------------------------------
+    # WebSocket URL of the hosted Nexus Gateway relay
+    nexus_gateway_url: str | None = Field(default=None)
+
 
 
     @property
