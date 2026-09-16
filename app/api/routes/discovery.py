@@ -137,4 +137,98 @@ async def discover_agent(
     )
 
 
+@router.get(
+    "/a2a/directory/search",
+    tags=["discovery"],
+    summary="Search the Gateway directory by agent_id, handle, or name",
+)
+async def directory_search(
+    request: Request,
+    q: str,
+    agent: NexusAgent = Depends(get_agent),
+    discovery_service: DiscoveryService = Depends(get_discovery_service),
+    settings: Settings = Depends(get_settings),
+) -> JSONResponse:
+    if not settings.nexus_gateway_url:
+        raise HTTPException(status_code=503, detail="Nexus Gateway URL is not configured.")
+
+    base_http = (
+        settings.nexus_gateway_url.replace("wss://", "https://")
+        .replace("ws://", "http://")
+        .rstrip("/ws")
+        .rstrip("/")
+    )
+
+    query = q.strip()
+    results: list[dict] = []
+
+    import httpx
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        try:
+            if query.startswith("nexus:ed25519:"):
+                resp = await client.get(f"{base_http}/agents/{query}")
+                if resp.status_code == 200:
+                    results = [resp.json()]
+            elif query.startswith("@"):
+                handle = query.lstrip("@")
+                resp = await client.get(f"{base_http}/agents/handle/{handle}")
+                if resp.status_code == 200:
+                    results = [resp.json()]
+                else:
+                    search_resp = await client.get(f"{base_http}/agents/search?q={handle}")
+                    if search_resp.status_code == 200:
+                        results = search_resp.json().get("agents", [])
+            else:
+                resp = await client.get(f"{base_http}/agents/search?q={query}")
+                if resp.status_code == 200:
+                    results = resp.json().get("agents", [])
+        except Exception as exc:
+            logger.warning("Gateway directory search error: %s", exc)
+            raise HTTPException(status_code=502, detail=f"Failed to query Gateway directory: {exc}")
+
+    # Check local trust status and verify cards
+    owner_id = await agent._owner_id()
+    a2a_service = getattr(request.app.state, "a2a_service", None)
+    trusted_agent_ids: set[str] = set()
+    if a2a_service and hasattr(a2a_service, "_session_factory"):
+        async with a2a_service._session_factory() as session:
+            all_trusted = await a2a_service._trusted.list_active(session, owner_id)
+            trusted_agent_ids = {ta.agent_id for ta in all_trusted}
+
+    enriched = []
+    for r in results:
+        agent_id = r.get("agent_id")
+        card = r.get("agent_card")
+        verified = False
+        if card:
+            try:
+                discovery_service.verify_card(card, expected_agent_id=agent_id)
+                verified = True
+            except Exception:
+                verified = False
+        elif r.get("public_key") and signing.agent_id_matches_key(agent_id, r["public_key"]):
+            verified = True
+
+        capabilities = []
+        if card and isinstance(card.get("capabilities"), list):
+            for c in card["capabilities"]:
+                capabilities.append(c.get("name") if isinstance(c, dict) else str(c))
+
+        enriched.append({
+            "agent_id": agent_id,
+            "display_name": (card and card.get("display_name")) or r.get("display_name") or agent_id,
+            "handle": r.get("handle"),
+            "public_key": (card and card.get("public_key")) or r.get("public_key"),
+            "endpoint": (card and card.get("endpoint")) or settings.nexus_gateway_url,
+            "capabilities": capabilities,
+            "is_online": r.get("is_online", False),
+            "verified": verified,
+            "is_trusted": agent_id in trusted_agent_ids,
+            "card": card,
+        })
+
+    return JSONResponse(content={"agents": enriched, "total": len(enriched)})
+
+
 __all__ = ["router"]
+

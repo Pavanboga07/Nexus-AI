@@ -120,6 +120,8 @@ class Settings(BaseSettings):
     # --- Discovery (Part 7) -------------------------------------------------------
     # Display name exposed in the agent card. Defaults to "Nexus Agent".
     nexus_agent_display_name: str = "Nexus Agent"
+    # Public handle for this agent (e.g. "nexus" or "rahul"), without leading @.
+    nexus_agent_handle: str | None = None
     # Base URL for this agent's A2A endpoint (used in the card).
     # Example: "https://my-agent.example.com" or "http://127.0.0.1:8000"
     nexus_agent_endpoint: str | None = None

@@ -67,10 +67,10 @@ def validate_endpoint(endpoint: str, *, allow_local: bool) -> str:
     except ValueError:
         raise A2AError(A2AErrorCode.INVALID_ENDPOINT, "Malformed endpoint URL.") from None
 
-    if parts.scheme not in {"http", "https"}:
+    if parts.scheme not in {"http", "https", "ws", "wss", "gateway"}:
         raise A2AError(
             A2AErrorCode.INVALID_ENDPOINT,
-            "Endpoint scheme must be http or https.",
+            "Endpoint scheme must be http, https, ws, wss, or gateway.",
         )
     if not parts.hostname:
         raise A2AError(A2AErrorCode.INVALID_ENDPOINT, "Endpoint has no host.")

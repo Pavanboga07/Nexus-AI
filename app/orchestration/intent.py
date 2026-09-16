@@ -113,6 +113,14 @@ class IntentResolver:
             logger.warning("Failed to validate LLM intent output: %s (raw: %s)", exc, content)
             return None
 
+    def _normalize_target(self, raw_target: str) -> str:
+        t = raw_target.strip()
+        if t.lower().startswith("nexus:ed25519:"):
+            return t.lower()
+        if t.startswith("@"):
+            return "@" + t[1:].lower()
+        return t.capitalize()
+
     def _rule_based_parse(
         self,
         msg: str,
@@ -121,6 +129,7 @@ class IntentResolver:
     ) -> Intent | None:
         """Deterministic rule-based intent parsing."""
         low = msg.lower()
+        target_pat = r"(nexus:ed25519:[0-9a-f]{32}|@[a-z0-9_.-]+|[a-z0-9_]+)"
 
         # Confirmations: "book it", "confirm it", "yes", "go ahead"
         if low in {"book it", "confirm it", "confirm", "yes", "yes please", "do it", "go ahead", "i'll take it", "take it"}:
@@ -133,10 +142,10 @@ class IntentResolver:
             )
 
         # Multi-agent coordination: "Ask Rahul and Priya when they're both free"
-        multi_match = re.search(r"(?:ask|check)\s+([a-z]+)\s+and\s+([a-z]+)\s+(?:when|if)\s+(?:they're|they are|both)", low)
+        multi_match = re.search(r"(?:ask|check)\s+" + target_pat + r"\s+and\s+" + target_pat + r"\s+(?:when|if)\s+(?:they're|they are|both)", low)
         if multi_match:
-            p1 = multi_match.group(1).capitalize()
-            p2 = multi_match.group(2).capitalize()
+            p1 = self._normalize_target(multi_match.group(1))
+            p2 = self._normalize_target(multi_match.group(2))
             return Intent(
                 goal=msg,
                 intent_type=IntentType.COORDINATE_MEETING,
@@ -149,8 +158,8 @@ class IntentResolver:
         # Alternative time / negotiation:
         # "Tell Rahul 8 PM works instead", "Ask him if 8 PM works instead"
         if ("works instead" in low or "works for me" in low or "can we do" in low or "instead" in low):
-            target_match = re.search(r"(?:tell|ask|suggest to)\s+([a-z0-9_]+)", low)
-            target_name = target_match.group(1).capitalize() if target_match else active_target
+            target_match = re.search(r"(?:tell|ask|suggest to)\s+" + target_pat, low)
+            target_name = self._normalize_target(target_match.group(1)) if target_match else active_target
             time_match = re.search(r"([0-9]+(?:\s*[ap]m|:00)?)", low)
             proposed = time_match.group(1) if time_match else None
             return Intent(
@@ -163,16 +172,16 @@ class IntentResolver:
 
         # Availability checks:
         # "Ask Rahul if he's free tomorrow after 6 PM"
-        # "Ask UnknownPerson if they are free tomorrow"
-        # "Ask UnknownColleague if he is free at 5 PM"
+        # "Ask nexus:ed25519:... if he is free tomorrow"
+        # "Ask @rahul if he is free tomorrow after 6 PM"
         # "See if Rahul can meet Saturday evening"
         # "Is Rahul free tomorrow?"
         avail_match = re.search(
-            r"(?:ask|see if|check if|is)\s+([a-z0-9_]+)\s+(?:if\s+(?:he's|she's|they're|he\s+is|she\s+is|they\s+are)|is|can\s+meet|free|available)",
+            r"(?:ask|see if|check if|is)\s+" + target_pat + r"\s+(?:if\s+(?:he's|she's|they're|he\s+is|she\s+is|they\s+are)|is|can\s+meet|free|available)",
             low,
         )
         if avail_match:
-            target_name = avail_match.group(1).capitalize()
+            target_name = self._normalize_target(avail_match.group(1))
             constraints: dict[str, Any] = {}
             if "tomorrow" in low:
                 constraints["date"] = "tomorrow"
@@ -198,9 +207,9 @@ class IntentResolver:
             )
 
         # Coordinate meeting: "Find a time when Rahul and I can meet this week"
-        meet_match = re.search(r"(?:coordinate|find a time|schedule|plan a meeting)\s+(?:with\s+)?([a-z0-9_]+)", low)
+        meet_match = re.search(r"(?:coordinate|find a time|schedule|plan a meeting)\s+(?:with\s+)?" + target_pat, low)
         if meet_match:
-            target_name = meet_match.group(1).capitalize()
+            target_name = self._normalize_target(meet_match.group(1))
             return Intent(
                 goal=msg,
                 intent_type=IntentType.COORDINATE_MEETING,
@@ -210,9 +219,9 @@ class IntentResolver:
             )
 
         # Send info: "Tell Priya I'll be 15 minutes late"
-        tell_match = re.search(r"(?:tell|inform|notify|message)\s+([a-z0-9_]+)\s+(.*)", low)
+        tell_match = re.search(r"(?:tell|inform|notify|message)\s+" + target_pat + r"\s+(.*)", low)
         if tell_match:
-            target_name = tell_match.group(1).capitalize()
+            target_name = self._normalize_target(tell_match.group(1))
             content = tell_match.group(2)
             return Intent(
                 goal=msg,
@@ -223,9 +232,9 @@ class IntentResolver:
             )
 
         # Delegate task: "Ask Rahul to review my project"
-        delegate_match = re.search(r"ask\s+([a-z]+)\s+to\s+(.*)", low)
+        delegate_match = re.search(r"ask\s+" + target_pat + r"\s+to\s+(.*)", low)
         if delegate_match:
-            target_name = delegate_match.group(1).capitalize()
+            target_name = self._normalize_target(delegate_match.group(1))
             task_desc = delegate_match.group(2)
             return Intent(
                 goal=msg,
@@ -236,9 +245,9 @@ class IntentResolver:
             )
 
         # Contact / Connect: "Connect to Rahul"
-        connect_match = re.search(r"(?:connect to|reach out to|contact)\s+([a-z]+)", low)
+        connect_match = re.search(r"(?:connect to|reach out to|contact)\s+" + target_pat, low)
         if connect_match:
-            target_name = connect_match.group(1).capitalize()
+            target_name = self._normalize_target(connect_match.group(1))
             return Intent(
                 goal=msg,
                 intent_type=IntentType.CONTACT_AGENT,

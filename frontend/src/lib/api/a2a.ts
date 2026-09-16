@@ -92,3 +92,21 @@ export async function getA2AAudit(): Promise<{
 }> {
   return apiFetch("/a2a/audit/list");
 }
+
+export async function searchGatewayDirectory(q: string): Promise<{
+  agents: Array<{
+    agent_id: string;
+    display_name: string;
+    handle?: string;
+    public_key: string;
+    endpoint: string;
+    capabilities: string[];
+    is_online: boolean;
+    verified: boolean;
+    is_trusted: boolean;
+    card?: any;
+  }>;
+  total: number;
+}> {
+  return apiFetch(`/a2a/directory/search?q=${encodeURIComponent(q)}`);
+}

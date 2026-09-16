@@ -98,8 +98,14 @@ class DiscoveryService:
 
         # 2. HTTP GET
         card = await self._http_get_card(url)
+        return self.verify_card(card)
 
-        # 3. Schema validation
+    def verify_card(
+        self, card: dict[str, Any], expected_agent_id: str | None = None
+    ) -> dict[str, Any]:
+        """Verify the structural schema, fingerprint consistency, Ed25519 signature,
+        and temporal validity of an agent card."""
+        # 1. Schema validation
         try:
             validate_card_schema(card)
         except CardValidationError as exc:
@@ -107,7 +113,7 @@ class DiscoveryService:
                 A2AErrorCode.INVALID_CARD, f"Card validation failed: {exc}"
             ) from None
 
-        # 4. agent_id <-> public_key consistency
+        # 2. agent_id <-> public_key consistency
         if not signing.agent_id_matches_key(
             card["agent_id"], card["public_key"]
         ):
@@ -116,14 +122,20 @@ class DiscoveryService:
                 "Card agent_id does not match the card's public_key.",
             )
 
-        # 5. Signature verification
+        if expected_agent_id and card["agent_id"] != expected_agent_id:
+            raise A2AError(
+                A2AErrorCode.INVALID_CARD,
+                f"Card agent_id '{card['agent_id']}' does not match expected '{expected_agent_id}'.",
+            )
+
+        # 3. Signature verification
         if not signing.verify_card_signature(card, card["public_key"]):
             raise A2AError(
                 A2AErrorCode.CARD_SIGNATURE_INVALID,
                 "Card signature verification failed.",
             )
 
-        # 6. Time window
+        # 4. Time window
         try:
             validate_card_time_window(card)
         except CardValidationError as exc:
@@ -138,6 +150,27 @@ class DiscoveryService:
             card.get("endpoint"),
         )
         return card
+
+    async def fetch_card_from_gateway(
+        self, agent_id: str, gateway_url: str
+    ) -> dict[str, Any]:
+        """Fetch and cryptographically verify an agent card from the Gateway directory."""
+        base_http = (
+            gateway_url.replace("wss://", "https://")
+            .replace("ws://", "http://")
+            .rstrip("/ws")
+            .rstrip("/")
+        )
+        url = f"{base_http}/agents/{agent_id}/card"
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                raise A2AError(
+                    A2AErrorCode.NOT_FOUND,
+                    f"Agent card not found on Gateway for agent_id {agent_id} (HTTP {resp.status_code})",
+                )
+            card = resp.json()
+            return self.verify_card(card, expected_agent_id=agent_id)
 
     async def discover_and_register(
         self,

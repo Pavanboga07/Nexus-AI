@@ -29,13 +29,14 @@ def _utcnow() -> datetime:
 class OrchestrationState(str, enum.Enum):
     UNDERSTANDING = "UNDERSTANDING"
     RESOLVING_TARGET = "RESOLVING_TARGET"
-    DISCOVERING_AGENT = "DISCOVERING_AGENT"
+    WAITING_FOR_DISCOVERY = "WAITING_FOR_DISCOVERY"
+    DISCOVERING_AGENT = "WAITING_FOR_DISCOVERY"  # Alias for backward compatibility
     WAITING_FOR_TRUST = "WAITING_FOR_TRUST"
     PLANNING = "PLANNING"
     AUTHORIZING = "AUTHORIZING"
     WAITING_APPROVAL = "WAITING_APPROVAL"
-    EXECUTING = "EXECUTING"
     WAITING_REMOTE = "WAITING_REMOTE"
+    EXECUTING = "EXECUTING"
     PROCESSING_RESULT = "PROCESSING_RESULT"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
@@ -103,6 +104,8 @@ class OrchestrationRun(Base):
     )
     target_person: Mapped[str | None] = mapped_column(String(255), nullable=True)
     target_agent_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    task_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    workflow_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     plan: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, default=dict
     )
@@ -114,9 +117,43 @@ class OrchestrationRun(Base):
         Boolean, nullable=False, default=False
     )
     approval_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    approval_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    requested_action: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    approval_target: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    approval_category: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    approval_purpose: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    approval_step: Mapped[int | None] = mapped_column(nullable=True)
+    owner_decision: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, server_default=func.now()
     )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=_utcnow,
+        server_default=func.now(),
+        onupdate=_utcnow,
+    )
+
+
+class OrchestrationContext(Base):
+    """Durable multi-turn conversation context for orchestration across restarts."""
+
+    __tablename__ = "orchestration_contexts"
+    __table_args__ = (
+        Index("ix_orchestration_contexts_owner_id", "owner_id"),
+    )
+
+    session_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    owner_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("owners.id"), nullable=False
+    )
+    active_target: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    active_agent_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    last_proposed_time: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_task_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_intent_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    pending_approval: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=_utcnow,

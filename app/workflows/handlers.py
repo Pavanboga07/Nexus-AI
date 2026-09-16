@@ -250,7 +250,7 @@ class A2ATaskStepHandler(BaseWorkflowStepHandler):
                 output_payload=resp_payload,
                 task_id=task_id,
             )
-        elif resp_status in {"pending", "pending_approval"}:
+        elif resp_status in {"pending", "pending_approval", "queued", "waiting_remote"}:
             return StepResult(
                 status=StepStatus.WAITING,
                 output_payload=resp_payload,

@@ -34,6 +34,7 @@ class TaskStatus(str, enum.Enum):
     FAILED = "failed"
     EXPIRED = "expired"
     CANCELLED = "cancelled"
+    WAITING_REMOTE = "waiting_remote"
 
 
 class TrustedAgent(Base):

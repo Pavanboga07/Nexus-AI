@@ -99,6 +99,8 @@ class OrchestrationRunRepository:
         target_person: str | None = None,
         target_agent_id: str | None = None,
         plan: dict[str, Any] | None = None,
+        task_id: str | None = None,
+        workflow_id: uuid.UUID | None = None,
     ) -> OrchestrationRun:
         run = OrchestrationRun(
             owner_id=owner_id,
@@ -109,19 +111,69 @@ class OrchestrationRunRepository:
             target_person=target_person,
             target_agent_id=target_agent_id,
             plan=plan or {},
+            task_id=task_id,
+            workflow_id=workflow_id,
         )
         session.add(run)
         await session.flush()
         return run
 
     async def get_by_id(
-        self, session: AsyncSession, owner_id: uuid.UUID, run_id: uuid.UUID
+        self,
+        session: AsyncSession,
+        owner_id: uuid.UUID,
+        run_id: uuid.UUID | None = None,
     ) -> OrchestrationRun | None:
-        stmt = select(OrchestrationRun).where(
-            OrchestrationRun.owner_id == owner_id, OrchestrationRun.id == run_id
-        )
+        if run_id is None:
+            stmt = select(OrchestrationRun).where(OrchestrationRun.id == owner_id)
+        else:
+            stmt = select(OrchestrationRun).where(
+                OrchestrationRun.owner_id == owner_id, OrchestrationRun.id == run_id
+            )
         result = await session.execute(stmt)
         return result.scalar_one_or_none()
+
+    async def transition_state(
+        self, session: AsyncSession, run_id: uuid.UUID, state: OrchestrationState | str
+    ) -> OrchestrationRun | None:
+        stmt = select(OrchestrationRun).where(OrchestrationRun.id == run_id)
+        result = await session.execute(stmt)
+        run = result.scalar_one_or_none()
+        if run is None:
+            return None
+        run.state = state.value if hasattr(state, "value") else str(state)
+        run.updated_at = func.now()
+        await session.flush()
+        return run
+
+    async def set_approval_request(
+        self,
+        session: AsyncSession,
+        run_id: uuid.UUID,
+        *,
+        reason: str,
+        requested_action: str | None = None,
+        approval_target: str | None = None,
+        approval_category: str | None = None,
+        approval_purpose: str | None = None,
+        approval_step: Any = None,
+    ) -> OrchestrationRun | None:
+        stmt = select(OrchestrationRun).where(OrchestrationRun.id == run_id)
+        result = await session.execute(stmt)
+        run = result.scalar_one_or_none()
+        if run is None:
+            return None
+        run.state = OrchestrationState.WAITING_APPROVAL.value
+        run.requires_approval = True
+        run.approval_reason = reason
+        run.requested_action = requested_action
+        run.approval_target = approval_target
+        run.approval_category = approval_category
+        run.approval_purpose = approval_purpose
+        run.approval_step = approval_step
+        run.updated_at = func.now()
+        await session.flush()
+        return run
 
     async def get_latest_active_run(
         self, session: AsyncSession, owner_id: uuid.UUID, session_id: str
@@ -162,9 +214,26 @@ class OrchestrationRunRepository:
         error: str | None = None,
         requires_approval: bool | None = None,
         approval_prompt: str | None = None,
+        approval_reason: str | None = None,
+        requested_action: str | None = None,
+        approval_target: str | None = None,
+        approval_category: str | None = None,
+        approval_purpose: str | None = None,
+        approval_step: int | None = None,
+        owner_decision: str | None = None,
+        task_id: str | None = None,
+        workflow_id: uuid.UUID | None = None,
         plan: dict[str, Any] | None = None,
         target_agent_id: str | None = None,
     ) -> OrchestrationRun:
+        stmt = select(OrchestrationRun).where(OrchestrationRun.id == run.id)
+        res = await session.execute(stmt)
+        active_run = res.scalar_one_or_none()
+        if active_run is not None:
+            run = active_run
+        else:
+            run = await session.merge(run)
+
         run.state = state
         if result is not None:
             run.result = result
@@ -174,6 +243,24 @@ class OrchestrationRunRepository:
             run.requires_approval = requires_approval
         if approval_prompt is not None:
             run.approval_prompt = approval_prompt
+        if approval_reason is not None:
+            run.approval_reason = approval_reason
+        if requested_action is not None:
+            run.requested_action = requested_action
+        if approval_target is not None:
+            run.approval_target = approval_target
+        if approval_category is not None:
+            run.approval_category = approval_category
+        if approval_purpose is not None:
+            run.approval_purpose = approval_purpose
+        if approval_step is not None:
+            run.approval_step = approval_step
+        if owner_decision is not None:
+            run.owner_decision = owner_decision
+        if task_id is not None:
+            run.task_id = task_id
+        if workflow_id is not None:
+            run.workflow_id = workflow_id
         if plan is not None:
             run.plan = plan
         if target_agent_id is not None:
@@ -181,6 +268,18 @@ class OrchestrationRunRepository:
         run.updated_at = func.now()
         await session.flush()
         return run
+
+    async def find_by_task_id(
+        self, session: AsyncSession, task_id: str
+    ) -> OrchestrationRun | None:
+        stmt = (
+            select(OrchestrationRun)
+            .where(OrchestrationRun.task_id == task_id)
+            .order_by(desc(OrchestrationRun.created_at))
+            .limit(1)
+        )
+        result = await session.execute(stmt)
+        return result.scalar_one_or_none()
 
     async def list_runs(
         self,
@@ -196,3 +295,65 @@ class OrchestrationRunRepository:
         )
         result = await session.execute(stmt)
         return result.scalars().all()
+
+
+class OrchestrationContextRepository:
+    """Repository for managing persistent session orchestration context."""
+
+    async def get_by_session_id(
+        self, session: AsyncSession, session_id: str
+    ) -> Any | None:
+        from app.orchestration.models import OrchestrationContext
+        stmt = select(OrchestrationContext).where(
+            OrchestrationContext.session_id == session_id
+        )
+        result = await session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def upsert(
+        self,
+        session: AsyncSession,
+        *,
+        session_id: str,
+        owner_id: uuid.UUID,
+        active_target: str | None = None,
+        active_agent_id: str | None = None,
+        last_proposed_time: str | None = None,
+        last_task_id: str | None = None,
+        last_run_id: str | None = None,
+        last_intent_type: str | None = None,
+        pending_approval: dict[str, Any] | None = None,
+    ) -> Any:
+        from app.orchestration.models import OrchestrationContext
+        ctx = await self.get_by_session_id(session, session_id)
+        if ctx is None:
+            ctx = OrchestrationContext(
+                session_id=session_id,
+                owner_id=owner_id,
+                active_target=active_target,
+                active_agent_id=active_agent_id,
+                last_proposed_time=last_proposed_time,
+                last_task_id=last_task_id,
+                last_run_id=last_run_id,
+                last_intent_type=last_intent_type,
+                pending_approval=pending_approval,
+            )
+            session.add(ctx)
+        else:
+            if active_target is not None:
+                ctx.active_target = active_target
+            if active_agent_id is not None:
+                ctx.active_agent_id = active_agent_id
+            if last_proposed_time is not None:
+                ctx.last_proposed_time = last_proposed_time
+            if last_task_id is not None:
+                ctx.last_task_id = last_task_id
+            if last_run_id is not None:
+                ctx.last_run_id = last_run_id
+            if last_intent_type is not None:
+                ctx.last_intent_type = last_intent_type
+            if pending_approval is not None:
+                ctx.pending_approval = pending_approval
+            ctx.updated_at = func.now()
+        await session.flush()
+        return ctx

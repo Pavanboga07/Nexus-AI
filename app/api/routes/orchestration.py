@@ -17,9 +17,13 @@ from app.orchestration.repository import ContactRepository, OrchestrationRunRepo
 from app.orchestration.schemas import (
     ContactCreateRequest,
     ContactResponse,
+    OrchestrationApproveRequest,
+    OrchestrationCancelRequest,
     OrchestrationExecuteRequest,
     OrchestrationExecuteResponse,
+    OrchestrationRejectRequest,
     OrchestrationRunResponse,
+    OrchestrationTrustRequest,
 )
 
 logger = logging.getLogger("nexus.api.orchestration")
@@ -117,12 +121,80 @@ async def get_run(
         state=r.state,
         target_person=r.target_person,
         target_agent_id=r.target_agent_id,
+        task_id=r.task_id,
+        workflow_id=str(r.workflow_id) if r.workflow_id else None,
         requires_approval=r.requires_approval,
         approval_prompt=r.approval_prompt,
+        approval_reason=r.approval_reason,
+        requested_action=r.requested_action,
+        approval_target=r.approval_target,
+        approval_category=r.approval_category,
+        approval_purpose=r.approval_purpose,
+        owner_decision=r.owner_decision,
         result=r.result,
         error=r.error,
         created_at=r.created_at.isoformat(),
     )
+
+
+@router.post(
+    "/runs/{run_id}/approve",
+    response_model=OrchestrationExecuteResponse,
+    summary="Approve a pending action in an orchestration run and resume the same run",
+)
+async def approve_run_endpoint(
+    run_id: uuid.UUID,
+    payload: OrchestrationApproveRequest = OrchestrationApproveRequest(),
+    agent: NexusAgent = Depends(get_agent),
+    orchestrator: AgentOrchestrator = Depends(get_orchestrator),
+) -> OrchestrationExecuteResponse:
+    owner_id = await _owner_id(agent)
+    return await orchestrator.approve_run(owner_id, run_id, payload)
+
+
+@router.post(
+    "/runs/{run_id}/reject",
+    response_model=OrchestrationExecuteResponse,
+    summary="Reject a pending action in an orchestration run",
+)
+async def reject_run_endpoint(
+    run_id: uuid.UUID,
+    payload: OrchestrationRejectRequest = OrchestrationRejectRequest(),
+    agent: NexusAgent = Depends(get_agent),
+    orchestrator: AgentOrchestrator = Depends(get_orchestrator),
+) -> OrchestrationExecuteResponse:
+    owner_id = await _owner_id(agent)
+    return await orchestrator.reject_run(owner_id, run_id, payload)
+
+
+@router.post(
+    "/runs/{run_id}/cancel",
+    response_model=OrchestrationExecuteResponse,
+    summary="Cancel an active or waiting orchestration run",
+)
+async def cancel_run_endpoint(
+    run_id: uuid.UUID,
+    payload: OrchestrationCancelRequest = OrchestrationCancelRequest(),
+    agent: NexusAgent = Depends(get_agent),
+    orchestrator: AgentOrchestrator = Depends(get_orchestrator),
+) -> OrchestrationExecuteResponse:
+    owner_id = await _owner_id(agent)
+    return await orchestrator.cancel_run(owner_id, run_id, payload)
+
+
+@router.post(
+    "/runs/{run_id}/trust",
+    response_model=OrchestrationExecuteResponse,
+    summary="Trust a discovered agent and resume the same orchestration run",
+)
+async def trust_run_endpoint(
+    run_id: uuid.UUID,
+    payload: OrchestrationTrustRequest = OrchestrationTrustRequest(),
+    agent: NexusAgent = Depends(get_agent),
+    orchestrator: AgentOrchestrator = Depends(get_orchestrator),
+) -> OrchestrationExecuteResponse:
+    owner_id = await _owner_id(agent)
+    return await orchestrator.trust_and_resume_run(owner_id, run_id, payload)
 
 
 # --- Contact Management ---

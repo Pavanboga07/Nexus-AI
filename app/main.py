@@ -241,6 +241,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
             async def _handle_gateway_inbound(envelope):
                 if a2a_service is not None and owner_id is not None:
+                    msg_type = envelope.get("message_type")
+                    if msg_type in ("response", "task_response"):
+                        return await a2a_service.handle_inbound_response(owner_id, envelope)
                     return await a2a_service.handle_inbound(owner_id, envelope)
                 return None
 
@@ -249,6 +252,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 identity_service=identity_service,
                 owner_id=owner_id,
                 inbound_handler=_handle_gateway_inbound,
+                display_name=settings.nexus_agent_display_name,
+                handle=settings.nexus_agent_handle,
             )
             transport = GatewayA2ATransport(
                 http_transport=http_transport,
@@ -350,8 +355,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             trusted_agents=a2a_service._trusted,
             discovery_service=discovery_service,
             memory_manager=app.state.agent._memory,
+            gateway_url=settings.nexus_gateway_url,
         )
-        decision_engine = autonomy_service._engine if autonomy_service is not None else None
+        decision_engine = getattr(autonomy_service, "_decision_engine", None)
         orchestrator = AgentOrchestrator(
             session_factory=session_factory,
             a2a_service=a2a_service,
@@ -359,6 +365,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             intent_resolver=intent_resolver,
             target_resolver=target_resolver,
             decision_engine=decision_engine,
+            workflow_service=workflow_service,
         )
     app.state.orchestrator = orchestrator
     app.state.orchestration_ok = orchestrator is not None

@@ -47,6 +47,9 @@ class GatewayClient:
         inbound_handler: Callable[[A2AEnvelope], Coroutine[Any, Any, A2AEnvelope | None]] | None = None,
         heartbeat_interval: float = 30.0,
         reconnect_delay: float = 5.0,
+        display_name: str | None = None,
+        handle: str | None = None,
+        agent_card: dict[str, Any] | None = None,
     ) -> None:
         self._gateway_url = gateway_url
         self._identity = identity_service
@@ -54,6 +57,9 @@ class GatewayClient:
         self._inbound_handler = inbound_handler
         self._heartbeat_interval = heartbeat_interval
         self._reconnect_delay = reconnect_delay
+        self._display_name = display_name
+        self._handle = handle
+        self._agent_card = agent_card
 
         self._ws: WSClient | None = None
         self._connected = False
@@ -80,13 +86,19 @@ class GatewayClient:
     async def stop(self) -> None:
         """Stop the gateway client and disconnect."""
         self._running = False
+        if self._ws:
+            try:
+                await self._ws.close(code=1000, reason="Normal closure")
+            except Exception:
+                pass
+            self._ws = None
         if self._loop_task:
             self._loop_task.cancel()
             try:
                 await self._loop_task
             except asyncio.CancelledError:
                 pass
-        await self._disconnect()
+        self._connected = False
         logger.info("Gateway client stopped.")
 
     async def _connection_supervisor(self) -> None:
@@ -132,13 +144,32 @@ class GatewayClient:
         raw_sig = await self._identity.sign(challenge_bytes)
         sig_b64 = base64.b64encode(raw_sig).decode("ascii")
 
+        # Build / sign agent card if not provided
+        card = self._agent_card
+        if card is None:
+            try:
+                from app.a2a.cards import build_card
+                from app.a2a.signing import sign_card
+                unsigned = build_card(
+                    agent_id=pub_ident.agent_id,
+                    public_key=pub_ident.public_key,
+                    display_name=self._display_name or "Nexus Primary Agent",
+                    endpoint=self._gateway_url,
+                )
+                card = await sign_card(self._identity, unsigned)
+            except Exception as exc:
+                logger.warning("Failed to auto-build signed agent card for gateway auth: %s", exc)
+                card = None
+
         # 3. Send auth_response
         auth_response = {
             "type": "auth_response",
             "agent_id": pub_ident.agent_id,
             "public_key": pub_ident.public_key,
             "signature": sig_b64,
-            "display_name": "Nexus Local Agent",
+            "display_name": self._display_name or "Nexus Primary Agent",
+            "handle": self._handle,
+            "agent_card": card,
         }
         await ws.send(json.dumps(auth_response))
 
@@ -181,14 +212,13 @@ class GatewayClient:
                 fut = self._pending_responses.pop(task_id)
                 if not fut.done():
                     fut.set_result(envelope_data)
-                return
 
-            # 3. Otherwise dispatch to local inbound handler
+            # 3. In all cases, dispatch to local inbound handler so DB and workflows are updated
             if self._inbound_handler:
                 try:
                     envelope = A2AEnvelope.model_validate(envelope_data)
                     response_envelope = await self._inbound_handler(envelope)
-                    if response_envelope:
+                    if response_envelope and msg_type not in {"response", "task_response"}:
                         # Relay the signed response back to the sender
                         response_frame = {
                             "type": "relay_envelope",
@@ -202,6 +232,7 @@ class GatewayClient:
 
         elif frame_type == "delivery_ack":
             relay_id = frame.get("relay_id")
+            logger.debug("Gateway delivery_ack received: %s", frame)
             if relay_id and relay_id in self._pending_acks:
                 fut = self._pending_acks.pop(relay_id)
                 if not fut.done():
@@ -209,6 +240,7 @@ class GatewayClient:
 
         elif frame_type == "delivery_failed":
             relay_id = frame.get("relay_id")
+            logger.warning("Gateway delivery_failed received: %s", frame)
             if relay_id and relay_id in self._pending_acks:
                 fut = self._pending_acks.pop(relay_id)
                 if not fut.done():
@@ -255,12 +287,14 @@ class GatewayClient:
         # Wait for delivery ack first
         try:
             ack = await asyncio.wait_for(ack_fut, timeout=10.0)
+            logger.debug("send_relay_envelope received ack: %s", ack)
             if ack.get("status") == "queued":
                 # Recipient is offline, envelope queued
                 if task_id in self._pending_responses:
                     self._pending_responses.pop(task_id, None)
                 return {"status": "queued", "relay_id": relay_id}
         except asyncio.TimeoutError:
+            logger.warning("Timed out waiting for delivery_ack (relay_id=%s)", relay_id)
             self._pending_acks.pop(relay_id, None)
 
         # Wait for the response envelope from remote agent
@@ -301,19 +335,37 @@ class GatewayA2ATransport:
     async def send(
         self, endpoint: str, envelope: dict[str, Any]
     ) -> dict[str, Any]:
-        """Send a signed envelope, return the parsed response envelope."""
-        # Check if destination endpoint targets the gateway
+        """Send a signed envelope, return the parsed response envelope.
+        
+        Selection rules (Part 13):
+        1. If a live Gateway connection exists: route through Gateway.
+        2. If Gateway is unavailable AND endpoint is a valid direct HTTP(S) URL: use DirectHTTPTransport.
+        3. If neither is available: raise transport unavailable error.
+        """
+        # 1. Prefer Gateway if connected
+        if self._gateway is not None and self._gateway.is_connected:
+            return await self._gateway.send_relay_envelope(envelope)
+
+        # 2. If endpoint explicitly targets gateway but gateway is disconnected
         is_gateway_target = (
             endpoint.startswith("ws://")
             or endpoint.startswith("wss://")
             or endpoint.startswith("gateway://")
         )
+        if is_gateway_target:
+            raise A2AError(
+                A2AErrorCode.TRANSPORT_ERROR,
+                "Gateway transport is not connected.",
+            )
 
-        if is_gateway_target and self._gateway is not None:
-            return await self._gateway.send_relay_envelope(envelope)
+        # 3. Fallback to direct HTTP transport if endpoint is valid http/https
+        if endpoint.startswith("http://") or endpoint.startswith("https://"):
+            return await self._http.send(endpoint, envelope)
 
-        # Fallback to direct HTTP transport
-        return await self._http.send(endpoint, envelope)
+        raise A2AError(
+            A2AErrorCode.TRANSPORT_ERROR,
+            f"No valid transport available for endpoint: {endpoint}",
+        )
 
 
 __all__ = ["GatewayClient", "GatewayA2ATransport"]

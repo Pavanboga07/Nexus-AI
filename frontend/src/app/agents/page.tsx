@@ -20,6 +20,9 @@ export default function AgentsPage() {
 
   // Discover modal & state
   const [discoverModalOpen, setDiscoverModalOpen] = useState(false);
+  const [discoverMode, setDiscoverMode] = useState<"gateway" | "direct">("gateway");
+  const [gatewayQuery, setGatewayQuery] = useState("");
+  const [gatewayResults, setGatewayResults] = useState<any[]>([]);
   const [endpointUrl, setEndpointUrl] = useState("");
   const [discovering, setDiscovering] = useState(false);
   const [discoveredCard, setDiscoveredCard] = useState<AgentCard | null>(null);
@@ -50,6 +53,46 @@ export default function AgentsPage() {
       await fetchTrustedAgents();
     } catch (err: any) {
       alert(`Failed to revoke agent: ${err.message}`);
+    }
+  };
+
+  const handleGatewaySearch = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!gatewayQuery.trim()) return;
+
+    try {
+      setDiscovering(true);
+      setDiscoverError(null);
+      setGatewayResults([]);
+      const res = await (await import("@/lib/api/a2a")).searchGatewayDirectory(gatewayQuery.trim());
+      setGatewayResults(res.agents || []);
+      if ((res.agents || []).length === 0) {
+        setDiscoverError("No agents found matching that query in the Gateway directory.");
+      }
+    } catch (err: any) {
+      setDiscoverError(err.message || "Failed to search Gateway directory.");
+    } finally {
+      setDiscovering(false);
+    }
+  };
+
+  const handleTrustGatewayAgent = async (agent: any) => {
+    try {
+      setRegistering(true);
+      await registerTrustedAgent({
+        agent_id: agent.agent_id,
+        display_name: agent.display_name || agent.handle || "Gateway Agent",
+        public_key: agent.public_key,
+        endpoint: agent.endpoint || "wss://nexus-gateway-mv63.onrender.com/ws",
+      });
+      await fetchTrustedAgents();
+      setDiscoverModalOpen(false);
+      setGatewayResults([]);
+      setGatewayQuery("");
+    } catch (err: any) {
+      alert(`Failed to trust agent: ${err.message}`);
+    } finally {
+      setRegistering(false);
     }
   };
 
@@ -109,6 +152,8 @@ export default function AgentsPage() {
               setDiscoverModalOpen(true);
               setDiscoverError(null);
               setDiscoveredCard(null);
+              setGatewayResults([]);
+              setGatewayQuery("");
               setEndpointUrl("");
             }}
           >
@@ -126,7 +171,7 @@ export default function AgentsPage() {
           <div className="py-16 text-center">
             <p className="text-sm text-neutral-400">No trusted agents found.</p>
             <p className="text-xs text-neutral-500 mt-1">
-              Click Discover Peer to connect with other agents.
+              Click Discover Peer to find agents on the Nexus Gateway.
             </p>
           </div>
         ) : (
@@ -177,74 +222,194 @@ export default function AgentsPage() {
         onClose={() => setDiscoverModalOpen(false)}
         title="Discover Agent"
       >
-        <form onSubmit={handleDiscover} className="space-y-4">
-          <div>
-            <label className="text-sm font-medium text-neutral-100 block mb-1.5">
-              Remote Endpoint URL
-            </label>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={endpointUrl}
-                onChange={(e) => setEndpointUrl(e.target.value)}
-                placeholder="http://peer.example.com/.well-known/nexus-agent.json"
-                className="flex-1 bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-100 placeholder-neutral-500 focus:outline-none focus:border-neutral-700 font-mono"
-              />
-              <Button type="submit" disabled={discovering || !endpointUrl.trim()} isLoading={discovering}>
-                Probe
-              </Button>
-            </div>
+        <div className="space-y-4">
+          <div className="flex border-b border-neutral-800">
+            <button
+              type="button"
+              onClick={() => { setDiscoverMode("gateway"); setDiscoverError(null); }}
+              className={`pb-2 px-3 text-xs font-medium border-b-2 transition-colors ${
+                discoverMode === "gateway"
+                  ? "border-emerald-500 text-emerald-400"
+                  : "border-transparent text-neutral-400 hover:text-neutral-200"
+              }`}
+            >
+              Gateway Directory
+            </button>
+            <button
+              type="button"
+              onClick={() => { setDiscoverMode("direct"); setDiscoverError(null); }}
+              className={`pb-2 px-3 text-xs font-medium border-b-2 transition-colors ${
+                discoverMode === "direct"
+                  ? "border-emerald-500 text-emerald-400"
+                  : "border-transparent text-neutral-400 hover:text-neutral-200"
+              }`}
+            >
+              Direct Endpoint
+            </button>
           </div>
 
-          {discoverError && (
-            <div className="p-3 rounded-lg bg-rose-950/30 border border-rose-900 text-sm text-rose-400">
-              {discoverError}
-            </div>
-          )}
-
-          {discoveredCard && (
-            <div className="p-4 rounded-lg bg-neutral-900 border border-neutral-800 space-y-4">
-              <div className="flex items-start justify-between">
-                <div>
-                  <h4 className="text-sm font-medium text-neutral-100">{discoveredCard.name}</h4>
-                  <p className="text-xs text-neutral-500 font-mono mt-1">{discoveredCard.agent_id}</p>
+          {discoverMode === "gateway" ? (
+            <div className="space-y-4">
+              <form onSubmit={handleGatewaySearch} className="space-y-3">
+                <label className="text-xs font-medium text-neutral-300 block">
+                  Search Gateway by Agent ID, @handle, or Name
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={gatewayQuery}
+                    onChange={(e) => setGatewayQuery(e.target.value)}
+                    placeholder="nexus:ed25519:... or @rahul or Alice"
+                    className="flex-1 bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-2 text-xs text-neutral-100 placeholder-neutral-500 focus:outline-none focus:border-neutral-700 font-mono"
+                  />
+                  <Button type="submit" size="sm" disabled={discovering || !gatewayQuery.trim()} isLoading={discovering}>
+                    Search
+                  </Button>
                 </div>
-                <Badge variant={discoveredVerified ? "success" : "danger"}>
-                  {discoveredVerified ? "Verified" : "Invalid"}
-                </Badge>
-              </div>
-              
-              <div className="text-sm text-neutral-400">
-                {discoveredCard.description || "No description provided."}
-              </div>
+              </form>
 
-              {discoveredCard.capabilities && (
-                <div className="flex flex-wrap gap-1.5">
-                  {discoveredCard.capabilities.map((cap) => (
-                    <span key={cap} className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-300">
-                      {cap}
-                    </span>
-                  ))}
+              {discoverError && (
+                <div className="p-2.5 rounded-lg bg-rose-950/30 border border-rose-900 text-xs text-rose-400">
+                  {discoverError}
                 </div>
               )}
 
-              <div className="pt-4 border-t border-neutral-800 flex justify-end gap-2">
-                <Button type="button" variant="ghost" size="sm" onClick={() => setDiscoveredCard(null)}>
-                  Cancel
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  onClick={handleTrustDiscovered}
-                  isLoading={registering}
-                  disabled={!discoveredVerified}
-                >
-                  Trust & Register
-                </Button>
-              </div>
+              {gatewayResults.length > 0 && (
+                <div className="space-y-2 max-h-72 overflow-y-auto">
+                  {gatewayResults.map((agent) => (
+                    <div
+                      key={agent.agent_id}
+                      className="p-3 rounded-lg bg-neutral-900 border border-neutral-800 space-y-2"
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div>
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-xs font-semibold text-neutral-100">
+                              {agent.display_name}
+                            </span>
+                            {agent.handle && (
+                              <span className="text-[11px] text-neutral-400">
+                                @{agent.handle}
+                              </span>
+                            )}
+                            <span
+                              className={`w-2 h-2 rounded-full ${
+                                agent.is_online ? "bg-emerald-500" : "bg-neutral-600"
+                              }`}
+                              title={agent.is_online ? "Online on Gateway" : "Offline"}
+                            />
+                          </div>
+                          <p className="text-[10px] text-neutral-500 font-mono mt-0.5">
+                            {truncateId(agent.agent_id, 14)}
+                          </p>
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          {agent.verified && (
+                            <Badge variant="success">Verified</Badge>
+                          )}
+                          {agent.is_trusted ? (
+                            <Badge variant="info">Trusted</Badge>
+                          ) : (
+                            <Button
+                              type="button"
+                              size="sm"
+                              onClick={() => handleTrustGatewayAgent(agent)}
+                              isLoading={registering}
+                            >
+                              Connect
+                            </Button>
+                          )}
+                        </div>
+                      </div>
+
+                      {agent.capabilities && agent.capabilities.length > 0 && (
+                        <div className="flex flex-wrap gap-1">
+                          {agent.capabilities.map((c: string) => (
+                            <span
+                              key={c}
+                              className="text-[9px] px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400"
+                            >
+                              {c}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
+          ) : (
+            <form onSubmit={handleDiscover} className="space-y-4">
+              <div>
+                <label className="text-sm font-medium text-neutral-100 block mb-1.5">
+                  Remote Endpoint URL
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={endpointUrl}
+                    onChange={(e) => setEndpointUrl(e.target.value)}
+                    placeholder="http://peer.example.com/.well-known/nexus-agent.json"
+                    className="flex-1 bg-neutral-900 border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-100 placeholder-neutral-500 focus:outline-none focus:border-neutral-700 font-mono"
+                  />
+                  <Button type="submit" disabled={discovering || !endpointUrl.trim()} isLoading={discovering}>
+                    Probe
+                  </Button>
+                </div>
+              </div>
+
+              {discoverError && (
+                <div className="p-3 rounded-lg bg-rose-950/30 border border-rose-900 text-sm text-rose-400">
+                  {discoverError}
+                </div>
+              )}
+
+              {discoveredCard && (
+                <div className="p-4 rounded-lg bg-neutral-900 border border-neutral-800 space-y-4">
+                  <div className="flex items-start justify-between">
+                    <div>
+                      <h4 className="text-sm font-medium text-neutral-100">{discoveredCard.name}</h4>
+                      <p className="text-xs text-neutral-500 font-mono mt-1">{discoveredCard.agent_id}</p>
+                    </div>
+                    <Badge variant={discoveredVerified ? "success" : "danger"}>
+                      {discoveredVerified ? "Verified" : "Invalid"}
+                    </Badge>
+                  </div>
+
+                  <div className="text-sm text-neutral-400">
+                    {discoveredCard.description || "No description provided."}
+                  </div>
+
+                  {discoveredCard.capabilities && (
+                    <div className="flex flex-wrap gap-1.5">
+                      {discoveredCard.capabilities.map((cap) => (
+                        <span key={cap} className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-300">
+                          {cap}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+
+                  <div className="pt-4 border-t border-neutral-800 flex justify-end gap-2">
+                    <Button type="button" variant="ghost" size="sm" onClick={() => setDiscoveredCard(null)}>
+                      Cancel
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      onClick={handleTrustDiscovered}
+                      isLoading={registering}
+                      disabled={!discoveredVerified}
+                    >
+                      Trust & Register
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </form>
           )}
-        </form>
+        </div>
       </Modal>
     </PageShell>
   );

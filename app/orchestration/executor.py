@@ -155,6 +155,12 @@ class OrchestrationExecutor:
                 "message": f"This action requires your confirmation: {policy_res.reason}",
                 "requires_approval": True,
                 "approval_prompt": policy_res.reason,
+                "approval_reason": policy_res.reason,
+                "requested_action": action,
+                "approval_target": target_name,
+                "approval_category": data_cat,
+                "approval_purpose": purpose,
+                "approval_step": step.step_id,
             }
 
         # 2. Decision Engine evaluation if available
@@ -179,6 +185,12 @@ class OrchestrationExecutor:
                     "message": f"This action requires your confirmation: {outcome.reason}",
                     "requires_approval": True,
                     "approval_prompt": outcome.reason,
+                    "approval_reason": outcome.reason,
+                    "requested_action": action,
+                    "approval_target": target_name,
+                    "approval_category": data_cat,
+                    "approval_purpose": purpose,
+                    "approval_step": step.step_id,
                 }
 
         return None

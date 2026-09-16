@@ -115,6 +115,11 @@ class A2AService:
         self._trusted = TrustedAgentRepository()
         self._tasks = TaskRepository()
         self._records = MessageRecordRepository()
+        self._task_completion_callbacks: list[Any] = []
+
+    def register_task_completion_callback(self, callback: Any) -> None:
+        """Register an async callback (task_id, payload) invoked upon remote task response."""
+        self._task_completion_callbacks.append(callback)
 
     # ------------------------------------------------------------------ utils
 
@@ -207,9 +212,109 @@ class A2AService:
 
     # ------------------------------------------------------------- INBOUND
 
-    async def handle_inbound(self, owner_id: uuid.UUID, envelope: A2AEnvelope) -> A2AEnvelope:
+    async def handle_inbound_response(
+        self, owner_id: uuid.UUID, envelope: A2AEnvelope
+    ) -> A2AEnvelope | None:
+        """Process and verify an inbound response for a previously sent task or request."""
+        local_agent_id = await self.local_agent_id()
+
+        if envelope.recipient != local_agent_id:
+            raise A2AError(
+                A2AErrorCode.NOT_ADDRESSED_TO_US,
+                "Message is not addressed to this agent.",
+            )
+
+        # 1. Lookup local task
+        async with self._session_factory() as session:
+            task = await self._tasks.get(session, owner_id, envelope.task_id)
+        if task is None:
+            logger.warning("Received response for unknown task_id: %s from %s", envelope.task_id, envelope.sender)
+            raise A2AError(
+                A2AErrorCode.INVALID_RESPONSE,
+                f"Task {envelope.task_id} not found locally.",
+            )
+
+        # 2. Check sender matches task recipient
+        if envelope.sender != task.recipient_agent_id:
+            raise A2AError(
+                A2AErrorCode.INVALID_RESPONSE,
+                f"Response sender {envelope.sender} does not match expected {task.recipient_agent_id}",
+            )
+
+        # 3. Verify sender trust and signature
+        async with self._session_factory() as session:
+            sender_record = await self._trusted.get(session, owner_id, envelope.sender)
+        if sender_record is None:
+            raise A2AError(
+                A2AErrorCode.UNTRUSTED_SENDER,
+                "Sender is not a registered trusted agent.",
+            )
+        if sender_record.status == TrustStatus.REVOKED.value:
+            raise A2AError(
+                A2AErrorCode.REVOKED_SENDER,
+                "Sender's trust has been revoked.",
+            )
+
+        if not signing.agent_id_matches_key(envelope.sender, sender_record.public_key):
+            raise A2AError(
+                A2AErrorCode.IDENTITY_MISMATCH,
+                "Registered key no longer matches the sender identity.",
+            )
+        if not signing.verify_envelope_signature(envelope, sender_record.public_key):
+            raise A2AError(
+                A2AErrorCode.INVALID_SIGNATURE,
+                "Response signature verification failed.",
+            )
+
+        # 4. Time window validation
+        validate_time_window(envelope, max_clock_skew_seconds=self._max_clock_skew)
+
+        # 5. Replay protection
+        async with self._session_factory() as session:
+            record = A2AMessageRecord(
+                owner_id=owner_id,
+                message_id=envelope.message_id,
+                task_id=envelope.task_id,
+                sender_agent_id=envelope.sender,
+                recipient_agent_id=envelope.recipient,
+                message_type=envelope.message_type,
+                purpose=envelope.purpose,
+                status="received",
+            )
+            is_new = await self._records.try_record(session, record)
+            if not is_new:
+                logger.info("Duplicate response message %s for task %s (idempotent ignore)", envelope.message_id, envelope.task_id)
+                return None
+            await session.commit()
+
+        # 6. Update local task status
+        resp_status = (envelope.payload or {}).get("status")
+        final_status = TaskStatus.COMPLETED
+        if resp_status in {"rejected", "failed"}:
+            final_status = TaskStatus.REJECTED
+
+        async with self._session_factory() as session:
+            task.status = final_status.value
+            task.response_payload = envelope.payload
+            task.completed_at = datetime.now(timezone.utc)
+            await self._tasks.upsert(session, task)
+            await session.commit()
+
+        # 7. Notify callbacks (e.g. workflows and orchestration runs)
+        for callback in self._task_completion_callbacks:
+            try:
+                await callback(envelope.task_id, envelope.payload)
+            except Exception as exc:
+                logger.error("Task completion callback error for %s: %s", envelope.task_id, exc)
+
+        return None
+
+    async def handle_inbound(self, owner_id: uuid.UUID, envelope: A2AEnvelope) -> A2AEnvelope | None:
         """Verify + authorize + process one inbound request; return a SIGNED
         response envelope. Raises A2AError for every rejection."""
+        if envelope.message_type in {"response", "task_response"}:
+            return await self.handle_inbound_response(owner_id, envelope)
+
         local_agent_id = await self.local_agent_id()
 
         # Recipient check: the envelope must be addressed to this agent.
@@ -349,6 +454,65 @@ class A2AService:
         return await self._sign_response(
             envelope, disclosure.task_status, disclosure.to_payload()
         )
+
+    async def handle_inbound_response(
+        self, owner_id: uuid.UUID, envelope_data: dict[str, Any] | A2AEnvelope
+    ) -> dict[str, Any] | None:
+        """Process an inbound response or task_response from a remote agent."""
+        if isinstance(envelope_data, dict):
+            try:
+                envelope = A2AEnvelope.model_validate(envelope_data)
+            except Exception as exc:
+                logger.warning("Invalid envelope format for inbound response: %s", exc)
+                return None
+        else:
+            envelope = envelope_data
+
+        local_agent_id = await self.local_agent_id()
+        if envelope.recipient != local_agent_id:
+            logger.warning("Inbound response not addressed to us: %s", envelope.recipient)
+            return None
+
+        # Verify sender
+        async with self._session_factory() as session:
+            sender_record = await self._trusted.get(session, owner_id, envelope.sender)
+        if sender_record is None:
+            logger.warning("Inbound response from untrusted sender: %s", envelope.sender)
+            return None
+
+        if not signing.agent_id_matches_key(envelope.sender, sender_record.public_key):
+            logger.warning("Sender key mismatch for: %s", envelope.sender)
+            return None
+
+        if not signing.verify_envelope_signature(envelope, sender_record.public_key):
+            logger.warning("Signature verification failed on inbound response from %s", envelope.sender)
+            return None
+
+        # Correlate task in database
+        task_id = envelope.task_id
+        async with self._session_factory() as session:
+            task = await self._tasks.get(session, owner_id, task_id)
+            if task is not None:
+                await self._tasks.update_status(
+                    session,
+                    owner_id,
+                    task_id,
+                    status=TaskStatus.COMPLETED.value,
+                    response_payload=envelope.payload,
+                    completed_at=datetime.now(timezone.utc),
+                )
+                await session.commit()
+
+        # Fire registered callbacks
+        for cb in self._task_completion_callbacks:
+            try:
+                res = cb(task_id, envelope.payload)
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception as exc:
+                logger.error("Error in task completion callback: %s", exc)
+
+        return {"status": "completed", "task_id": task_id, "payload": envelope.payload}
 
     async def _handle_inbound_task(
         self, owner_id: uuid.UUID, envelope: A2AEnvelope, local_agent_id: str
@@ -652,6 +816,26 @@ class A2AService:
             target_endpoint, signed_request.model_dump()
         )
 
+        if isinstance(response_data, dict) and response_data.get("status") == "queued":
+            async with self._session_factory() as session:
+                await self._tasks.upsert(
+                    session,
+                    A2ATask(
+                        owner_id=owner_id,
+                        task_id=task_id,
+                        sender_agent_id=local_agent_id,
+                        recipient_agent_id=recipient_agent_id,
+                        status=TaskStatus.WAITING_REMOTE.value,
+                    ),
+                )
+                await session.commit()
+            return {
+                "task_id": task_id,
+                "recipient": recipient_agent_id,
+                "status": "queued",
+                "relay_id": response_data.get("relay_id"),
+            }
+
         # Verify the response envelope.
         try:
             response = A2AEnvelope.model_validate(response_data)
@@ -795,6 +979,30 @@ class A2AService:
         response_data = await self._transport.send(
             target_endpoint, signed_request.model_dump()
         )
+
+        if isinstance(response_data, dict) and response_data.get("status") == "queued":
+            async with self._session_factory() as session:
+                await self._tasks.upsert(
+                    session,
+                    A2ATask(
+                        owner_id=owner_id,
+                        task_id=task_id,
+                        sender_agent_id=local_agent_id,
+                        recipient_agent_id=recipient_agent_id,
+                        status=TaskStatus.WAITING_REMOTE.value,
+                        task_type=task_type,
+                        purpose=purpose,
+                        request_payload=payload or {},
+                        expires_at=parse_iso(expires_at_iso),
+                    ),
+                )
+                await session.commit()
+            return {
+                "task_id": task_id,
+                "recipient": recipient_agent_id,
+                "status": "queued",
+                "relay_id": response_data.get("relay_id"),
+            }
 
         try:
             response = A2AEnvelope.model_validate(response_data)

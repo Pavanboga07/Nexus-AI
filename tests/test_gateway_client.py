@@ -54,12 +54,14 @@ async def test_gateway_transport_routing(mock_identity: MagicMock) -> None:
         "payload": {},
     }
 
-    # 1. HTTP endpoint goes to HTTP transport
+    # 1. When gateway is connected, Gateway is preferred even if endpoint is http
+    mock_client.is_connected = True
+    res_gw = await transport.send("http://remote.agent.com/a2a", envelope)
+    assert res_gw == {"status": "gateway_ok"}
+    mock_client.send_relay_envelope.assert_awaited_once_with(envelope)
+
+    # 2. When gateway is disconnected, falls back to HTTP transport
+    mock_client.is_connected = False
     res_http = await transport.send("http://remote.agent.com/a2a", envelope)
     assert res_http == {"status": "http_ok"}
     mock_http.send.assert_awaited_once_with("http://remote.agent.com/a2a", envelope)
-
-    # 2. WebSocket endpoint goes to gateway client
-    res_gw = await transport.send("ws://gateway.example.com:9000/ws", envelope)
-    assert res_gw == {"status": "gateway_ok"}
-    mock_client.send_relay_envelope.assert_awaited_once_with(envelope)

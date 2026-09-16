@@ -104,6 +104,27 @@ class OrchestrationExecuteResponse(BaseModel):
     details: dict[str, Any] | None = None
 
 
+class OrchestrationApproveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    decision: str = "approve"
+    notes: str | None = None
+
+
+class OrchestrationRejectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: str = "User declined"
+
+
+class OrchestrationCancelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: str = "User cancelled"
+
+
+class OrchestrationTrustRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    display_name: str | None = None
+
+
 class OrchestrationRunResponse(BaseModel):
     run_id: str
     session_id: str
@@ -112,8 +133,16 @@ class OrchestrationRunResponse(BaseModel):
     state: str
     target_person: str | None = None
     target_agent_id: str | None = None
+    task_id: str | None = None
+    workflow_id: str | None = None
     requires_approval: bool = False
     approval_prompt: str | None = None
+    approval_reason: str | None = None
+    requested_action: str | None = None
+    approval_target: str | None = None
+    approval_category: str | None = None
+    approval_purpose: str | None = None
+    owner_decision: str | None = None
     result: dict[str, Any] | None = None
     error: str | None = None
     created_at: str
