@@ -281,6 +281,7 @@ class WorkflowService:
                 status=wf.status,
                 purpose=wf.purpose,
             )
+            await self._sync_linked_runs(wf.workflow_id)
             return True
         return False
 

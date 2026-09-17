@@ -1002,6 +1002,15 @@ async def test_a8_approve_workflow_backed_orchestration_single_consent(
         await session.commit()
         run_id = run.id
 
+    orig_create = policy_service.create_consent
+    mint_calls: list[dict] = []
+
+    async def _mint_spy(owner_id, *args, **kwargs):
+        mint_calls.append({"owner_id": owner_id, "args": args, "kwargs": kwargs})
+        return await orig_create(owner_id, *args, **kwargs)
+
+    policy_service.create_consent = _mint_spy  # type: ignore[method-assign]
+
     mock_target = AsyncMock()
     mock_target.resolve.return_value = TargetResolution(
         target_name="Rahul",
@@ -1028,6 +1037,12 @@ async def test_a8_approve_workflow_backed_orchestration_single_consent(
         if c.single_use and c.decision == "ALLOW" and c.used_at is None
     ]
     assert lingering == []
+    assert len(mint_calls) == 1
+    step_mint = mint_calls[0]["kwargs"]
+    assert step_mint["data_category"] == "calendar"
+    assert step_mint["action"] == "read"
+    assert step_mint["purpose"] == "a8_single_consent"
+    assert step_mint["requester_agent_id"] == "nexus:self"
 
 
 @pytest.mark.asyncio
@@ -1083,3 +1098,140 @@ async def test_a8_complete_linked_workflow_syncs_run(
 
     run_after = await autonomy_service_instance.get_run(test_owner, run_id)
     assert run_after.status == RunStatus.COMPLETED.value
+
+
+@pytest.mark.asyncio
+async def test_a8_direct_path_orchestration_mints_single_consent(
+    db_session_factory,
+    policy_service: PolicyService,
+    test_owner: uuid.UUID,
+):
+    """Direct-path orchestration approve must mint exact-scope consent (A8d)."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from app.orchestration.models import OrchestrationState
+    from app.orchestration.orchestrator import AgentOrchestrator
+    from app.orchestration.repository import OrchestrationRunRepository
+    from app.orchestration.schemas import TargetResolution, TargetResolutionStatus
+
+    runs_repo = OrchestrationRunRepository()
+    async with db_session_factory() as session:
+        run = await runs_repo.create(
+            session,
+            owner_id=test_owner,
+            session_id="a8-direct",
+            goal="A8 direct path",
+            intent_type="COORDINATE_MEETING",
+            state=OrchestrationState.WAITING_APPROVAL.value,
+            target_person="Rahul",
+            target_agent_id="nexus:anonymous",
+            plan={
+                "goal": "A8 direct",
+                "intent_type": "COORDINATE_MEETING",
+                "target_person": "Rahul",
+                "target_agent_id": "nexus:anonymous",
+                "steps": [],
+            },
+            workflow_id=None,
+        )
+        await runs_repo.set_approval_request(
+            session,
+            run.id,
+            reason="Direct approval needed",
+            requested_action="disclose_information",
+            approval_target="Rahul",
+            approval_category="availability",
+            approval_purpose="direct_path_check",
+            approval_step=1,
+        )
+        await session.commit()
+        run_id = run.id
+
+    orig_create = policy_service.create_consent
+    calls: list[dict] = []
+
+    async def _spy(owner_id, *args, **kwargs):
+        calls.append({"owner_id": owner_id, "args": args, "kwargs": kwargs})
+        return await orig_create(owner_id, *args, **kwargs)
+
+    policy_service.create_consent = _spy  # type: ignore[method-assign]
+
+    mock_target = AsyncMock()
+    mock_target.resolve.return_value = TargetResolution(
+        target_name="Rahul",
+        status=TargetResolutionStatus.KNOWN_AGENT,
+        agent_id="nexus:anonymous",
+        display_name="Rahul",
+        is_trusted=True,
+    )
+    mock_executor = AsyncMock()
+    mock_executor.execute_plan.return_value = {
+        "status": "completed",
+        "message": "direct ok",
+    }
+    orchestrator = AgentOrchestrator(
+        session_factory=db_session_factory,
+        a2a_service=MagicMock(),
+        policy_service=policy_service,
+        intent_resolver=MagicMock(),
+        target_resolver=mock_target,
+        executor=mock_executor,
+        workflow_service=None,
+    )
+    await orchestrator.approve_run(test_owner, run_id)
+
+    assert len(calls) == 1
+    minted = calls[0]["kwargs"]
+    assert minted["action"] == "disclose_information"
+    assert minted["data_category"] == "availability"
+    assert minted["purpose"] == "direct_path_check"
+    assert minted["requester_agent_id"] == "nexus:anonymous"
+    assert minted["single_use"] is True
+
+
+@pytest.mark.asyncio
+async def test_a8_expiry_via_get_syncs_linked_run(
+    autonomy_service_instance: AutonomyService,
+    db_session_factory,
+    test_owner: uuid.UUID,
+):
+    """Expiring via get_workflow (no advance) must sync WAITING runs (A8e)."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.autonomy.models import AutonomyRun
+    from app.schemas.workflows import WorkflowStepSpec
+    from app.workflows.models import Workflow, WorkflowStatus
+
+    wf_service: WorkflowService = autonomy_service_instance._workflows
+    wf = await wf_service.create_workflow(
+        test_owner,
+        workflow_type="meeting_coordination",
+        purpose="a8_expiry_get",
+        steps=[
+            WorkflowStepSpec(
+                step_type="availability_check",
+                input_payload={"candidate_slots": ["10:00"]},
+            ),
+        ],
+    )
+    async with db_session_factory() as session:
+        db_wf = await session.get(Workflow, wf.workflow_id)
+        assert db_wf is not None
+        db_wf.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        linked = AutonomyRun(
+            owner_id=test_owner,
+            workflow_id=wf.workflow_id,
+            goal="A8 expiry orphan",
+            status=RunStatus.WAITING_APPROVAL.value,
+            started_at=datetime.now(timezone.utc),
+        )
+        session.add(linked)
+        await session.commit()
+        run_id = linked.id
+
+    expired = await wf_service.get_workflow(test_owner, wf.workflow_id)
+    assert expired.status == WorkflowStatus.EXPIRED.value
+
+    run_after = await autonomy_service_instance.get_run(test_owner, run_id)
+    assert run_after.status == RunStatus.FAILED.value
+    assert run_after.failure_reason is not None
