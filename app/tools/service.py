@@ -23,7 +23,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.policy.engine import EvaluationRequest
+from app.authz import Action, Authorizer, Requester
 from app.policy.models import PolicyDecision
 from app.policy.service import PolicyService
 from app.tools.errors import ToolError, ToolErrorCode
@@ -40,9 +40,9 @@ from app.tools.schemas import (
 
 logger = logging.getLogger("nexus.tools.service")
 
-#: The requester identity for self-initiated tool calls is the Nexus agent
-#: itself (Part 6 A2A will introduce external requester identities).
-SELF_REQUESTER = "nexus:self"
+#: Deprecated alias for :data:`app.authz.Requester.SELF`. Kept because tests and
+#: older call sites refer to it; the Authorizer now owns this vocabulary.
+SELF_REQUESTER = Requester.SELF
 
 
 class ToolService:
@@ -57,6 +57,8 @@ class ToolService:
     ) -> None:
         self._registry = registry
         self._policy = policy_service
+        # M5: authorization goes through the single entry point.
+        self._authorizer = Authorizer(policy_service)
         self._session_factory = session_factory
         self._repo = ToolExecutionRepository()
         self._timeout = timeout_seconds
@@ -101,14 +103,14 @@ class ToolService:
         request_id = invocation.request_id or f"req_{uuid.uuid4().hex[:16]}"
 
         # --- Policy gate (Part 4). Never skipped. ---
-        policy_result = await self._policy.evaluate(
+        # Routed through the single authorization entry point (M5) so the action
+        # vocabulary and request shape cannot drift from the other call sites.
+        policy_result = await self._authorizer.check(
             owner_id,
-            EvaluationRequest(
-                requester_agent_id=SELF_REQUESTER,
-                data_category=tool.data_category,
-                action="access_tool",
-                purpose=invocation.purpose,
-            ),
+            Requester.local(),
+            Action.ACCESS_TOOL,
+            data_category=tool.data_category,
+            purpose=invocation.purpose,
         )
 
         if policy_result.decision is PolicyDecision.DENY:

@@ -39,9 +39,16 @@ class SessionNotFoundError(KeyError):
 
 @dataclass
 class Session:
-    """A single conversation and its message history."""
+    """A single conversation and its message history.
+
+    ``owner_id`` is part of the session, not an ambient property of the
+    process. Before multi-tenancy the owner came from a process-wide cache, so
+    every request served the same principal and one user could read another's
+    conversation by guessing its id.
+    """
 
     session_id: str
+    owner_id: uuid.UUID | None = None
     messages: list[Message] = field(default_factory=list)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -74,25 +81,33 @@ class Session:
 
 
 class SessionStore(ABC):
-    """Interface every session backend must satisfy."""
+    """Interface every session backend must satisfy.
+
+    Every method takes the acting ``owner_id`` explicitly. This is the
+    tenancy boundary: a store must never return another owner's data, and the
+    only way to guarantee that is to make ownership a required argument rather
+    than something the store resolves for itself.
+    """
 
     @abstractmethod
-    async def create_session(self) -> Session: ...
+    async def create_session(self, owner_id: uuid.UUID) -> Session: ...
 
     @abstractmethod
-    async def get_session(self, session_id: str) -> Session: ...
+    async def get_session(self, owner_id: uuid.UUID, session_id: str) -> Session: ...
 
     @abstractmethod
-    async def add_message(self, session_id: str, role: str, content: str) -> Message: ...
+    async def add_message(
+        self, owner_id: uuid.UUID, session_id: str, role: str, content: str
+    ) -> Message: ...
 
     @abstractmethod
-    async def clear_session(self, session_id: str) -> Session: ...
+    async def clear_session(self, owner_id: uuid.UUID, session_id: str) -> Session: ...
 
     @abstractmethod
-    async def delete_session(self, session_id: str) -> None: ...
+    async def delete_session(self, owner_id: uuid.UUID, session_id: str) -> None: ...
 
     @abstractmethod
-    async def list_sessions(self) -> list[str]: ...
+    async def list_sessions(self, owner_id: uuid.UUID) -> list[str]: ...
 
 
 class InMemorySessionStore(SessionStore):
@@ -100,40 +115,45 @@ class InMemorySessionStore(SessionStore):
 
     Safe for concurrent use within a single event loop: every mutation is
     guarded by an ``asyncio.Lock``.
+
+    Sessions are keyed by ``(owner_id, session_id)`` so a session id is not
+    globally guessable across owners.
     """
 
     def __init__(self, *, max_messages: int = 100) -> None:
-        self._sessions: dict[str, Session] = {}
+        self._sessions: dict[tuple[uuid.UUID, str], Session] = {}
         self._lock = asyncio.Lock()
         self._max_messages = max_messages
 
-    async def create_session(self) -> Session:
-        session = Session(session_id=str(uuid.uuid4()))
+    async def create_session(self, owner_id: uuid.UUID) -> Session:
+        session = Session(session_id=str(uuid.uuid4()), owner_id=owner_id)
         async with self._lock:
-            self._sessions[session.session_id] = session
+            self._sessions[(owner_id, session.session_id)] = session
         logger.info("session_created session_id=%s", session.session_id)
         return session
 
-    async def get_session(self, session_id: str) -> Session:
+    async def get_session(self, owner_id: uuid.UUID, session_id: str) -> Session:
         async with self._lock:
-            session = self._sessions.get(session_id)
+            session = self._sessions.get((owner_id, session_id))
         if session is None:
             raise SessionNotFoundError(session_id)
         return session
 
-    async def add_message(self, session_id: str, role: str, content: str) -> Message:
+    async def add_message(
+        self, owner_id: uuid.UUID, session_id: str, role: str, content: str
+    ) -> Message:
         async with self._lock:
-            session = self._sessions.get(session_id)
+            session = self._sessions.get((owner_id, session_id))
             if session is None:
                 raise SessionNotFoundError(session_id)
             message = session.append(role, content)
             session.trim(self._max_messages)
         return message
 
-    async def clear_session(self, session_id: str) -> Session:
+    async def clear_session(self, owner_id: uuid.UUID, session_id: str) -> Session:
         """Empty a session's history but keep the session id valid."""
         async with self._lock:
-            session = self._sessions.get(session_id)
+            session = self._sessions.get((owner_id, session_id))
             if session is None:
                 raise SessionNotFoundError(session_id)
             session.messages.clear()
@@ -141,16 +161,16 @@ class InMemorySessionStore(SessionStore):
         logger.info("session_cleared session_id=%s", session_id)
         return session
 
-    async def delete_session(self, session_id: str) -> None:
+    async def delete_session(self, owner_id: uuid.UUID, session_id: str) -> None:
         async with self._lock:
-            if session_id not in self._sessions:
+            if (owner_id, session_id) not in self._sessions:
                 raise SessionNotFoundError(session_id)
-            del self._sessions[session_id]
+            del self._sessions[(owner_id, session_id)]
         logger.info("session_deleted session_id=%s", session_id)
 
-    async def list_sessions(self) -> list[str]:
+    async def list_sessions(self, owner_id: uuid.UUID) -> list[str]:
         async with self._lock:
-            return list(self._sessions.keys())
+            return [sid for (owner, sid) in self._sessions if owner == owner_id]
 
 
 __all__ = [

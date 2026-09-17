@@ -37,6 +37,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from app.observability import POLICY_DECISIONS
 from app.policy.models import (
     SENSITIVE_DEFAULT_DENY,
     WILDCARD,
@@ -137,6 +138,29 @@ class PolicyEngine:
     """Pure evaluation over in-memory rule sets."""
 
     def evaluate(
+        self,
+        request: EvaluationRequest,
+        *,
+        policies: list[Policy],
+        consents: list[Consent],
+        now: datetime | None = None,
+    ) -> EvaluationResult:
+        """Evaluate, and count the outcome (M11).
+
+        The metric is recorded here rather than in the caller because this is
+        the single point every decision passes through - the service, the A2A
+        pipeline and the autonomy engine all reach the engine this way, so one
+        call site covers all of them and none can forget.
+
+        ASK and DENY are separated in the labels specifically so an alert can
+        fire on "denials spiked" or "everything is asking for approval", which
+        are the two failure modes a policy engine actually has.
+        """
+        result = self._evaluate(request, policies=policies, consents=consents, now=now)
+        POLICY_DECISIONS.inc(1, decision=result.decision.value)
+        return result
+
+    def _evaluate(
         self,
         request: EvaluationRequest,
         *,

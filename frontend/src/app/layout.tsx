@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Nexus",
-  description: "Your personal AI assistant",
+  description: "Your personal AI agent, and the people its agent talks to",
 };
 
 export default function RootLayout({

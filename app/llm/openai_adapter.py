@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from urllib.parse import urlsplit
 
 import httpx
@@ -29,6 +30,7 @@ from app.llm.base import (
     LLMTimeoutError,
     Message,
 )
+from app.observability import LLM_LATENCY
 
 logger = logging.getLogger("nexus.llm.openai_compatible")
 
@@ -77,6 +79,8 @@ class OpenAICompatibleProvider(LLMProvider):
         base_url: str | None = None,
         timeout: float = 60.0,
         extra_headers: dict[str, str] | None = None,
+        max_attempts: int = 3,
+        retry_base_seconds: float = 0.5,
     ) -> None:
         if not api_key:
             raise LLMConfigurationError(
@@ -86,8 +90,11 @@ class OpenAICompatibleProvider(LLMProvider):
 
         self._model = model
         self._timeout = timeout
-        self._empty_response_retries = 1
-        self._empty_response_backoff = 0.5
+        # M7: retry transient failures, not just empty responses. A single
+        # empty-response retry was previously the entire resilience story, so a
+        # 502 or a dropped connection was terminal for the user's turn.
+        self._max_attempts = max(1, int(max_attempts))
+        self._retry_base_seconds = max(0.0, float(retry_base_seconds))
         self._client = AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
@@ -100,41 +107,92 @@ class OpenAICompatibleProvider(LLMProvider):
     def model(self) -> str:
         return self._model
 
+    @staticmethod
+    def _is_retryable_status(status_code: int | None) -> bool:
+        """5xx and 429 are worth retrying; 4xx generally is not.
+
+        429 (rate limit) is included: it is explicitly a "try again later"
+        signal. A 400 (malformed request) is not: the same request will fail
+        the same way, so retrying only adds latency.
+        """
+        if status_code is None:
+            return True
+        return status_code >= 500 or status_code == 429
+
     async def generate(self, messages: list[Message]) -> str:
+        """Generate, recording latency and outcome (M11).
+
+        The wrapper exists so the metric cannot be forgotten by a new code path
+        and so the observed duration is the *whole* call including retries and
+        backoff - which is what a caller waits for, and what a latency alert
+        should fire on. Timing only the successful attempt would hide the
+        retry storm that is usually the actual incident.
+        """
+        started = time.perf_counter()
+        try:
+            result = await self._generate_with_retries(messages)
+        except Exception as exc:
+            LLM_LATENCY.observe(
+                time.perf_counter() - started,
+                provider=self.name,
+                outcome=type(exc).__name__,
+            )
+            raise
+        LLM_LATENCY.observe(
+            time.perf_counter() - started,
+            provider=self.name,
+            outcome="success",
+        )
+        return result
+
+    async def _generate_with_retries(self, messages: list[Message]) -> str:
         logger.debug(
             "llm_request provider=%s model=%s messages=%d",
             self.name,
             self._model,
             len(messages),
         )
-        # Some OpenAI-compatible providers (e.g. Groq's on-demand tier,
-        # OpenRouter's free pool) intermittently return 200 with an empty
-        # `choices` array. One retry with a short backoff absorbs that flake.
-        last_error: LLMProviderError | None = None
-        for attempt in range(1 + self._empty_response_retries):
+        last_error: Exception | None = None
+
+        for attempt in range(1, self._max_attempts + 1):
             try:
                 completion = await self._client.chat.completions.create(
                     model=self._model,
                     messages=messages,  # type: ignore[arg-type]
                 )
             except AuthenticationError as exc:
+                # Never retry: the key is wrong, and retrying risks lockout.
                 raise LLMConfigurationError(
                     "The LLM provider rejected the configured API key."
                 ) from exc
             except APITimeoutError as exc:
-                raise LLMTimeoutError(
+                last_error = LLMTimeoutError(
                     f"The LLM provider did not respond within {self._timeout:g}s."
-                ) from exc
+                )
+                if await self._backoff(attempt, "timeout"):
+                    continue
+                raise last_error from exc
             except (APIConnectionError, httpx.TimeoutException) as exc:
-                raise LLMTimeoutError("Could not reach the LLM provider.") from exc
+                last_error = LLMTimeoutError("Could not reach the LLM provider.")
+                if await self._backoff(attempt, "connection_error"):
+                    continue
+                raise last_error from exc
             except RateLimitError as exc:
-                raise LLMProviderError(
+                last_error = LLMProviderError(
                     "LLM provider rate limit reached. Try again shortly."
-                ) from exc
+                )
+                if await self._backoff(attempt, "rate_limited"):
+                    continue
+                raise last_error from exc
             except APIStatusError as exc:
-                raise LLMProviderError(
+                last_error = LLMProviderError(
                     f"The LLM provider returned an error (status {exc.status_code})."
-                ) from exc
+                )
+                if self._is_retryable_status(
+                    getattr(exc, "status_code", None)
+                ) and await self._backoff(attempt, f"status_{exc.status_code}"):
+                    continue
+                raise last_error from exc
             except Exception as exc:  # noqa: BLE001 - normalise unknown failures
                 raise LLMProviderError(
                     "Unexpected error from the LLM provider."
@@ -143,16 +201,13 @@ class OpenAICompatibleProvider(LLMProvider):
             try:
                 content = self._extract_content(completion)
             except LLMProviderError as exc:
+                # Some compatible providers return 200 with an empty choices
+                # array; that is transient, so retry it too.
                 last_error = exc
-                if attempt < self._empty_response_retries:
-                    logger.warning(
-                        "llm_empty_response provider=%s attempt=%d retrying",
-                        self.name,
-                        attempt + 1,
-                    )
-                    await asyncio.sleep(self._empty_response_backoff)
+                if await self._backoff(attempt, "empty_response"):
                     continue
                 raise
+
             logger.debug(
                 "llm_response provider=%s chars=%d", self.name, len(content)
             )
@@ -161,6 +216,30 @@ class OpenAICompatibleProvider(LLMProvider):
         raise last_error if last_error else LLMProviderError(  # pragma: no cover
             "Unexpected error from the LLM provider."
         )
+
+    async def _backoff(self, attempt: int, reason: str) -> bool:
+        """Sleep before the next attempt. False when attempts are exhausted.
+
+        Exponential with jitter: without jitter, every request that failed
+        during an outage retries in lockstep and keeps the provider saturated.
+        """
+        if attempt >= self._max_attempts:
+            return False
+        from app.jobs.queue import compute_backoff_seconds
+
+        delay = compute_backoff_seconds(
+            attempt, base_seconds=self._retry_base_seconds or 0.5, max_seconds=30.0
+        )
+        logger.warning(
+            "llm_retry provider=%s attempt=%d/%d reason=%s delay=%.2fs",
+            self.name,
+            attempt,
+            self._max_attempts,
+            reason,
+            delay,
+        )
+        await asyncio.sleep(delay)
+        return True
 
     @staticmethod
     def _extract_content(completion: object) -> str:

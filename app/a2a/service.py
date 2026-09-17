@@ -25,6 +25,7 @@ trusted agent still gets evaluated by policy, and DENY/ASK return no data.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from typing import Any
@@ -35,6 +36,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.a2a import signing
 from app.a2a.disclosure import build_disclosure
+from app.a2a.capabilities import (
+    CapabilityPayloadError,
+    CapabilitySpec,
+    validate_payload_against_schema,
+    version_compatible,
+)
 from app.a2a.errors import A2AError, A2AErrorCode
 from app.a2a.handlers import (
     TaskContext,
@@ -68,7 +75,9 @@ from app.a2a.schemas import (
     utc_now_iso,
     validate_request_payload,
 )
+from app.a2a.tracing import trace_context_for_outbound
 from app.a2a.transport import A2ATransport, validate_endpoint
+from app.observability import A2A_OUTCOMES
 from app.identity.service import IdentityService
 from app.memory.manager import MemoryManager
 from app.policy.engine import EvaluationRequest
@@ -116,10 +125,125 @@ class A2AService:
         self._tasks = TaskRepository()
         self._records = MessageRecordRepository()
         self._task_completion_callbacks: list[Any] = []
+        #: Capability contracts this agent offers, keyed by capability id.
+        #: Empty means "no capability contracts declared", in which case a 0.2
+        #: request that names one is refused with UNSUPPORTED_CAPABILITY rather
+        #: than being accepted unvalidated.
+        self._capabilities: dict[str, CapabilitySpec] = {}
+        self._register_default_capabilities()
 
     def register_task_completion_callback(self, callback: Any) -> None:
         """Register an async callback (task_id, payload) invoked upon remote task response."""
         self._task_completion_callbacks.append(callback)
+
+    # --- Capability contracts (M6) -------------------------------------------
+
+    def register_capability(self, spec: CapabilitySpec) -> None:
+        """Declare a capability this agent offers.
+
+        Registration is explicit rather than derived, so what an agent
+        advertises and what it will accept cannot diverge silently.
+        """
+        self._capabilities[spec.id] = spec
+        logger.info(
+            "capability_registered id=%s version=%s category=%s",
+            spec.id,
+            spec.version,
+            spec.data_category,
+        )
+
+    @property
+    def capabilities(self) -> dict[str, CapabilitySpec]:
+        return dict(self._capabilities)
+
+    def _register_default_capabilities(self) -> None:
+        """Register contracts for the capabilities this agent actually serves.
+
+        These mirror the task handlers: every handler that can execute a
+        request gets a declared contract, so a caller can build a valid request
+        instead of guessing the payload shape.
+        """
+        from app.a2a.capabilities import CapabilitySpec as _Spec
+
+        defaults = [
+            _Spec(
+                id="calendar.availability",
+                version="1.0",
+                description="Check whether the owner is available at a time.",
+                data_category="availability",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "requested_time": {"type": "string", "maxLength": 128},
+                        "date": {"type": "string", "maxLength": 128},
+                    },
+                    "additionalProperties": True,
+                },
+                output_schema={"type": "object"},
+            ),
+            _Spec(
+                id="calendar.propose_meeting",
+                version="1.0",
+                description="Propose a meeting time to the owner.",
+                data_category="schedule",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "proposed_time": {"type": "string", "maxLength": 128},
+                        "duration_minutes": {"type": "integer", "minimum": 5,
+                                             "maximum": 480},
+                    },
+                    "additionalProperties": True,
+                },
+                output_schema={"type": "object"},
+            ),
+            _Spec(
+                id="information.request",
+                version="1.0",
+                description="Request a policy-permitted piece of information.",
+                data_category="preferences",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "maxLength": 500},
+                    },
+                    "additionalProperties": True,
+                },
+                output_schema={"type": "object"},
+            ),
+        ]
+        for spec in defaults:
+            self._capabilities[spec.id] = spec
+
+    # --- Public collaborators (M5) -------------------------------------------
+    # ``TargetResolver`` and the discovery route used to reach through to
+    # ``a2a_service._trusted`` and ``a2a_service._session_factory()``. Those are
+    # implementation details; exposing them made the dependency invisible and
+    # let a refactor break callers silently.
+
+    @property
+    def trusted_agents(self) -> TrustedAgentRepository:
+        """Repository the service uses for the trusted-agent registry."""
+        return self._trusted
+
+    @property
+    def session_factory(self) -> async_sessionmaker[AsyncSession]:
+        """Session factory, for collaborators that must share this service's DB."""
+        return self._session_factory
+
+    async def list_trusted_agent_ids(self, owner_id: uuid.UUID) -> set[str]:
+        """Active trusted-agent ids for an owner.
+
+        The single supported way to ask "who do I already trust?", used by the
+        directory route instead of poking at the repository.
+        """
+        async with self._session_factory() as session:
+            from app.a2a.models import TrustStatus
+
+            agents = await self._trusted.list_active(session, owner_id)
+        return {
+            a.agent_id for a in agents if a.status == TrustStatus.ACTIVE.value
+        }
 
     # ------------------------------------------------------------------ utils
 
@@ -131,6 +255,12 @@ class A2AService:
             )
 
     async def local_agent_id(self) -> str:
+        """The local agent's current cryptographic id.
+
+        The bound identity reports the id captured when the adapter was built;
+        a key rotation changes the real agent_id, so this reflects the identity
+        actually in use for signing.
+        """
         return self._identity.get_public_identity().agent_id
 
     # ------------------------------------------------- trusted-agent registry
@@ -266,7 +396,8 @@ class A2AService:
                 "Response signature verification failed.",
             )
 
-        # 4. Time window validation
+        # 4. Time window validation (expiry + clock skew). Responses are
+        #    just as replayable as requests, so they get the same checks.
         validate_time_window(envelope, max_clock_skew_seconds=self._max_clock_skew)
 
         # 5. Replay protection
@@ -300,18 +431,49 @@ class A2AService:
             await self._tasks.upsert(session, task)
             await session.commit()
 
-        # 7. Notify callbacks (e.g. workflows and orchestration runs)
+        # 7. Notify callbacks (e.g. workflows and orchestration runs).
+        #    Callbacks may be sync or async; both are supported, and a
+        #    failing callback must not corrupt the response handling above.
         for callback in self._task_completion_callbacks:
             try:
-                await callback(envelope.task_id, envelope.payload)
+                result = callback(envelope.task_id, envelope.payload)
+                if asyncio.iscoroutine(result):
+                    await result
             except Exception as exc:
                 logger.error("Task completion callback error for %s: %s", envelope.task_id, exc)
 
         return None
 
-    async def handle_inbound(self, owner_id: uuid.UUID, envelope: A2AEnvelope) -> A2AEnvelope | None:
+    async def handle_inbound(
+        self,
+        owner_id: uuid.UUID,
+        envelope: A2AEnvelope,
+        *,
+        direction: str = "direct",
+    ) -> A2AEnvelope | None:
         """Verify + authorize + process one inbound request; return a SIGNED
-        response envelope. Raises A2AError for every rejection."""
+        response envelope. Raises A2AError for every rejection.
+
+        Records the outcome (M11). The label is the A2A error code rather than a
+        boolean, because "inbound failures spiked" is not actionable while
+        "`UNTRUSTED_SENDER` spiked" points straight at the cause. `direction`
+        separates direct-HTTP arrivals from gateway relays, which is how a
+        transport problem is told apart from a trust problem.
+        """
+        try:
+            result = await self._handle_inbound(owner_id, envelope)
+        except A2AError as exc:
+            A2A_OUTCOMES.inc(
+                1, direction=direction, outcome=f"rejected:{exc.code.value}"
+            )
+            raise
+        except Exception:
+            A2A_OUTCOMES.inc(1, direction=direction, outcome="error:unexpected")
+            raise
+        A2A_OUTCOMES.inc(1, direction=direction, outcome="accepted")
+        return result
+
+    async def _handle_inbound(self, owner_id: uuid.UUID, envelope: A2AEnvelope) -> A2AEnvelope | None:
         if envelope.message_type in {"response", "task_response"}:
             return await self.handle_inbound_response(owner_id, envelope)
 
@@ -399,6 +561,48 @@ class A2AService:
             await self._finalize(owner_id, envelope, "failed", None, "INVALID_ENVELOPE")
             raise A2AError(A2AErrorCode.INVALID_ENVELOPE, str(exc)) from None
 
+        # ---- Capability contract (0.2) --------------------------------------
+        # A 0.2 request may name the capability it is invoking. When it does,
+        # the declaration must be supported and the payload must satisfy its
+        # input schema. Refusing explicitly is the point: before 0.2 there was
+        # nothing to validate against, so a malformed request was either
+        # accepted and mishandled or failed with a generic error.
+        if envelope.capability is not None:
+            spec = self._capabilities.get(envelope.capability.id)
+            if spec is None:
+                await self._finalize(
+                    owner_id, envelope, "failed", None, "UNSUPPORTED_CAPABILITY"
+                )
+                raise A2AError(
+                    A2AErrorCode.UNSUPPORTED_CAPABILITY,
+                    f"This agent does not offer capability "
+                    f"'{envelope.capability.id}'.",
+                )
+            if not version_compatible(envelope.capability.version, spec.version):
+                await self._finalize(
+                    owner_id, envelope, "failed", None, "UNSUPPORTED_CAPABILITY"
+                )
+                raise A2AError(
+                    A2AErrorCode.UNSUPPORTED_CAPABILITY,
+                    f"Capability '{spec.id}' is offered at version "
+                    f"{spec.version}, which is not compatible with the "
+                    f"requested {envelope.capability.version}.",
+                )
+            try:
+                validate_payload_against_schema(
+                    envelope.payload, spec.input_schema, path="payload"
+                )
+            except CapabilityPayloadError as exc:
+                await self._finalize(
+                    owner_id, envelope, "failed", None, "INVALID_ENVELOPE"
+                )
+                raise A2AError(A2AErrorCode.INVALID_ENVELOPE, str(exc)) from None
+            # The capability's declared category is authoritative for policy:
+            # a caller must not widen disclosure by naming a different category
+            # in the payload than the capability advertises.
+            if spec.data_category:
+                data_category = spec.data_category
+
         policy_result = await self._policy.evaluate(
             owner_id,
             EvaluationRequest(
@@ -455,64 +659,49 @@ class A2AService:
             envelope, disclosure.task_status, disclosure.to_payload()
         )
 
-    async def handle_inbound_response(
+    async def handle_gateway_delivery(
         self, owner_id: uuid.UUID, envelope_data: dict[str, Any] | A2AEnvelope
-    ) -> dict[str, Any] | None:
-        """Process an inbound response or task_response from a remote agent."""
+    ) -> A2AEnvelope | None:
+        """Tolerant entry point for envelopes pushed by the Nexus Gateway.
+
+        The gateway is an untrusted relay: anything on the wire may be
+        malformed or hostile. Unlike the strict handlers (which raise
+        ``A2AError`` so the HTTP layer can map it to a status code), this
+        method never raises - a bad frame must not tear down the gateway
+        connection or kill the reader loop.
+
+        Requests are dispatched through :meth:`handle_inbound`, which returns
+        the SIGNED response envelope that the gateway client relays back to
+        the original sender. Responses are dispatched through
+        :meth:`handle_inbound_response` (returning ``None``) and are consumed
+        locally. Every verification step still runs exactly once; a rejection
+        is logged and the frame is dropped.
+        """
+        envelope: A2AEnvelope
         if isinstance(envelope_data, dict):
             try:
                 envelope = A2AEnvelope.model_validate(envelope_data)
             except Exception as exc:
-                logger.warning("Invalid envelope format for inbound response: %s", exc)
+                logger.warning("gateway_delivery_malformed_envelope detail=%s", exc)
                 return None
         else:
             envelope = envelope_data
 
-        local_agent_id = await self.local_agent_id()
-        if envelope.recipient != local_agent_id:
-            logger.warning("Inbound response not addressed to us: %s", envelope.recipient)
+        try:
+            # `direction="gateway"` so a relayed rejection is distinguishable
+            # from a direct one: the same error code arriving over the gateway
+            # and over HTTP points at different causes.
+            return await self.handle_inbound(
+                owner_id, envelope, direction="gateway"
+            )
+        except A2AError as exc:
+            logger.warning(
+                "gateway_delivery_rejected code=%s message=%s sender=%s",
+                exc.code.value,
+                exc.message,
+                envelope.sender,
+            )
             return None
-
-        # Verify sender
-        async with self._session_factory() as session:
-            sender_record = await self._trusted.get(session, owner_id, envelope.sender)
-        if sender_record is None:
-            logger.warning("Inbound response from untrusted sender: %s", envelope.sender)
-            return None
-
-        if not signing.agent_id_matches_key(envelope.sender, sender_record.public_key):
-            logger.warning("Sender key mismatch for: %s", envelope.sender)
-            return None
-
-        if not signing.verify_envelope_signature(envelope, sender_record.public_key):
-            logger.warning("Signature verification failed on inbound response from %s", envelope.sender)
-            return None
-
-        # Correlate task in database
-        task_id = envelope.task_id
-        async with self._session_factory() as session:
-            task = await self._tasks.get(session, owner_id, task_id)
-            if task is not None:
-                await self._tasks.update_status(
-                    session,
-                    owner_id,
-                    task_id,
-                    status=TaskStatus.COMPLETED.value,
-                    response_payload=envelope.payload,
-                    completed_at=datetime.now(timezone.utc),
-                )
-                await session.commit()
-
-        # Fire registered callbacks
-        for cb in self._task_completion_callbacks:
-            try:
-                res = cb(task_id, envelope.payload)
-                if asyncio.iscoroutine(res):
-                    await res
-            except Exception as exc:
-                logger.error("Error in task completion callback: %s", exc)
-
-        return {"status": "completed", "task_id": task_id, "payload": envelope.payload}
 
     async def _handle_inbound_task(
         self, owner_id: uuid.UUID, envelope: A2AEnvelope, local_agent_id: str
@@ -731,6 +920,7 @@ class A2AService:
             purpose=request.purpose,
             task_type=request.task_type,
             payload=payload,
+            trace=trace_context_for_outbound(),
         )
         return await signing.sign_envelope(self._identity, response)
 
@@ -788,6 +978,7 @@ class A2AService:
             message_type="request",
             purpose=purpose,
             payload=full_payload,
+            trace=trace_context_for_outbound(),
         )
         signed_request = await signing.sign_envelope(self._identity, request)
 
@@ -948,6 +1139,7 @@ class A2AService:
             task_type=task_type,
             purpose=purpose,
             payload=payload or {},
+            trace=trace_context_for_outbound(),
         )
         signed_request = await signing.sign_envelope(self._identity, request)
 
@@ -1106,6 +1298,7 @@ class A2AService:
             task_type=task.task_type,
             purpose=purpose or task.purpose or "negotiation",
             payload=proposal_payload,
+            trace=trace_context_for_outbound(),
         )
         signed_request = await signing.sign_envelope(self._identity, request)
 

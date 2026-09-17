@@ -278,7 +278,9 @@ async def test_memory_isolation_between_owners(memory_manager, db_owner_id, db_s
 # --- Chat flow with memory (agent-level) ---------------------------------------------
 
 
-async def test_chat_persists_and_injects_memory(db_agent, fake_provider: FakeProvider) -> None:
+async def test_chat_persists_and_injects_memory(
+    db_agent, db_owner_id, fake_provider: FakeProvider
+) -> None:
     """Full pipeline: chat -> extraction (scripted) -> storage -> retrieval
     into the next turn's context."""
     extraction_json = json.dumps(
@@ -296,9 +298,9 @@ async def test_chat_persists_and_injects_memory(db_agent, fake_provider: FakePro
     # Turn 1: chat reply, then the background extraction pops the JSON.
     fake_provider.script = ["Got it!", extraction_json]
 
-    session_obj = await db_agent.create_session()
+    session_obj = await db_agent.create_session(db_owner_id)
     reply = await db_agent.process_message(
-        session_obj.session_id, "I prefer meetings after 6 PM."
+        db_owner_id, session_obj.session_id, "I prefer meetings after 6 PM."
     )
     assert reply == "Got it!"
 
@@ -307,10 +309,10 @@ async def test_chat_persists_and_injects_memory(db_agent, fake_provider: FakePro
 
     # Turn 2 (new session = new context): the memory must be retrieved and
     # injected as a system message before the history.
-    session_obj_2 = await db_agent.create_session()
+    session_obj_2 = await db_agent.create_session(db_owner_id)
     fake_provider.script = ["After 6 PM, of course."]
     await db_agent.process_message(
-        session_obj_2.session_id, "When should I schedule my meetings?"
+        db_owner_id, session_obj_2.session_id, "When should I schedule my meetings?"
     )
 
     second_call = fake_provider.calls[-1]
@@ -320,12 +322,14 @@ async def test_chat_persists_and_injects_memory(db_agent, fake_provider: FakePro
 
 
 async def test_chat_memory_survives_agent_restart(
-    db_session_factory, memory_manager, fake_provider
+    db_session_factory, memory_manager, fake_provider, owner_ids
 ) -> None:
     """The spec §24 critical scenario: stop the 'server' (build a new agent
     with a fresh store), and the memory is still retrieved."""
     from app.agent.agent import NexusAgent
     from app.agent.context import ContextBuilder
+
+    owner_a, _owner_b = owner_ids
 
     extraction_json = json.dumps(
         {
@@ -347,9 +351,9 @@ async def test_chat_memory_survives_agent_restart(
         memory_manager=memory_manager,
     )
     fake_provider.script = ["Noted.", extraction_json]
-    session_obj = await agent_one.create_session()
+    session_obj = await agent_one.create_session(owner_a)
     await agent_one.process_message(
-        session_obj.session_id, "Rahul is my college project partner."
+        owner_a, session_obj.session_id, "Rahul is my college project partner."
     )
     await agent_one.aclose()
 
@@ -363,8 +367,10 @@ async def test_chat_memory_survives_agent_restart(
     )
     fake_provider.calls.clear()
     fake_provider.script = ["Rahul is your college project partner."]
-    session_obj_2 = await agent_two.create_session()
-    reply = await agent_two.process_message(session_obj_2.session_id, "Who is Rahul?")
+    session_obj_2 = await agent_two.create_session(owner_a)
+    reply = await agent_two.process_message(
+        owner_a, session_obj_2.session_id, "Who is Rahul?"
+    )
     assert "project partner" in reply
 
     system_blocks = [m for m in fake_provider.calls[-1] if m["role"] == "system"]

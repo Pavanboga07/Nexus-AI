@@ -41,18 +41,39 @@ TIMESTAMP_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 @dataclass(frozen=True)
 class AgentCapability:
-    """A single capability exposed by an agent."""
+    """A capability exposed by an agent.
+
+    Backward compatible with the pre-M6 free-text form (``name`` +
+    ``description`` + ``data_category``) while carrying the 0.2 contract
+    (``id``, ``version``, input/output schema) when the publisher has one. A
+    0.1 consumer reads the fields it knows and ignores the rest, which is what
+    makes the card format additive rather than breaking.
+    """
 
     name: str
     description: str
     data_category: str
+    #: 0.2 contract fields (None for a free-text-only capability).
+    id: str | None = None
+    version: str | None = None
+    input_schema: dict[str, Any] | None = None
+    output_schema: dict[str, Any] | None = None
 
-    def to_dict(self) -> dict[str, str]:
-        return {
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
             "name": self.name,
             "description": self.description,
             "data_category": self.data_category,
         }
+        if self.id:
+            payload["id"] = self.id
+        if self.version:
+            payload["version"] = self.version
+        if self.input_schema:
+            payload["input_schema"] = self.input_schema
+        if self.output_schema:
+            payload["output_schema"] = self.output_schema
+        return payload
 
 
 def build_card(
@@ -129,6 +150,35 @@ def capabilities_from_tools(tools: list[dict[str, Any]]) -> list[AgentCapability
     return result
 
 
+def capabilities_from_specs(specs: list[Any]) -> list[AgentCapability]:
+    """Convert CapabilitySpec contracts into card capabilities (M6).
+
+    The schemas are included: a caller cannot construct a valid request without
+    them, and they contain no private data (an input schema describes what the
+    agent ACCEPTS, not what it knows).
+
+    ``name`` is emitted alongside ``id`` for backward compatibility with 0.1
+    consumers that only understood the free-text form, so a peer that has not
+    upgraded still sees the capability list.
+    """
+    result: list[AgentCapability] = []
+    for spec in specs:
+        result.append(
+            AgentCapability(
+                # `name` duplicates the id so a 0.1-only consumer still sees a
+                # usable capability list.
+                name=spec.id,
+                description=spec.description,
+                data_category=spec.data_category,
+                id=spec.id,
+                version=spec.version,
+                input_schema=dict(spec.input_schema or {}),
+                output_schema=dict(spec.output_schema or {}),
+            )
+        )
+    return result
+
+
 # --- Card validation (consumer side) ----------------------------------------
 
 
@@ -167,10 +217,17 @@ def validate_card_schema(card: dict[str, Any]) -> None:
             f"Card protocol must be '{PROTOCOL}', got {card.get('protocol')!r}."
         )
 
-    if card.get("version") != PROTOCOL_VERSION:
+    # Accept any protocol version we understand, not just the current one, so a
+    # peer that has not upgraded yet can still be discovered. (Exact-equality
+    # against PROTOCOL_VERSION would make every 0.1 card undiscoverable the
+    # moment we bumped to 0.2.)
+    from app.a2a.schemas import SUPPORTED_PROTOCOL_VERSIONS
+
+    card_version = card.get("version")
+    if card_version not in SUPPORTED_PROTOCOL_VERSIONS:
         raise CardValidationError(
-            f"Card version must be '{PROTOCOL_VERSION}', "
-            f"got {card.get('version')!r}."
+            f"Card version must be one of {SUPPORTED_PROTOCOL_VERSIONS}, "
+            f"got {card_version!r}."
         )
 
     agent_id = card.get("agent_id", "")

@@ -5,9 +5,10 @@ from __future__ import annotations
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from app.agent.agent import NexusAgent
+from app.api.auth_context import request_owner_id
 from app.api.dependencies import get_agent, get_autonomy_service
 from app.autonomy.decision_engine import DecisionRequest
 from app.autonomy.errors import (
@@ -37,8 +38,8 @@ logger = logging.getLogger("nexus.api.autonomy")
 router = APIRouter(prefix="/autonomy", tags=["autonomy"])
 
 
-async def _owner_id(agent: NexusAgent) -> uuid.UUID:
-    return await agent._owner_id()
+async def _owner_id(request: Request) -> uuid.UUID:
+    return request_owner_id(request)
 
 
 @router.get(
@@ -47,10 +48,11 @@ async def _owner_id(agent: NexusAgent) -> uuid.UUID:
     summary="Get current owner autonomy configuration",
 )
 async def get_autonomy_config(
+    request: Request,
     agent: NexusAgent = Depends(get_agent),
     autonomy_service: AutonomyService = Depends(get_autonomy_service),
 ) -> AutonomyConfigOut:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     cfg = await autonomy_service.get_config(owner_id)
     return AutonomyConfigOut(**cfg.to_dict())
 
@@ -61,11 +63,12 @@ async def get_autonomy_config(
     summary="Update owner autonomy configuration",
 )
 async def update_autonomy_config(
+    request: Request,
     payload: AutonomyConfigUpdate,
     agent: NexusAgent = Depends(get_agent),
     autonomy_service: AutonomyService = Depends(get_autonomy_service),
 ) -> AutonomyConfigOut:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     update_data = payload.model_dump(exclude_unset=True)
     if "mode" in update_data and update_data["mode"]:
         update_data["mode"] = update_data["mode"].value
@@ -80,11 +83,12 @@ async def update_autonomy_config(
     summary="Create and start an autonomous run",
 )
 async def create_autonomy_run(
+    request: Request,
     payload: AutonomyRunCreateRequest,
     agent: NexusAgent = Depends(get_agent),
     autonomy_service: AutonomyService = Depends(get_autonomy_service),
 ) -> AutonomyRunOut:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     custom_plan = [p.model_dump() for p in payload.plan] if payload.plan else None
     try:
         run = await autonomy_service.create_run(
@@ -113,13 +117,14 @@ async def create_autonomy_run(
     summary="List owner autonomous runs",
 )
 async def list_autonomy_runs(
+    request: Request,
     status_filter: str | None = Query(None, alias="status"),
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
     agent: NexusAgent = Depends(get_agent),
     autonomy_service: AutonomyService = Depends(get_autonomy_service),
 ) -> AutonomyRunListResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     runs = await autonomy_service.list_runs(
         owner_id, status=status_filter, limit=limit, offset=offset
     )
@@ -133,11 +138,12 @@ async def list_autonomy_runs(
     summary="Get details of an autonomous run",
 )
 async def get_autonomy_run(
+    request: Request,
     run_id: uuid.UUID,
     agent: NexusAgent = Depends(get_agent),
     autonomy_service: AutonomyService = Depends(get_autonomy_service),
 ) -> AutonomyRunOut:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     try:
         run = await autonomy_service.get_run(owner_id, run_id)
     except AutonomyRunNotFoundError as exc:
@@ -154,12 +160,13 @@ async def get_autonomy_run(
     summary="Approve a paused run in waiting_approval status",
 )
 async def approve_autonomy_run(
+    request: Request,
     run_id: uuid.UUID,
     payload: AutonomyApprovalDecisionRequest | None = None,
     agent: NexusAgent = Depends(get_agent),
     autonomy_service: AutonomyService = Depends(get_autonomy_service),
 ) -> AutonomyRunOut:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     notes = payload.notes if payload else None
     try:
         run = await autonomy_service.approve_run(owner_id, run_id, notes=notes)
@@ -182,12 +189,13 @@ async def approve_autonomy_run(
     summary="Reject a paused run in waiting_approval status",
 )
 async def reject_autonomy_run(
+    request: Request,
     run_id: uuid.UUID,
     payload: AutonomyApprovalDecisionRequest | None = None,
     agent: NexusAgent = Depends(get_agent),
     autonomy_service: AutonomyService = Depends(get_autonomy_service),
 ) -> AutonomyRunOut:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     notes = payload.notes if payload else None
     try:
         run = await autonomy_service.reject_run(owner_id, run_id, notes=notes)
@@ -205,11 +213,12 @@ async def reject_autonomy_run(
     summary="Cancel an active autonomous run",
 )
 async def cancel_autonomy_run(
+    request: Request,
     run_id: uuid.UUID,
     agent: NexusAgent = Depends(get_agent),
     autonomy_service: AutonomyService = Depends(get_autonomy_service),
 ) -> AutonomyRunOut:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     try:
         run = await autonomy_service.cancel_run(owner_id, run_id)
     except AutonomyRunNotFoundError as exc:
@@ -226,11 +235,12 @@ async def cancel_autonomy_run(
     summary="Get all decisions made for a run",
 )
 async def get_run_decisions(
+    request: Request,
     run_id: uuid.UUID,
     agent: NexusAgent = Depends(get_agent),
     autonomy_service: AutonomyService = Depends(get_autonomy_service),
 ) -> AutonomyDecisionListResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     decisions = await autonomy_service.list_decisions(owner_id, run_id)
     items = [AutonomyDecisionOut(**d.to_dict()) for d in decisions]
     return AutonomyDecisionListResponse(decisions=items, total=len(items))
@@ -242,11 +252,12 @@ async def get_run_decisions(
     summary="Get audit trail and trigger history for a run",
 )
 async def get_run_audit(
+    request: Request,
     run_id: uuid.UUID,
     agent: NexusAgent = Depends(get_agent),
     autonomy_service: AutonomyService = Depends(get_autonomy_service),
 ) -> AutonomyAuditListResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     audits = await autonomy_service.list_audits(owner_id, run_id)
     items = [
         AutonomyAuditOut(
@@ -266,11 +277,12 @@ async def get_run_audit(
     summary="Evaluate an action against the Decision Engine without executing it",
 )
 async def evaluate_action(
+    request: Request,
     payload: AutonomyEvaluateRequest,
     agent: NexusAgent = Depends(get_agent),
     autonomy_service: AutonomyService = Depends(get_autonomy_service),
 ) -> AutonomyEvaluateResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     req = DecisionRequest(
         action_type=payload.action_type,
         proposed_action=payload.proposed_action,

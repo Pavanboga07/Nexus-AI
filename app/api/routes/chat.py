@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from app import __version__
 from app.agent.agent import NexusAgent
 from app.agent.session import Session, SessionNotFoundError
+from app.api.auth_context import RequestContext, get_request_context
 from app.api.dependencies import get_agent
 from app.config.settings import Settings, get_settings
 from app.llm.base import (
@@ -38,43 +39,9 @@ def _to_session_response(session: Session) -> SessionResponse:
     return SessionResponse(**session.to_dict())  # type: ignore[arg-type]
 
 
-@router.get(
-    "/health",
-    response_model=HealthResponse,
-    tags=["system"],
-    summary="Liveness and configuration probe",
-)
-async def health(
-    request: Request,
-    agent: NexusAgent = Depends(get_agent),
-    settings: Settings = Depends(get_settings),
-) -> HealthResponse:
-    """Liveness probe.
-
-    Always returns 200 while the process is alive. ``llm_configured`` reports
-    whether chat is actually usable, so a missing API key is visible without
-    taking the health check down.
-    """
-    database_ok: bool = getattr(request.app.state, "database_ok", False)
-    identity_ok: bool = getattr(request.app.state, "identity_ok", False)
-    tools_ok: bool = getattr(request.app.state, "tools_ok", False)
-    a2a_ok: bool = getattr(request.app.state, "a2a_ok", False)
-    autonomy_ok: bool = getattr(request.app.state, "autonomy_ok", False)
-    gateway_ok: bool = getattr(request.app.state, "gateway_ok", False)
-    return HealthResponse(
-        status="ok",
-        version=__version__,
-        environment=settings.nexus_env,
-        llm_provider=agent.provider_name,
-        llm_configured=settings.llm_configured,
-        database=database_ok,
-        memory=agent.memory_enabled,
-        identity=identity_ok,
-        tools=tools_ok,
-        a2a=a2a_ok,
-        autonomy=autonomy_ok,
-        gateway=gateway_ok,
-    )
+# NOTE: /health moved to app/api/routes/system.py so it can be mounted WITHOUT
+# the authentication dependency. A liveness probe that requires a session
+# cannot be used by a load balancer or orchestrator.
 
 
 @router.post(
@@ -85,9 +52,10 @@ async def health(
     summary="Create a new conversation session",
 )
 async def create_session(
+    ctx: RequestContext = Depends(get_request_context),
     agent: NexusAgent = Depends(get_agent),
 ) -> SessionCreateResponse:
-    session = await agent.create_session()
+    session = await agent.create_session(ctx.owner_id)
     return SessionCreateResponse(session_id=session.session_id)
 
 
@@ -98,9 +66,10 @@ async def create_session(
     summary="List session IDs",
 )
 async def list_sessions(
+    ctx: RequestContext = Depends(get_request_context),
     agent: NexusAgent = Depends(get_agent),
 ) -> list[str]:
-    return await agent.list_sessions()
+    return await agent.list_sessions(ctx.owner_id)
 
 
 @router.get(
@@ -112,10 +81,11 @@ async def list_sessions(
 )
 async def get_session(
     session_id: str,
+    ctx: RequestContext = Depends(get_request_context),
     agent: NexusAgent = Depends(get_agent),
 ) -> SessionResponse:
     try:
-        session = await agent.get_session(session_id)
+        session = await agent.get_session(ctx.owner_id, session_id)
     except SessionNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -137,10 +107,11 @@ async def get_session(
 )
 async def clear_session(
     session_id: str,
+    ctx: RequestContext = Depends(get_request_context),
     agent: NexusAgent = Depends(get_agent),
 ) -> SessionResponse:
     try:
-        session = await agent.clear_session(session_id)
+        session = await agent.clear_session(ctx.owner_id, session_id)
     except SessionNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -164,11 +135,13 @@ async def clear_session(
 async def chat(
     request: Request,
     payload: ChatRequest,
+    ctx: RequestContext = Depends(get_request_context),
     agent: NexusAgent = Depends(get_agent),
 ) -> ChatResponse:
-    # Ensure the session exists first
+    owner_id = ctx.owner_id
+    # Ensure the session exists first (and belongs to THIS owner).
     try:
-        await agent.get_session(payload.session_id)
+        await agent.get_session(owner_id, payload.session_id)
     except SessionNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -179,23 +152,28 @@ async def chat(
     orchestrator = getattr(request.app.state, "orchestrator", None)
     if orchestrator is not None:
         try:
-            owner_id = await agent._owner_id()
             orch_res = await orchestrator.handle_user_message(
                 owner_id=owner_id,
                 session_id=payload.session_id,
                 message=payload.message,
             )
             if orch_res is not None:
-                # Orchestrator handled it; record in session history and return response
-                await agent._sessions.add_message(payload.session_id, "user", payload.message)
-                await agent._sessions.add_message(payload.session_id, "assistant", orch_res.message)
-                agent._schedule_extraction(payload.session_id, payload.message, orch_res.message)
+                # Orchestrator handled it; record in session history and return.
+                # The route records the exchange through the agent's public
+                # API rather than reaching into agent._sessions /
+                # agent._schedule_extraction (M5).
+                await agent.record_exchange(
+                    owner_id,
+                    payload.session_id,
+                    payload.message,
+                    orch_res.message,
+                )
                 return ChatResponse(session_id=payload.session_id, response=orch_res.message)
         except Exception as exc:
             logger.warning("orchestrator_execution_error: %s", exc, exc_info=True)
 
     try:
-        reply = await agent.process_message(payload.session_id, payload.message)
+        reply = await agent.process_message(owner_id, payload.session_id, payload.message)
     except SessionNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

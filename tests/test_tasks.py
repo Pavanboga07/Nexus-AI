@@ -709,7 +709,7 @@ class TestTaskAPIRoutes:
         class MockAgent:
             def __init__(self, owner_id: uuid.UUID):
                 self._oid = owner_id
-            async def _owner_id(self) -> uuid.UUID:
+            async def owner_id(self) -> uuid.UUID:
                 return self._oid
 
         app.state.agent = MockAgent(s["owner_a"])

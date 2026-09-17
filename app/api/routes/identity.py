@@ -9,13 +9,17 @@ from __future__ import annotations
 import base64
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 
-from app.api.dependencies import get_identity_service
+from app.api.auth_context import request_owner_id
+from app.api.dependencies import get_a2a_service, get_identity_service
 from app.identity import crypto
 from app.identity.service import IdentityService
+from app.a2a.service import A2AService
 from app.schemas.identity import (
+    CapabilityListResponse,
+    CapabilityOut,
     IdentityResponse,
     IdentityVerifyRequest,
     IdentityVerifyResponse,
@@ -106,6 +110,30 @@ async def verify_identity(
     )
     return IdentityVerifyResponse(
         valid=valid, agent_id_matches=agent_id_matches, reason=reason
+    )
+
+
+@router.get(
+    "/identity/capabilities",
+    response_model=CapabilityListResponse,
+    tags=["identity"],
+    summary="Live capability registry for this agent",
+    description=(
+        "Returns the typed capability contracts (id, version, schemas) the "
+        "agent will actually accept on the 0.2 envelope. This is the live "
+        "registry - not a static list - so the Agent page's 'What your agent "
+        "can do' panel cannot drift from what the receiver enforces."
+    ),
+)
+async def list_own_capabilities(
+    a2a_service: A2AService = Depends(get_a2a_service),
+) -> CapabilityListResponse:
+    specs = sorted(
+        a2a_service.capabilities.values(), key=lambda s: s.id
+    )
+    return CapabilityListResponse(
+        capabilities=[CapabilityOut(**s.to_dict()) for s in specs],
+        total=len(specs),
     )
 
 

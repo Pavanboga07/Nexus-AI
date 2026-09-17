@@ -21,7 +21,8 @@ import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -31,9 +32,15 @@ from app import __version__
 from app.agent.agent import NexusAgent
 from app.agent.context import ContextBuilder
 from app.agent.session import InMemorySessionStore, SessionStore
+from app.api.auth_context import get_request_context
 from app.api.dependencies import HTTPDependencyError
 from app.api.routes.a2a import router as a2a_router
+from app.api.routes.agents import router as agents_router
+from app.api.routes.auth import router as auth_router
+from app.api.middleware import MetricsMiddleware, TraceMiddleware
+from app.api.readiness import build_system_router, reset_readiness_cache
 from app.api.routes.chat import router as chat_router
+from app.api.routes.system import router as system_router
 from app.api.routes.discovery import router as discovery_router
 from app.api.routes.identity import router as identity_router
 from app.api.routes.memories import router as memories_router
@@ -46,31 +53,92 @@ from app.api.routes.orchestration import router as orchestration_router
 from app.a2a.rate_limit import SlidingWindowRateLimiter
 from app.a2a.service import A2AService
 from app.a2a.transport import HttpA2ATransport
+from app.auth.service import AuthService
 from app.config.settings import Settings, get_settings
+from app.errors import (
+    CODE_BAD_REQUEST,
+    CODE_CONFLICT,
+    CODE_DEPENDENCY_UNAVAILABLE,
+    CODE_FORBIDDEN,
+    CODE_GONE,
+    CODE_INTERNAL,
+    CODE_METHOD_NOT_ALLOWED,
+    CODE_NOT_FOUND,
+    CODE_PAYLOAD_TOO_LARGE,
+    CODE_RATE_LIMITED,
+    CODE_TIMEOUT,
+    CODE_UNAUTHENTICATED,
+    CODE_UPSTREAM,
+    CODE_VALIDATION,
+    DependencyUnavailableError,
+    NexusError,
+    ValidationError,
+)
 from app.database.connection import (
     create_engine,
     create_session_factory,
 )
 from app.database.session_store import DatabaseSessionStore
+from app.identity.bound import AgentIdentity
 from app.identity.service import IdentityCorruptionError, IdentityService
 from app.llm import build_provider
 from app.memory.embeddings import build_embedding_provider
 from app.memory.manager import MemoryManager
+from app.observability import configure_structured_logging
 from app.policy.service import PolicyService
 from app.tools.builtin import BUILTIN_TOOLS
 from app.tools.registry import ToolRegistry
 from app.tools.service import ToolService
 
+#: Maps a framework HTTP status onto the shared error-code vocabulary, so a
+#: route's `raise HTTPException(404)` produces the same envelope (and the same
+#: machine-readable code) as a domain `NotFoundError`.
+#:
+#: Every value is a declared constant from `app.errors`. Inlining the strings
+#: here let the map name four codes that existed nowhere else in the codebase -
+#: a client switching on `error.code` would have had to guess them.
+_HTTP_STATUS_TO_CODE = {
+    400: CODE_BAD_REQUEST,
+    401: CODE_UNAUTHENTICATED,
+    403: CODE_FORBIDDEN,
+    404: CODE_NOT_FOUND,
+    405: CODE_METHOD_NOT_ALLOWED,
+    409: CODE_CONFLICT,
+    410: CODE_GONE,
+    413: CODE_PAYLOAD_TOO_LARGE,
+    422: CODE_VALIDATION,
+    429: CODE_RATE_LIMITED,
+    500: CODE_INTERNAL,
+    502: CODE_UPSTREAM,
+    503: CODE_DEPENDENCY_UNAVAILABLE,
+    504: CODE_TIMEOUT,
+}
+
 logger = logging.getLogger("nexus")
 
 
 def configure_logging(settings: Settings) -> None:
-    """Configure root logging once, with a compact structured-ish format."""
-    logging.basicConfig(
-        level=settings.nexus_log_level,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S%z",
-        force=True,
+    """Configure root logging once.
+
+    M11: JSON, one object per line, with the request's ``trace_id`` on every
+    record. The previous format was a human-readable timestamp/level/logger
+    triple, which no log aggregator can query and which a multi-line traceback
+    breaks. Logging is structured because the alternative is grepping.
+    """
+    level = settings.nexus_log_level
+    if settings.nexus_log_format == "text":
+        # Retained deliberately: a developer tailing a terminal during local
+        # debugging reads plain text faster than escaped JSON, and forcing JSON
+        # on them is how people end up piping through `jq` to read a stack trace.
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S%z",
+            force=True,
+        )
+        return
+    configure_structured_logging(
+        level=level, service=settings.nexus_service_name, environment=settings.nexus_env
     )
 
 
@@ -154,13 +222,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.engine = engine
     app.state.database_ok = engine is not None
 
-    # --- Identity (Part 3) -------------------------------------------------
-    # Owner-scoped Ed25519 identity. A corrupted identity (wrong secret,
+    # --- Identity (Part 3, M4 multi-agent) ---------------------------------
+    # Identity is per-AGENT, not per-process. Startup ensures the deployment
+    # owner has at least one agent (idempotent) and binds an AgentIdentity
+    # adapter for the protocol stack. A corrupted identity (wrong secret,
     # mismatched keypair) aborts startup: silently regenerating would break
-    # all future trust relationships. Without a database, identity is
-    # unavailable and the app still runs (identity endpoints report 503).
+    # all future trust relationships.
     session_factory = None
     identity_service: IdentityService | None = None
+    primary_identity: AgentIdentity | None = None
     if engine is not None:
         session_factory = create_session_factory(engine)
         from app.database.repositories import OwnerRepository
@@ -175,18 +245,67 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             owner_id=owner_id,
         )
         try:
-            public_identity = await identity_service.initialize_identity()
+            # Idempotent: creates the owner's primary agent on first run only.
+            agent_summary = await identity_service.initialize_primary_agent(
+                owner_id, display_name=settings.nexus_agent_display_name
+            )
+            primary_identity = await AgentIdentity.for_agent(
+                identity_service=identity_service,
+                agent_row_id=agent_summary.id,
+            )
+            public_identity = primary_identity.get_public_identity()
             logger.info(
-                "identity_ready agent_id=%s fingerprint=%s",
+                "identity_ready agent_id=%s fingerprint=%s display_name=%s",
                 public_identity.agent_id,
                 public_identity.fingerprint,
+                agent_summary.display_name,
             )
         except IdentityCorruptionError as exc:
             logger.critical("identity_verification_failure detail=%s", exc)
             await engine.dispose()
             raise RuntimeError(f"Fatal identity error: {exc}") from exc
     app.state.identity_service = identity_service
-    app.state.identity_ok = identity_service is not None and identity_service.ready
+    #: Back-compat name used by the A2A stack, the gateway client and card
+    #: signing. It is the PRIMARY agent's identity adapter, not a singleton
+    #: identity.
+    app.state.primary_identity = primary_identity
+    app.state.identity_ok = primary_identity is not None
+
+    # --- Authentication (M3) --------------------------------------------------
+    # Every request resolves its own principal from a session. Until this
+    # existed the owner was resolved ONCE here from the first `owners` row and
+    # cached, which made the whole API single-tenant and left authorization
+    # with nothing to authorize against.
+    auth_service: AuthService | None = None
+    if engine is not None:
+        session_secret = settings.nexus_session_key or settings.nexus_identity_key
+        if settings.auth_is_required and not settings.nexus_session_key:
+            # Refuse to run "authenticated" with a borrowed/missing secret:
+            # sessions would be forgeable by anyone who knows the identity key.
+            logger.critical(
+                "auth_required_without_session_key: NEXUS_SESSION_KEY must be "
+                "set when NEXUS_AUTH_REQUIRED is true."
+            )
+            raise RuntimeError(
+                "NEXUS_SESSION_KEY is required when authentication is enforced."
+            )
+        if not settings.nexus_session_key:
+            logger.warning(
+                "auth_session_key_not_set: falling back to NEXUS_IDENTITY_KEY "
+                "for session signing; set NEXUS_SESSION_KEY before production."
+            )
+        auth_service = AuthService(
+            session_factory=session_factory,
+            session_secret=session_secret,
+            session_ttl_seconds=settings.nexus_session_ttl_seconds,
+            allow_registration=settings.nexus_allow_registration,
+        )
+    app.state.auth_service = auth_service
+    app.state.auth_required = settings.auth_is_required
+    app.state.registration_open = settings.nexus_allow_registration
+    app.state.cookie_secure = settings.cookie_secure_effective
+    app.state.session_ttl_seconds = settings.nexus_session_ttl_seconds
+    app.state.adopt_legacy_owner = settings.nexus_adopt_legacy_owner
 
     # --- Policy & Consent (Part 4) ------------------------------------------
     # Deterministic authorization over policies/consents; requires the DB.
@@ -223,8 +342,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     a2a_service: A2AService | None = None
     if (
         engine is not None
-        and identity_service is not None
-        and identity_service.ready
+        and primary_identity is not None
         and policy_service is not None
     ):
         http_transport = HttpA2ATransport(
@@ -241,15 +359,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
             async def _handle_gateway_inbound(envelope):
                 if a2a_service is not None and owner_id is not None:
-                    msg_type = envelope.get("message_type")
-                    if msg_type in ("response", "task_response"):
-                        return await a2a_service.handle_inbound_response(owner_id, envelope)
-                    return await a2a_service.handle_inbound(owner_id, envelope)
+                    # The gateway is an untrusted relay: a malformed or
+                    # hostile frame must never raise into the reader loop.
+                    return await a2a_service.handle_gateway_delivery(
+                        owner_id, envelope
+                    )
                 return None
 
             gateway_client = GatewayClient(
                 gateway_url=settings.nexus_gateway_url,
-                identity_service=identity_service,
+                identity_service=primary_identity,
                 owner_id=owner_id,
                 inbound_handler=_handle_gateway_inbound,
                 display_name=settings.nexus_agent_display_name,
@@ -258,6 +377,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             transport = GatewayA2ATransport(
                 http_transport=http_transport,
                 gateway_client=gateway_client,
+                allow_direct_egress=settings.nexus_a2a_direct_egress,
             )
             app.state.gateway_client = gateway_client
             await gateway_client.start()
@@ -265,9 +385,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
         a2a_service = A2AService(
             session_factory=session_factory,
-            identity_service=identity_service,
+            identity_service=primary_identity,
             policy_service=policy_service,
-            memory_manager=app.state.agent._memory,
+            memory_manager=app.state.agent.memory,
             transport=transport,
             rate_limiter=SlidingWindowRateLimiter(
                 settings.nexus_a2a_rate_limit_per_minute
@@ -290,13 +410,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from app.a2a.discovery import DiscoveryService
 
     discovery_service: DiscoveryService | None = None
-    if a2a_service is not None and identity_service is not None:
+    if a2a_service is not None and primary_identity is not None:
         discovery_service = DiscoveryService(
-            identity_service=identity_service,
+            identity_service=primary_identity,
             a2a_service=a2a_service,
             allow_local_endpoints=settings.nexus_a2a_allow_local_endpoints,
             timeout_seconds=settings.nexus_discovery_timeout_seconds,
             max_card_bytes=settings.nexus_discovery_max_card_bytes,
+            session_factory=session_factory,
         )
     app.state.discovery_service = discovery_service
     app.state.discovery_ok = discovery_service is not None
@@ -311,13 +432,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             policy_service=policy_service,
             tool_service=tool_service,
             a2a_service=a2a_service,
-            memory_manager=app.state.agent._memory,
-            identity_service=identity_service,
+            memory_manager=app.state.agent.memory,
+            identity_service=primary_identity,
             default_ttl_seconds=settings.nexus_workflow_default_ttl_seconds,
             max_step_attempts=settings.nexus_workflow_max_step_attempts,
         )
     app.state.workflow_service = workflow_service
     app.state.workflows_ok = workflow_service is not None
+
+    # Crash recovery: workflows paused mid-run (awaiting a remote task or an
+    # approval) are left in a non-terminal state by a process restart. Resume
+    # them now, mirroring autonomy's reconcile_on_startup(). Without this,
+    # interrupted workflows stay wedged forever.
+    if workflow_service is not None:
+        try:
+            resumed = await workflow_service.recover_interrupted_workflows()
+            if resumed:
+                logger.info(
+                    "workflow_crash_recovery_completed count=%d", len(resumed)
+                )
+        except Exception as exc:
+            logger.warning("workflow_startup_recovery_warning: %s", exc)
 
     # --- Autonomy & Decision Engine (Part 10) ---------------------------------
     from app.autonomy.service import AutonomyService
@@ -330,7 +465,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             tool_service=tool_service,
             a2a_service=a2a_service,
             workflow_service=workflow_service,
-            memory_manager=app.state.agent._memory,
+            memory_manager=app.state.agent.memory,
         )
         try:
             reconciled = await autonomy_service.reconcile_on_startup()
@@ -343,18 +478,33 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.autonomy_ok = autonomy_service is not None
 
     # --- Orchestration (Part 12) ---------------------------------------------
+    # Gated behind NEXUS_ORCHESTRATION_ENABLED (decision D5): OFF by default.
+    # Orchestration converts free text into agent actions through an LLM intent
+    # resolver plus fuzzy target matching, so a wrong guess is acted upon - and
+    # silently. Explicit asks and the workflow API work without it, so this
+    # costs convenience rather than capability.
     from app.orchestration.intent import IntentResolver
     from app.orchestration.target_resolver import TargetResolver
     from app.orchestration.orchestrator import AgentOrchestrator
 
     orchestrator: AgentOrchestrator | None = None
-    if session_factory is not None and a2a_service is not None and policy_service is not None:
-        intent_resolver = IntentResolver(llm_provider=app.state.agent._provider)
+    if not settings.nexus_orchestration_enabled:
+        logger.info(
+            "orchestration_disabled detail=NEXUS_ORCHESTRATION_ENABLED is false; "
+            "natural-language orchestration is off (chat and explicit asks are "
+            "unaffected)"
+        )
+    elif (
+        session_factory is not None
+        and a2a_service is not None
+        and policy_service is not None
+    ):
+        intent_resolver = IntentResolver(llm_provider=app.state.agent.provider)
         target_resolver = TargetResolver(
             session_factory=session_factory,
-            trusted_agents=a2a_service._trusted,
+            trusted_agents=a2a_service.trusted_agents,
             discovery_service=discovery_service,
-            memory_manager=app.state.agent._memory,
+            memory_manager=app.state.agent.memory,
             gateway_url=settings.nexus_gateway_url,
         )
         decision_engine = getattr(autonomy_service, "_decision_engine", None)
@@ -369,6 +519,42 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
     app.state.orchestrator = orchestrator
     app.state.orchestration_ok = orchestrator is not None
+
+    # --- Durable jobs (M7) ----------------------------------------------------
+    # A Postgres-backed queue (decision D6) so retries, backoff, idempotency and
+    # dead-lettering exist at all. Before this, asynchronous work was either
+    # inline in a request or a fire-and-forget task whose failure was lost.
+    from app.jobs import JobQueue, JobRegistry, JobWorker
+
+    job_queue: JobQueue | None = None
+    job_worker: JobWorker | None = None
+    if session_factory is not None:
+        job_queue = JobQueue(session_factory=session_factory)
+        registry = JobRegistry()
+        app.state.job_registry = registry
+
+        # Handler registration is explicit: a kind is enqueued only if a handler
+        # exists, and an unregistered kind dead-letters with a clear reason.
+        if workflow_service is not None:
+            async def _advance_workflow_job(job) -> None:
+                workflow_id = uuid.UUID(str(job.payload.get("workflow_id")))
+                await workflow_service.advance_workflow(workflow_id)
+
+            registry.register("workflow.advance", _advance_workflow_job)
+
+        job_worker = JobWorker(
+            queue=job_queue,
+            registry=registry,
+            poll_interval_seconds=settings.nexus_job_poll_interval_seconds,
+            batch_size=settings.nexus_job_batch_size,
+            lease_seconds=settings.nexus_job_lease_seconds,
+            job_timeout_seconds=settings.nexus_job_timeout_seconds,
+        )
+        await job_worker.start()
+
+    app.state.job_queue = job_queue
+    app.state.job_worker = job_worker
+    app.state.jobs_ok = job_queue is not None
 
     logger.info(
         "nexus_started env=%s provider=%s model=%s base_url=%s llm_configured=%s "
@@ -398,6 +584,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        # Stop claiming new jobs and let the in-flight one finish, so a deploy
+        # does not abandon a half-done unit of work.
+        if getattr(app.state, "job_worker", None) is not None:
+            await app.state.job_worker.stop()
         if getattr(app.state, "gateway_client", None) is not None:
             await app.state.gateway_client.stop()
         await app.state.agent.aclose()
@@ -418,70 +608,181 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    settings = get_settings()
+    cors_origins = settings.cors_origins_list
+    # Browsers reject `allow_credentials=True` combined with a wildcard
+    # origin; more importantly a wildcard would let any site drive this API
+    # with the user's cookies. Keep them mutually exclusive.
+    cors_allow_credentials = not settings.cors_allows_any_origin
+    if settings.cors_allows_any_origin and not settings.is_development:
+        logger.warning(
+            "cors_wildcard_origin_configured env=%s: this is unsafe outside "
+            "development; set NEXUS_CORS_ORIGINS to an explicit allow-list.",
+            settings.nexus_env,
+        )
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[
-            "http://localhost:3000",
-            "http://127.0.0.1:3000",
-            "http://localhost:3001",
-            "http://127.0.0.1:3001",
-            "*",
-        ],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=cors_origins,
+        allow_credentials=cors_allow_credentials,
+        allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
     )
 
-    app.include_router(chat_router)
-    app.include_router(memories_router)
-    app.include_router(identity_router)
-    app.include_router(policy_router)
-    app.include_router(tools_router)
-    app.include_router(a2a_router)
+    # --- Observability (M11) --------------------------------------------------
+    # Order matters, and Starlette applies middleware in REVERSE order of
+    # `add_middleware`: the last one added is the outermost. Tracing is added
+    # last so it wraps metrics - every metric then carries the trace id of the
+    # request that produced it, and the trace header is set even on a response
+    # the metrics layer short-circuits.
+    #
+    # TraceMiddleware must be pure ASGI, not BaseHTTPMiddleware: the latter runs
+    # the app in a task with a COPY of the context, so a ContextVar bound inside
+    # it never reaches the endpoint.
+    app.add_middleware(MetricsMiddleware)
+    app.add_middleware(TraceMiddleware)
+
+    # Auth first, unauthenticated by necessity (you cannot require a session
+    # in order to obtain one).
+    app.include_router(auth_router)
+
+    # Liveness must never require a session (load balancers, orchestrators,
+    # monitoring), so it is mounted without the auth dependency. Its payload is
+    # deliberately minimal; the detailed report is /system/status, protected.
+    app.include_router(system_router)
+
+    # Readiness and metrics (M11). Also public, for the same reason as /health:
+    # a probe and a scraper have no session. /readyz is the one that returns 503
+    # when a required dependency is down, so the load balancer drains this
+    # replica instead of routing requests that can only fail.
+    reset_readiness_cache()
+    app.include_router(build_system_router(metrics_enabled=True))
+
+    # Every data router requires a resolved principal. Applied at the router
+    # level rather than per-handler, so a new endpoint is protected by default
+    # instead of protected only if its author remembered to add a dependency.
+    #
+    # Deliberately NOT behind this dependency:
+    #   /health                        - liveness must be reachable
+    #   /auth/*                        - bootstrapping
+    #   /.well-known/*, /a2a/card      - public identity cards (no data)
+    #   /a2a/messages                  - authenticated by Ed25519 envelope
+    #                                    signature, not by a session
+    protected = [Depends(get_request_context)]
+    app.include_router(chat_router, dependencies=protected)
+    app.include_router(memories_router, dependencies=protected)
+    app.include_router(identity_router, dependencies=protected)
+    app.include_router(agents_router, dependencies=protected)
+    app.include_router(policy_router, dependencies=protected)
+    app.include_router(tools_router, dependencies=protected)
+    app.include_router(a2a_router, dependencies=protected)
+    # Discovery is mixed: the public card endpoints (/.well-known/..., /a2a/card)
+    # must stay reachable so peers can fetch an identity, while the stateful
+    # endpoints carry their own get_request_context dependency. See the module
+    # docstring in app/api/routes/discovery.py.
     app.include_router(discovery_router)
-    app.include_router(tasks_router)
-    app.include_router(workflows_router)
-    app.include_router(autonomy_router)
-    app.include_router(orchestration_router)
+    app.include_router(tasks_router, dependencies=protected)
+    app.include_router(workflows_router, dependencies=protected)
+    app.include_router(autonomy_router, dependencies=protected)
+    app.include_router(orchestration_router, dependencies=protected)
+
+    # --- Error handling (M5) --------------------------------------------------
+    # ONE envelope for every expected failure. These handlers are registered so
+    # a route can simply let a domain error propagate and still get a correct
+    # status and a consistent body, instead of translating by hand (which is
+    # how the same condition ended up as a different status in different
+    # routes).
+
+    @app.exception_handler(NexusError)
+    async def _nexus_error_handler(
+        request: Request, exc: NexusError
+    ) -> JSONResponse:
+        """Domain errors: stable code, honest status, safe message."""
+        if exc.http_status >= 500:
+            logger.error(
+                "domain_error path=%s code=%s detail=%s",
+                request.url.path,
+                exc.code,
+                exc.message,
+            )
+        else:
+            logger.info(
+                "domain_error path=%s code=%s detail=%s",
+                request.url.path,
+                exc.code,
+                exc.message,
+            )
+        return JSONResponse(status_code=exc.http_status, content=exc.to_dict())
 
     @app.exception_handler(HTTPDependencyError)
     async def _dependency_handler(
         request: Request, exc: HTTPDependencyError
     ) -> JSONResponse:
+        """A required subsystem is missing: 503, not 500.
+
+        This used to be reachable only as a bare RuntimeError from some
+        dependencies, which the catch-all turned into a misleading 500.
+        """
+        error = DependencyUnavailableError(str(exc))
         return JSONResponse(
-            status_code=503,
-            content={"error": "service_unavailable", "detail": str(exc)},
+            status_code=error.http_status, content=error.to_dict()
         )
 
     @app.exception_handler(RequestValidationError)
     async def _validation_handler(
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
-        """Return a clean 422 envelope instead of FastAPI's default body.
+        """Return the SAME envelope as every other error.
 
         Pydantic v2 error dicts can carry the original exception object in
-        ``ctx``; encode defensively so the response stays JSON-safe."""
+        ``ctx``; encode defensively so the response stays JSON-safe.
+        """
         from fastapi.encoders import jsonable_encoder
 
+        error = ValidationError(
+            "Request failed validation.",
+            details={"errors": jsonable_encoder(exc.errors())},
+        )
+        return JSONResponse(status_code=422, content=error.to_dict())
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_exception_handler(
+        request: Request, exc: StarletteHTTPException
+    ) -> JSONResponse:
+        """Convert framework HTTPExceptions into the ONE error envelope.
+
+        Without this there were still TWO response shapes: domain errors went
+        out as ``{"error": {...}}`` while a route's ``raise HTTPException`` went
+        out as ``{"detail": "..."}``. A client then has to parse both, and the
+        frontend's error handling silently degraded to "HTTP 400" for the
+        second kind. Routing them through the same envelope is what makes the
+        error contract actually single.
+        """
+        code = _HTTP_STATUS_TO_CODE.get(exc.status_code, "http_error")
+        detail = exc.detail
+        error = NexusError(
+            detail if isinstance(detail, str) else "Request failed.",
+            code=code,
+            http_status=exc.status_code,
+            details=None if isinstance(detail, str) else {"detail": detail},
+        )
         return JSONResponse(
-            status_code=422,
-            content={
-                "error": "validation_error",
-                "detail": "Request body failed validation.",
-                "errors": jsonable_encoder(exc.errors()),
-            },
+            status_code=exc.status_code,
+            content=error.to_dict(),
+            headers=getattr(exc, "headers", None),
         )
 
     @app.exception_handler(Exception)
     async def _unhandled_handler(request: Request, exc: Exception) -> JSONResponse:
-        """Last-resort handler: log the trace, return a generic message."""
+        """Last-resort handler: log the trace, return a generic message.
+
+        The message is deliberately opaque - an unexpected error must never
+        leak internals - but the envelope matches every other error so clients
+        parse responses uniformly.
+        """
         logger.exception("unhandled_error path=%s", request.url.path)
+        error = NexusError("An unexpected error occurred.")
         return JSONResponse(
-            status_code=500,
-            content={
-                "error": "internal_error",
-                "detail": "An unexpected error occurred.",
-            },
+            status_code=error.http_status, content=error.to_dict()
         )
 
     return app

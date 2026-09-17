@@ -1,0 +1,178 @@
+{
+  "agent_card": {
+    "card": {
+      "agent_id": "nexus:ed25519:56475aa75463474c0285df5dbf2bcab7",
+      "capabilities": [
+        {
+          "data_category": "availability",
+          "description": "Check availability",
+          "id": "calendar.availability",
+          "input_schema": {
+            "type": "object"
+          },
+          "name": "calendar.availability",
+          "output_schema": {
+            "type": "object"
+          },
+          "version": "1.0"
+        }
+      ],
+      "display_name": "Test Agent",
+      "endpoint": "https://agent.example.com",
+      "expires_at": "2027-09-16T14:40:00Z",
+      "issued_at": "2026-09-16T14:40:00Z",
+      "protocol": "nexus-a2a",
+      "public_key": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+      "signature": "IMnp2tipwQUzqHAwBqJaPRB+nztRUSaBNhUmUcdYDDHCqPgxYWERPYjHHCWoF18JAfP01tVjWaMIbsG6Cnc9AQ==",
+      "supported_purposes": [
+        "scheduling"
+      ],
+      "type": "agent-card",
+      "version": "0.2"
+    },
+    "signature_b64": "IMnp2tipwQUzqHAwBqJaPRB+nztRUSaBNhUmUcdYDDHCqPgxYWERPYjHHCWoF18JAfP01tVjWaMIbsG6Cnc9AQ==",
+    "signing_bytes_hex": "7b226167656e745f6964223a226e657875733a656432353531393a3536343735616137353436333437346330323835646635646266326263616237222c226361706162696c6974696573223a5b7b22646174615f63617465676f7279223a22617661696c6162696c697479222c226465736372697074696f6e223a22436865636b20617661696c6162696c697479222c226964223a2263616c656e6461722e617661696c6162696c697479222c22696e7075745f736368656d61223a7b2274797065223a226f626a656374227d2c226e616d65223a2263616c656e6461722e617661696c6162696c697479222c226f75747075745f736368656d61223a7b2274797065223a226f626a656374227d2c2276657273696f6e223a22312e30227d5d2c22646973706c61795f6e616d65223a2254657374204167656e74222c22656e64706f696e74223a2268747470733a2f2f6167656e742e6578616d706c652e636f6d222c22657870697265735f6174223a22323032372d30392d31365431343a34303a30305a222c226973737565645f6174223a22323032362d30392d31365431343a34303a30305a222c2270726f746f636f6c223a226e657875732d613261222c227075626c69635f6b6579223a2241364548762f504f454c3464634e3059353076416d57666b316a436270513166486479475a424a564d62673d222c22737570706f727465645f707572706f736573223a5b227363686564756c696e67225d2c2274797065223a226167656e742d63617264222c2276657273696f6e223a22302e32227d"
+  },
+  "canonical_json": [
+    {
+      "canonical_utf8_hex": "7b2261223a322c2262223a317d",
+      "input": {
+        "a": 2,
+        "b": 1
+      }
+    },
+    {
+      "canonical_utf8_hex": "7b226e6573746564223a7b2261223a7b226b223a2276227d2c227a223a5b312c322c335d7d7d",
+      "input": {
+        "nested": {
+          "a": {
+            "k": "v"
+          },
+          "z": [
+            1,
+            2,
+            3
+          ]
+        }
+      }
+    },
+    {
+      "canonical_utf8_hex": "7b22656d6f6a69223a22f09f9490222c22756e69636f6465223a22636166c3a920e29895227d",
+      "input": {
+        "emoji": "🔐",
+        "unicode": "café ☕"
+      }
+    },
+    {
+      "canonical_utf8_hex": "7b226e756c6c73223a7b22656d707479223a22222c226e756d626572223a302c2270726573656e74223a6e756c6c7d7d",
+      "input": {
+        "nulls": {
+          "empty": "",
+          "number": 0,
+          "present": null
+        }
+      }
+    },
+    {
+      "canonical_utf8_hex": "7b22696e7465676572735f6f6e6c79223a7b22626967223a393030373139393235343734303939312c226e65676174697665223a2d317d7d",
+      "input": {
+        "integers_only": {
+          "big": 9007199254740991,
+          "negative": -1
+        }
+      }
+    }
+  ],
+  "envelope_v01": {
+    "envelope": {
+      "expires_at": "2026-09-20T12:05:00Z",
+      "message_id": "msg_1111111111111111",
+      "message_type": "request",
+      "payload": {
+        "action": "read_memory",
+        "data_category": "availability"
+      },
+      "protocol": "nexus-a2a",
+      "purpose": "scheduling",
+      "recipient": "nexus:ed25519:24f6ed6acbfe1009c030d7ca567c33ca",
+      "sender": "nexus:ed25519:56475aa75463474c0285df5dbf2bcab7",
+      "signature": "nODoCmYYenXN1rhjale05+Aymq2+5aO4bCHf2dYzT5+Zw0jCnFpDIcI1JQs++T51qjwSID7FTizhAzBPMSQkCg==",
+      "task_id": "task_2222222222222222",
+      "timestamp": "2026-09-20T12:00:00Z",
+      "version": "0.2"
+    },
+    "signature_b64": "nODoCmYYenXN1rhjale05+Aymq2+5aO4bCHf2dYzT5+Zw0jCnFpDIcI1JQs++T51qjwSID7FTizhAzBPMSQkCg==",
+    "signer_public_key_b64": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+    "signing_bytes_hex": "7b22657870697265735f6174223a22323032362d30392d32305431323a30353a30305a222c226d6573736167655f6964223a226d73675f31313131313131313131313131313131222c226d6573736167655f74797065223a2272657175657374222c227061796c6f6164223a7b22616374696f6e223a22726561645f6d656d6f7279222c22646174615f63617465676f7279223a22617661696c6162696c697479227d2c2270726f746f636f6c223a226e657875732d613261222c22707572706f7365223a227363686564756c696e67222c22726563697069656e74223a226e657875733a656432353531393a3234663665643661636266653130303963303330643763613536376333336361222c2273656e646572223a226e657875733a656432353531393a3536343735616137353436333437346330323835646635646266326263616237222c227461736b5f6964223a227461736b5f32323232323232323232323232323232222c2274696d657374616d70223a22323032362d30392d32305431323a30303a30305a222c2276657273696f6e223a22302e32227d"
+  },
+  "envelope_v02": {
+    "envelope": {
+      "authorization": {
+        "kind": "delegation_grant",
+        "reference": "grant_1"
+      },
+      "capability": {
+        "id": "calendar.availability",
+        "version": "1.0"
+      },
+      "correlation_id": "cor_5555555555555555",
+      "expires_at": "2026-09-20T12:05:00Z",
+      "message_id": "msg_3333333333333333",
+      "message_type": "task_progress",
+      "payload": {
+        "action": "read_memory",
+        "data_category": "availability"
+      },
+      "protocol": "nexus-a2a",
+      "purpose": "scheduling",
+      "recipient": "nexus:ed25519:24f6ed6acbfe1009c030d7ca567c33ca",
+      "reply_to": "msg_1111111111111111",
+      "sender": "nexus:ed25519:56475aa75463474c0285df5dbf2bcab7",
+      "signature": "dWwJVWYzRwvEEDl0kYwBOopHS+sU2HG5atKai4tQLrLYmWvDtGyTi/nHhCtlp9vGNdhFJt4YBYdpLqVUe9ZYAg==",
+      "task_id": "task_4444444444444444",
+      "timestamp": "2026-09-20T12:00:00Z",
+      "trace": {
+        "span_id": "bbbbbbbbbbbbbbbb",
+        "trace_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "version": "0.2"
+    },
+    "signature_b64": "dWwJVWYzRwvEEDl0kYwBOopHS+sU2HG5atKai4tQLrLYmWvDtGyTi/nHhCtlp9vGNdhFJt4YBYdpLqVUe9ZYAg==",
+    "signer_public_key_b64": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+    "signing_bytes_hex": "7b22617574686f72697a6174696f6e223a7b226b696e64223a2264656c65676174696f6e5f6772616e74222c227265666572656e6365223a226772616e745f31227d2c226361706162696c697479223a7b226964223a2263616c656e6461722e617661696c6162696c697479222c2276657273696f6e223a22312e30227d2c22636f7272656c6174696f6e5f6964223a22636f725f35353535353535353535353535353535222c22657870697265735f6174223a22323032362d30392d32305431323a30353a30305a222c226d6573736167655f6964223a226d73675f33333333333333333333333333333333222c226d6573736167655f74797065223a227461736b5f70726f6772657373222c227061796c6f6164223a7b22616374696f6e223a22726561645f6d656d6f7279222c22646174615f63617465676f7279223a22617661696c6162696c697479227d2c2270726f746f636f6c223a226e657875732d613261222c22707572706f7365223a227363686564756c696e67222c22726563697069656e74223a226e657875733a656432353531393a3234663665643661636266653130303963303330643763613536376333336361222c227265706c795f746f223a226d73675f31313131313131313131313131313131222c2273656e646572223a226e657875733a656432353531393a3536343735616137353436333437346330323835646635646266326263616237222c227461736b5f6964223a227461736b5f34343434343434343434343434343434222c2274696d657374616d70223a22323032362d30392d32305431323a30303a30305a222c227472616365223a7b227370616e5f6964223a2262626262626262626262626262626262222c2274726163655f6964223a226161616161616161616161616161616161616161616161616161616161616161227d2c2276657273696f6e223a22302e32227d"
+  },
+  "expected_rejections": [
+    {
+      "case": "float in signed payload",
+      "error": "CanonicalizationError",
+      "input": {
+        "value": 0.5
+      }
+    },
+    {
+      "case": "unknown envelope field",
+      "error": "validation",
+      "input": {
+        "unknown_field": true
+      }
+    }
+  ],
+  "format": "nexus-conformance-vectors",
+  "generated_by": "nexus/scripts/generate_conformance_vectors.py",
+  "notes": [
+    "Generated from the runtime implementation. A third-party implementation is conformant when it reproduces every byte and verifies every signature here.",
+    "TEST_SEED is bytes(range(32)) - a test key, never use it for real."
+  ],
+  "peer_key": {
+    "agent_id": "nexus:ed25519:24f6ed6acbfe1009c030d7ca567c33ca",
+    "private_seed_hex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "public_key_b64": "Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc="
+  },
+  "protocol_version": "0.2",
+  "test_key": {
+    "agent_id": "nexus:ed25519:56475aa75463474c0285df5dbf2bcab7",
+    "private_seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "public_key_b64": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+  },
+  "version": 1
+}

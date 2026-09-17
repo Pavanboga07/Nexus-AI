@@ -27,6 +27,11 @@ export async function apiFetch<T>(
     const res = await fetch(url, {
       ...options,
       headers,
+      // The API authenticates via an HttpOnly session cookie. Without this the
+      // browser will not attach it cross-origin, and every data endpoint
+      // returns 401. The backend allow-lists specific origins and enables
+      // credentials for exactly those origins (never a wildcard).
+      credentials: "include",
     });
 
     if (!res.ok) {
@@ -34,12 +39,27 @@ export async function apiFetch<T>(
       let errorMessage = `HTTP error ${res.status}`;
       try {
         errorData = await res.json();
+        // The backend uses ONE error envelope (M5):
+        //   {"error": {"code", "message", "kind", "details?"}}
+        // Older endpoints used {"detail": "..."}; both are handled so a stale
+        // response shape degrades to a useful message instead of "HTTP 400".
         if (typeof errorData === "object" && errorData !== null) {
-          const detail = (errorData as Record<string, unknown>).detail;
-          if (typeof detail === "string") {
-            errorMessage = detail;
-          } else if (typeof detail === "object" && detail !== null) {
-            errorMessage = JSON.stringify(detail);
+          const body = errorData as Record<string, unknown>;
+          const envelope = body.error;
+          if (typeof envelope === "object" && envelope !== null) {
+            const message = (envelope as Record<string, unknown>).message;
+            if (typeof message === "string" && message) {
+              errorMessage = message;
+            }
+          } else if (typeof envelope === "string" && envelope) {
+            errorMessage = envelope;
+          } else {
+            const detail = body.detail;
+            if (typeof detail === "string") {
+              errorMessage = detail;
+            } else if (typeof detail === "object" && detail !== null) {
+              errorMessage = JSON.stringify(detail);
+            }
           }
         }
       } catch {

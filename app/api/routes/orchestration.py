@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.agent import NexusAgent
+from app.api.auth_context import request_owner_id
 from app.api.dependencies import get_agent, get_orchestrator
 from app.orchestration.models import OrchestrationRun
 from app.orchestration.orchestrator import AgentOrchestrator
@@ -31,8 +32,8 @@ logger = logging.getLogger("nexus.api.orchestration")
 router = APIRouter(prefix="/orchestration", tags=["orchestration"])
 
 
-async def _owner_id(agent: NexusAgent) -> uuid.UUID:
-    return await agent._owner_id()
+async def _owner_id(request: Request) -> uuid.UUID:
+    return request_owner_id(request)
 
 
 @router.post(
@@ -41,11 +42,12 @@ async def _owner_id(agent: NexusAgent) -> uuid.UUID:
     summary="Execute a natural language agent orchestration request",
 )
 async def execute_orchestration(
+    request: Request,
     payload: OrchestrationExecuteRequest,
     agent: NexusAgent = Depends(get_agent),
     orchestrator: AgentOrchestrator = Depends(get_orchestrator),
 ) -> OrchestrationExecuteResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     session_id = payload.session_id or f"orch_{uuid.uuid4().hex[:12]}"
     result = await orchestrator.handle_user_message(
         owner_id=owner_id,
@@ -69,10 +71,11 @@ async def execute_orchestration(
     summary="List recent orchestration runs for the owner",
 )
 async def list_runs(
+    request: Request,
     agent: NexusAgent = Depends(get_agent),
     orchestrator: AgentOrchestrator = Depends(get_orchestrator),
 ) -> list[OrchestrationRunResponse]:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     repo = OrchestrationRunRepository()
     async with orchestrator.session_factory() as session:
         runs = await repo.list_runs(session, owner_id)
@@ -101,11 +104,12 @@ async def list_runs(
     summary="Get details of a specific orchestration run",
 )
 async def get_run(
+    request: Request,
     run_id: uuid.UUID,
     agent: NexusAgent = Depends(get_agent),
     orchestrator: AgentOrchestrator = Depends(get_orchestrator),
 ) -> OrchestrationRunResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     repo = OrchestrationRunRepository()
     async with orchestrator.session_factory() as session:
         r = await repo.get_by_id(session, owner_id, run_id)
@@ -143,12 +147,13 @@ async def get_run(
     summary="Approve a pending action in an orchestration run and resume the same run",
 )
 async def approve_run_endpoint(
+    request: Request,
     run_id: uuid.UUID,
     payload: OrchestrationApproveRequest = OrchestrationApproveRequest(),
     agent: NexusAgent = Depends(get_agent),
     orchestrator: AgentOrchestrator = Depends(get_orchestrator),
 ) -> OrchestrationExecuteResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     return await orchestrator.approve_run(owner_id, run_id, payload)
 
 
@@ -158,12 +163,13 @@ async def approve_run_endpoint(
     summary="Reject a pending action in an orchestration run",
 )
 async def reject_run_endpoint(
+    request: Request,
     run_id: uuid.UUID,
     payload: OrchestrationRejectRequest = OrchestrationRejectRequest(),
     agent: NexusAgent = Depends(get_agent),
     orchestrator: AgentOrchestrator = Depends(get_orchestrator),
 ) -> OrchestrationExecuteResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     return await orchestrator.reject_run(owner_id, run_id, payload)
 
 
@@ -173,12 +179,13 @@ async def reject_run_endpoint(
     summary="Cancel an active or waiting orchestration run",
 )
 async def cancel_run_endpoint(
+    request: Request,
     run_id: uuid.UUID,
     payload: OrchestrationCancelRequest = OrchestrationCancelRequest(),
     agent: NexusAgent = Depends(get_agent),
     orchestrator: AgentOrchestrator = Depends(get_orchestrator),
 ) -> OrchestrationExecuteResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     return await orchestrator.cancel_run(owner_id, run_id, payload)
 
 
@@ -188,12 +195,13 @@ async def cancel_run_endpoint(
     summary="Trust a discovered agent and resume the same orchestration run",
 )
 async def trust_run_endpoint(
+    request: Request,
     run_id: uuid.UUID,
     payload: OrchestrationTrustRequest = OrchestrationTrustRequest(),
     agent: NexusAgent = Depends(get_agent),
     orchestrator: AgentOrchestrator = Depends(get_orchestrator),
 ) -> OrchestrationExecuteResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     return await orchestrator.trust_and_resume_run(owner_id, run_id, payload)
 
 
@@ -207,11 +215,12 @@ async def trust_run_endpoint(
     summary="Create a new person contact with aliases and optional agent mapping",
 )
 async def create_contact(
+    request: Request,
     payload: ContactCreateRequest,
     agent: NexusAgent = Depends(get_agent),
     orchestrator: AgentOrchestrator = Depends(get_orchestrator),
 ) -> ContactResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     repo = ContactRepository()
     async with orchestrator.session_factory() as session:
         c = await repo.create(
@@ -241,10 +250,11 @@ async def create_contact(
     summary="List all contacts for the current owner",
 )
 async def list_contacts(
+    request: Request,
     agent: NexusAgent = Depends(get_agent),
     orchestrator: AgentOrchestrator = Depends(get_orchestrator),
 ) -> list[ContactResponse]:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     repo = ContactRepository()
     async with orchestrator.session_factory() as session:
         contacts = await repo.list_all(session, owner_id)

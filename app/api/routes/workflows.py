@@ -15,10 +15,11 @@ import logging
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
 from app.agent.agent import NexusAgent
+from app.api.auth_context import request_owner_id
 from app.api.dependencies import get_agent, get_workflow_service
 from app.schemas.workflows import (
     WorkflowActionResponse,
@@ -49,8 +50,8 @@ class WorkflowCancelRequest(BaseModel):
     reason: str = Field(default="Cancelled by owner", max_length=255)
 
 
-async def _owner_id(agent: NexusAgent) -> uuid.UUID:
-    return await agent._owner_id()
+async def _owner_id(request: Request) -> uuid.UUID:
+    return request_owner_id(request)
 
 
 def _to_workflow_out(wf: Workflow) -> WorkflowOut:
@@ -99,11 +100,12 @@ def _to_workflow_out(wf: Workflow) -> WorkflowOut:
     summary="Create a new multi-step workflow",
 )
 async def create_workflow(
+    request: Request,
     payload: WorkflowCreateRequest,
     agent: NexusAgent = Depends(get_agent),
     workflow_service: WorkflowService = Depends(get_workflow_service),
 ) -> WorkflowOut:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     try:
         wf = await workflow_service.create_workflow(
             owner_id,
@@ -128,12 +130,13 @@ async def create_workflow(
     summary="List workflows for the current owner",
 )
 async def list_workflows(
+    request: Request,
     status_filter: str | None = Query(default=None, alias="status"),
     limit: int = Query(default=100, ge=1, le=500),
     agent: NexusAgent = Depends(get_agent),
     workflow_service: WorkflowService = Depends(get_workflow_service),
 ) -> WorkflowListResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     workflows = await workflow_service.list_workflows(
         owner_id, status=status_filter, limit=limit
     )
@@ -148,11 +151,12 @@ async def list_workflows(
     summary="Get workflow details and current step status",
 )
 async def get_workflow(
+    request: Request,
     workflow_id: uuid.UUID,
     agent: NexusAgent = Depends(get_agent),
     workflow_service: WorkflowService = Depends(get_workflow_service),
 ) -> WorkflowOut:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     try:
         wf = await workflow_service.get_workflow(owner_id, workflow_id)
         return _to_workflow_out(wf)
@@ -170,11 +174,12 @@ async def get_workflow(
     summary="Start execution of a pending workflow",
 )
 async def start_workflow(
+    request: Request,
     workflow_id: uuid.UUID,
     agent: NexusAgent = Depends(get_agent),
     workflow_service: WorkflowService = Depends(get_workflow_service),
 ) -> WorkflowOut:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     try:
         wf = await workflow_service.start_workflow(owner_id, workflow_id)
         return _to_workflow_out(wf)
@@ -202,12 +207,13 @@ async def start_workflow(
     summary="Approve a workflow step awaiting authorization",
 )
 async def approve_workflow(
+    request: Request,
     workflow_id: uuid.UUID,
     payload: WorkflowApproveRequest | None = None,
     agent: NexusAgent = Depends(get_agent),
     workflow_service: WorkflowService = Depends(get_workflow_service),
 ) -> WorkflowOut:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     step_id = payload.step_id if payload else None
     try:
         wf = await workflow_service.approve_workflow(
@@ -233,12 +239,13 @@ async def approve_workflow(
     summary="Cancel an active workflow",
 )
 async def cancel_workflow(
+    request: Request,
     workflow_id: uuid.UUID,
     payload: WorkflowCancelRequest | None = None,
     agent: NexusAgent = Depends(get_agent),
     workflow_service: WorkflowService = Depends(get_workflow_service),
 ) -> WorkflowOut:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     reason = payload.reason if payload else "Cancelled by owner"
     try:
         wf = await workflow_service.cancel_workflow(

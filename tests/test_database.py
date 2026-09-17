@@ -228,23 +228,47 @@ async def test_vector_search_owner_isolation(db_session_factory, db_owner_id, em
 # --- Session store persistence ----------------------------------------------------
 
 
-async def test_sessions_survive_store_restart(db_session_factory) -> None:
+async def test_sessions_survive_store_restart(db_session_factory, db_owner_id) -> None:
     """The Part 2 critical property: a NEW store instance (= server restart)
     sees the same conversations."""
     store_a = DatabaseSessionStore(session_factory=db_session_factory)
-    session_obj = await store_a.create_session()
-    await store_a.add_message(session_obj.session_id, "user", "Hi, my name is Boss.")
+    session_obj = await store_a.create_session(db_owner_id)
+    await store_a.add_message(
+        db_owner_id, session_obj.session_id, "user", "Hi, my name is Boss."
+    )
 
     # "Restart": a fresh store over the same database.
     store_b = DatabaseSessionStore(session_factory=db_session_factory)
-    fetched = await store_b.get_session(session_obj.session_id)
+    fetched = await store_b.get_session(db_owner_id, session_obj.session_id)
     assert fetched.messages == [
         {"role": "user", "content": "Hi, my name is Boss."}
     ]
 
 
-async def test_session_store_unknown_session(db_store) -> None:
+async def test_session_store_unknown_session(db_store, db_owner_id) -> None:
     with pytest.raises(SessionNotFoundError):
-        await db_store.get_session("not-a-uuid")
+        await db_store.get_session(db_owner_id, "not-a-uuid")
     with pytest.raises(SessionNotFoundError):
-        await db_store.get_session(str(uuid.uuid4()))
+        await db_store.get_session(db_owner_id, str(uuid.uuid4()))
+
+
+async def test_session_store_is_owner_scoped(db_session_factory, owner_ids) -> None:
+    """A session id is not usable across owners.
+
+    This is the storage-level half of the tenancy guarantee; the HTTP-level
+    half is covered by tests/test_m3_auth_regressions.py.
+    """
+    owner_a, owner_b = owner_ids
+    store = DatabaseSessionStore(session_factory=db_session_factory)
+    session_obj = await store.create_session(owner_a)
+
+    # Owner A sees it.
+    assert await store.get_session(owner_a, session_obj.session_id)
+    # Owner B does not, and cannot list or delete it either.
+    with pytest.raises(SessionNotFoundError):
+        await store.get_session(owner_b, session_obj.session_id)
+    assert session_obj.session_id not in await store.list_sessions(owner_b)
+    with pytest.raises(SessionNotFoundError):
+        await store.delete_session(owner_b, session_obj.session_id)
+    # A still has it.
+    assert session_obj.session_id in await store.list_sessions(owner_a)

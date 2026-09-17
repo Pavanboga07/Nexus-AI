@@ -123,6 +123,56 @@ class A2ATask(Base):
         }
 
 
+class TrustedAgentCard(Base):
+    """A VERIFIED agent card, cached for discovery (Part 7).
+
+    Only :meth:`DiscoveryService.register_verified_card` may write here, and it
+    writes only after the card's Ed25519 signature, agent_id <-> public_key
+    consistency and time window have all been verified. Persisting the card is
+    what makes capability discovery possible without re-fetching the peer on
+    every lookup, and it is why the cached card can be trusted later: nothing
+    unverified ever reaches this table.
+
+    A card is invalidated by ``expires_at``; consumers must not treat a stale
+    row as current.
+    """
+
+    __tablename__ = "trusted_agent_cards"
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id", "agent_id", name="uq_trusted_agent_cards_owner_agent"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    owner_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), nullable=False, index=True
+    )
+    agent_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    #: The full verified card document (canonical JSON + signature).
+    card: Mapped[dict] = mapped_column(JSON, nullable=False)
+    #: When this card was last successfully verified by us.
+    verified_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    #: The card's own expires_at, so stale cards can be detected cheaply.
+    card_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "agent_id": self.agent_id,
+            "card": self.card,
+            "verified_at": self.verified_at.isoformat() if self.verified_at else None,
+            "card_expires_at": (
+                self.card_expires_at.isoformat() if self.card_expires_at else None
+            ),
+        }
+
+
 class A2AMessageRecord(Base):
     """Replay protection + audit, one row per processed inbound message."""
 
@@ -170,4 +220,11 @@ class A2AMessageRecord(Base):
         }
 
 
-__all__ = ["A2AMessageRecord", "A2ATask", "TaskStatus", "TrustedAgent", "TrustStatus"]
+__all__ = [
+    "A2AMessageRecord",
+    "A2ATask",
+    "TaskStatus",
+    "TrustedAgent",
+    "TrustedAgentCard",
+    "TrustStatus",
+]

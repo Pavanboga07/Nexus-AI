@@ -77,7 +77,7 @@ async def test_chat_empty_message_returns_422(client: httpx.AsyncClient) -> None
     )
 
     assert response.status_code == 422
-    assert response.json()["error"] == "validation_error"
+    assert response.json()["error"]["code"] == "validation_error"
 
 
 async def test_chat_missing_field_returns_422(client: httpx.AsyncClient) -> None:

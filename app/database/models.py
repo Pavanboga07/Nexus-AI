@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    Boolean,
     DateTime,
     Enum,
     Float,
@@ -30,6 +31,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -118,11 +120,29 @@ class Message(Base):
 class Memory(Base):
     """A long-term memory with its pgvector embedding.
 
-    ``embedding`` is a dimensionless ``vector`` column: the local embedder
-    produces 256 dims and OpenAI text-embedding-3-small produces 1536, and a
-    fixed typmod would reject one of them. All vectors within one deployment
-    share the configured embedder's dimension, so cosine KNN search is
-    consistent. If an HNSW index is added later, pin the dimension then."""
+    The embedding column is declared dimensionless because the deployment's
+    embedder decides the dimension (local-hash: 256, text-embedding-3-small:
+    1536). Two consequences, both addressed in M8:
+
+      * **pgvector cannot build an HNSW index on a dimensionless column** - it
+        fails with "column does not have dimensions". Pinning the dimension is
+        a PREREQUISITE for indexing, not an optimisation.
+      * Until the index exists, retrieval is an EXACT cosine scan over the
+        owner's memories: correct at thousands, not at millions.
+
+    ``scripts/build_vector_index.py`` verifies the data, pins the dimension and
+    builds the index (verified in testing: with 20k rows the planner switches
+    to ``Index Scan using ix_memories_embedding_hnsw`` for the repository's
+    query shape).
+
+    Dimensions are additionally enforced at WRITE time
+    (``MemoryRepository.add``): mixing dimensions in one column cannot be
+    searched consistently, and the failure would otherwise appear at query time
+    as a confusing SQL error.
+
+    ``agent_id`` is nullable for backward compatibility: rows written before M8
+    belong to the owner rather than to a specific agent.
+    """
 
     __tablename__ = "memories"
     __table_args__ = (
@@ -131,10 +151,18 @@ class Memory(Base):
             "owner_id",
             "memory_type",
         ),
+        # Supports per-agent scoping without a scan.
+        Index("ix_memories_owner_agent", "owner_id", "agent_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     owner_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("owners.id"), nullable=False, index=True)
+    #: The agent this memory belongs to. NULL = owner-scoped (pre-M8 rows).
+    #: Not a FK to agents.id: memories must survive an agent being deleted,
+    #: because they are the owner's data, not the agent's.
+    agent_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True, index=True
+    )
     memory_type: Mapped[MemoryType] = mapped_column(
         Enum(MemoryType, name="memory_type", native_enum=False, length=32),
         nullable=False,
@@ -149,6 +177,10 @@ class Memory(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     last_accessed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    #: Soft pin: a pinned memory is never reaped by retention.
+    pinned: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
     metadata_: Mapped[dict] = mapped_column("metadata", JSONB, default=dict, nullable=False)
 
     owner: Mapped[Owner] = relationship(back_populates="memories")

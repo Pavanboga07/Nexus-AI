@@ -47,6 +47,10 @@ def build_provider(settings: Settings) -> LLMProvider:
         base_url=settings.llm_base_url,
         timeout=settings.nexus_llm_timeout,
         extra_headers=settings.llm_extra_headers,
+        # M7: retry transient provider failures (5xx, connection, empty
+        # response), not just a single empty response.
+        max_attempts=settings.nexus_llm_max_attempts,
+        retry_base_seconds=settings.nexus_llm_retry_base_seconds,
     )
 
 

@@ -5,9 +5,10 @@ from __future__ import annotations
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from app.agent.agent import NexusAgent
+from app.api.auth_context import request_owner_id
 from app.api.dependencies import get_agent
 from app.schemas.memory import (
     MemoryDeleteResponse,
@@ -29,17 +30,19 @@ def _memory_out(memory) -> MemoryOut:
     return MemoryOut(**memory.to_dict())  # type: ignore[arg-type]
 
 
-async def _owner_id(agent: NexusAgent) -> uuid.UUID:
-    return await agent._owner_id()
+async def _owner_id(request: Request) -> uuid.UUID:
+    return request_owner_id(request)
 
 
 def _require_memory(agent: NexusAgent):
-    if agent._memory is None:
+    """The agent's memory manager, or 503 when memory is disabled (M5: public)."""
+    memory = agent.memory
+    if memory is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Memory subsystem is not configured.",
         )
-    return agent._memory
+    return memory
 
 
 @router.get(
@@ -49,6 +52,7 @@ def _require_memory(agent: NexusAgent):
     summary="List stored memories (owner-scoped)",
 )
 async def list_memories(
+    request: Request,
     memory_type: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
     agent: NexusAgent = Depends(get_agent),
@@ -59,7 +63,7 @@ async def list_memories(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="memory_type must be semantic, episodic, or relationship",
         )
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     memories = await memory.list_memories(
         owner_id, memory_type=memory_type, limit=limit
     )
@@ -74,11 +78,12 @@ async def list_memories(
     summary="Semantic memory search (owner-scoped)",
 )
 async def search_memories(
+    request: Request,
     payload: MemorySearchRequest,
     agent: NexusAgent = Depends(get_agent),
 ) -> MemorySearchResponse:
     memory = _require_memory(agent)
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     results = await memory.search_memories(
         owner_id,
         payload.query,
@@ -102,6 +107,7 @@ async def search_memories(
     responses={404: {"description": "Memory not found"}},
 )
 async def delete_memory(
+    request: Request,
     memory_id: str,
     agent: NexusAgent = Depends(get_agent),
 ) -> MemoryDeleteResponse:
@@ -113,7 +119,7 @@ async def delete_memory(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Memory not found.",
         ) from None
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     deleted = await memory.delete_memory(owner_id, memory_uuid)
     if not deleted:
         raise HTTPException(

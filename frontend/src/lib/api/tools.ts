@@ -27,31 +27,32 @@ export async function executeTool(
   });
 }
 
+export type ToolAuditEntry = {
+  id: string;
+  request_id: string;
+  tool_name: string;
+  purpose: string;
+  status: string;
+  policy_decision: string;
+  error_code?: string | null;
+  created_at?: string | null;
+  completed_at?: string | null;
+};
+
+/**
+ * The tool execution audit (`ToolAuditEntryOut`).
+ *
+ * Previously reshaped into `{entries: [{caller, duration_ms, success, ...}]}`.
+ * Only `duration_ms: 0` and a `success` boolean derived from `status` survived
+ * that mapping; `caller` was fed from `purpose`, so the Activity page labelled a
+ * purpose as a caller, and every duration displayed as 0ms. The API shape is
+ * used directly.
+ */
 export async function getToolAudit(): Promise<{
-  entries: Array<{
-    id: string;
-    tool_name: string;
-    caller: string;
-    success: boolean;
-    duration_ms: number;
-    error?: string;
-    timestamp: string;
-  }>;
+  executions: ToolAuditEntry[];
   total: number;
 }> {
-  const res = await apiFetch<{ executions: any[]; total: number }>(
+  return apiFetch<{ executions: ToolAuditEntry[]; total: number }>(
     "/tools/audit/list"
   );
-  return {
-    entries: (res.executions || []).map((e) => ({
-      id: e.id,
-      tool_name: e.tool_name,
-      caller: e.purpose,
-      success: e.status === "executed",
-      duration_ms: 0,
-      error: e.error_code,
-      timestamp: e.created_at,
-    })),
-    total: res.total,
-  };
 }

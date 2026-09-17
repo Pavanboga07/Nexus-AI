@@ -1,9 +1,10 @@
-"""Real Two-Device Network Demonstration: Gateway-Centered Agent Discovery & Identity (Part 14).
+"""Real network demonstration: Gateway-centered agent discovery & identity (Part 14).
 
 Demonstrates:
-  Device A (Alice, @alice)  <---- Live Hosted Nexus Gateway ---->  Device B (Rahul, @rahul)
-  Gateway: wss://nexus-gateway-mv63.onrender.com/ws
-           https://nexus-gateway-mv63.onrender.com
+  Device A (Alice, @alice)  <---- Live Nexus Gateway ---->  Device B (Rahul, @rahul)
+
+Gateway target comes from NEXUS_GATEWAY_URL (default: local ws://127.0.0.1:9000/ws).
+Start one with:  cd nexus-gateway && docker compose up -d  (or: python run.py)
 
 Tests:
   [Test 1] Exact Agent ID Discovery:
@@ -19,6 +20,11 @@ Tests:
            - Rahul disconnects from Gateway
            - Alice sends message -> Gateway replies "queued" -> Alice enters WAITING_REMOTE
            - Rahul reconnects -> Gateway flushes queued message to Rahul -> Rahul answers -> Task completes
+
+NOTE: Alice and Rahul are simulated as two independent runtimes in ONE process,
+each with its own in-memory database and its own Ed25519 identity. The network
+path to the gateway (WSS) is real; the two "devices" are not separate hosts.
+For a true multi-process test see tests/integration/.
 """
 
 from __future__ import annotations
@@ -28,6 +34,7 @@ import base64
 import httpx
 import json
 import logging
+import os
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -77,8 +84,18 @@ except Exception:
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger("demo")
 
-GATEWAY_WS_URL = "wss://nexus-gateway-mv63.onrender.com/ws"
-GATEWAY_HTTP_URL = "https://nexus-gateway-mv63.onrender.com"
+# Gateway target is environment-driven so the demo can run against any
+# gateway (local docker compose, staging, self-hosted) rather than being
+# pinned to one deployed instance.
+GATEWAY_WS_URL = os.environ.get(
+    "NEXUS_GATEWAY_URL", "ws://127.0.0.1:9000/ws"
+)
+GATEWAY_HTTP_URL = (
+    GATEWAY_WS_URL.replace("wss://", "https://")
+    .replace("ws://", "http://")
+    .rstrip("/ws")
+    .rstrip("/")
+)
 
 # SQLite compatibility compiler hook for JSONB
 @compiles(JSONB, "sqlite")
@@ -115,16 +132,46 @@ class MockIdentity:
 
 
 async def cleanup_stale_demo_records():
-    """Remove previous run's demo records so unique handles @rahul and @alice can be re-registered."""
-    db_url = "postgresql+asyncpg://neondb_owner:npg_uOQ8LbeJgA2p@ep-rapid-poetry-audz0vue-pooler.c-10.us-east-1.aws.neon.tech/neondb?ssl=require"
+    """Release the demo handles so @rahul / @alice can be re-registered.
+
+    SECURITY: this function must never contain a hardcoded connection string
+    (an earlier revision committed a live database credential here). The
+    gateway database URL is read from the environment, and the demo is a
+    no-op when it is not configured.
+
+    The gateway now claims handles atomically, so a stale demo handle must be
+    released through the gateway's own API rather than by deleting rows
+    directly from its database.
+    """
+    gateway_admin_url = os.environ.get("GATEWAY_ADMIN_URL")
+    gateway_admin_token = os.environ.get("GATEWAY_ADMIN_TOKEN")
+    if not gateway_admin_url:
+        print(
+            "    [i] GATEWAY_ADMIN_URL not set - skipping stale handle cleanup "
+            "(handles are claimed atomically by the gateway)."
+        )
+        return
+
+    headers = {}
+    if gateway_admin_token:
+        headers["Authorization"] = f"Bearer {gateway_admin_token}"
+
     try:
-        from sqlalchemy import text
-        neon_engine = create_async_engine(db_url)
-        async with neon_engine.begin() as conn:
-            await conn.execute(text("DELETE FROM registered_agents WHERE handle IN ('rahul', 'alice', '@rahul', '@alice');"))
-        await neon_engine.dispose()
-    except Exception as exc:
-        pass
+        import httpx
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for handle in ("rahul", "alice"):
+                resp = await client.delete(
+                    f"{gateway_admin_url.rstrip('/')}/admin/agents/handle/{handle}",
+                    headers=headers,
+                )
+                if resp.status_code not in (200, 204, 404):
+                    print(
+                        f"    [!] Could not release handle @{handle}: "
+                        f"HTTP {resp.status_code}"
+                    )
+    except Exception as exc:  # pragma: no cover - best-effort demo helper
+        print(f"    [!] Stale handle cleanup failed (continuing): {exc}")
 
 
 def print_banner(text: str):

@@ -15,11 +15,12 @@ from __future__ import annotations
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from app.a2a.errors import A2AError
 from app.a2a.service import A2AService
 from app.agent.agent import NexusAgent
+from app.api.auth_context import request_owner_id
 from app.api.dependencies import get_a2a_service, get_agent
 from app.schemas.tasks import (
     TaskActionResponse,
@@ -36,8 +37,8 @@ logger = logging.getLogger("nexus.api.tasks")
 router = APIRouter()
 
 
-async def _owner_id(agent: NexusAgent) -> uuid.UUID:
-    return await agent._owner_id()
+async def _owner_id(request: Request) -> uuid.UUID:
+    return request_owner_id(request)
 
 
 @router.post(
@@ -54,11 +55,12 @@ async def _owner_id(agent: NexusAgent) -> uuid.UUID:
     },
 )
 async def delegate_task(
+    request: Request,
     payload: TaskDelegateRequest,
     agent: NexusAgent = Depends(get_agent),
     a2a_service: A2AService = Depends(get_a2a_service),
 ) -> TaskActionResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     try:
         result = await a2a_service.delegate_task(
             owner_id,
@@ -85,12 +87,13 @@ async def delegate_task(
     summary="List owner-scoped tasks",
 )
 async def list_tasks(
+    request: Request,
     status: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
     agent: NexusAgent = Depends(get_agent),
     a2a_service: A2AService = Depends(get_a2a_service),
 ) -> TaskListResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     tasks = await a2a_service.list_tasks(owner_id, status=status, limit=limit)
     items = [TaskOut(**t.to_dict()) for t in tasks]  # type: ignore[arg-type]
     return TaskListResponse(tasks=items, total=len(items))
@@ -106,11 +109,12 @@ async def list_tasks(
     },
 )
 async def get_task(
+    request: Request,
     task_id: str,
     agent: NexusAgent = Depends(get_agent),
     a2a_service: A2AService = Depends(get_a2a_service),
 ) -> TaskOut:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     task = await a2a_service.get_task(owner_id, task_id)
     if task is None:
         raise HTTPException(
@@ -131,12 +135,13 @@ async def get_task(
     },
 )
 async def approve_task(
+    request: Request,
     task_id: str,
     payload: TaskApproveRequest | None = None,
     agent: NexusAgent = Depends(get_agent),
     a2a_service: A2AService = Depends(get_a2a_service),
 ) -> TaskActionResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     notes = payload.notes if payload else None
     try:
         task = await a2a_service.approve_task(owner_id, task_id, notes=notes)
@@ -161,12 +166,13 @@ async def approve_task(
     },
 )
 async def reject_task(
+    request: Request,
     task_id: str,
     payload: TaskRejectRequest | None = None,
     agent: NexusAgent = Depends(get_agent),
     a2a_service: A2AService = Depends(get_a2a_service),
 ) -> TaskActionResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     reason = payload.reason if payload else "Rejected by owner"
     try:
         task = await a2a_service.reject_task(owner_id, task_id, reason=reason)
@@ -191,11 +197,12 @@ async def reject_task(
     },
 )
 async def cancel_task(
+    request: Request,
     task_id: str,
     agent: NexusAgent = Depends(get_agent),
     a2a_service: A2AService = Depends(get_a2a_service),
 ) -> TaskActionResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     try:
         task = await a2a_service.cancel_task(owner_id, task_id)
     except A2AError as exc:
@@ -221,12 +228,13 @@ async def cancel_task(
     },
 )
 async def negotiate_task(
+    request: Request,
     task_id: str,
     payload: TaskNegotiateRequest,
     agent: NexusAgent = Depends(get_agent),
     a2a_service: A2AService = Depends(get_a2a_service),
 ) -> TaskActionResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     try:
         result = await a2a_service.negotiate_task(
             owner_id,

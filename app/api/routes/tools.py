@@ -5,9 +5,10 @@ from __future__ import annotations
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from app.agent.agent import NexusAgent
+from app.api.auth_context import request_owner_id
 from app.api.dependencies import get_agent, get_tool_service
 from app.tools.schemas import ToolInvocation
 from app.tools.service import ToolService
@@ -25,8 +26,15 @@ logger = logging.getLogger("nexus.api.tools")
 router = APIRouter()
 
 
-async def _owner_id(agent: NexusAgent) -> uuid.UUID:
-    return await agent._owner_id()
+async def _owner_id(request: Request) -> uuid.UUID:
+    """The ACTING owner for this request (authenticated principal).
+
+    Multi-tenancy: the owner comes from the resolved RequestContext, never from
+    a process-wide cache. Raising here (rather than defaulting) surfaces a
+    route mounted without the auth dependency instead of silently operating on
+    the wrong tenant's data.
+    """
+    return request_owner_id(request)
 
 
 @router.get(
@@ -76,11 +84,12 @@ async def get_tool(
     ),
 )
 async def execute_tool(
+    request: Request,
     payload: ToolExecuteRequest,
     agent: NexusAgent = Depends(get_agent),
     tool_service: ToolService = Depends(get_tool_service),
 ) -> ToolExecuteResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     result = await tool_service.execute(
         owner_id,
         ToolInvocation(
@@ -100,11 +109,12 @@ async def execute_tool(
     summary="Tool execution audit trail (owner-scoped)",
 )
 async def list_tool_audit(
+    request: Request,
     limit: int = Query(default=100, ge=1, le=500),
     agent: NexusAgent = Depends(get_agent),
     tool_service: ToolService = Depends(get_tool_service),
 ) -> ToolAuditResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     records = await tool_service.list_audit(owner_id, limit=limit)
     entries = [ToolAuditEntryOut(**r.to_dict()) for r in records]
     return ToolAuditResponse(executions=entries, total=len(entries))

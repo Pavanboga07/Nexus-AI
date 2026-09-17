@@ -27,17 +27,24 @@ def get_agent(request: Request) -> NexusAgent:
     """Return the process-wide agent instance."""
     agent: NexusAgent | None = getattr(request.app.state, "agent", None)
     if agent is None:  # pragma: no cover - only if startup failed
-        raise RuntimeError("Nexus agent is not initialised.")
+        raise HTTPDependencyError("Nexus agent is not initialised.")
     return agent
 
 
 def get_identity_service(request: Request) -> IdentityService:
-    """Return the process-wide identity service (may be uninitialised)."""
+    """Return the process-wide identity service (may be uninitialised).
+
+    NOTE: this raises ``HTTPDependencyError`` (mapped to 503) rather than a
+    bare RuntimeError. A bare RuntimeError was swallowed by the catch-all
+    exception handler and surfaced as a 500, which masked the real cause.
+    """
     service: IdentityService | None = getattr(
         request.app.state, "identity_service", None
     )
     if service is None:
-        raise RuntimeError("Identity service is not initialised.")
+        raise HTTPDependencyError(
+            "Identity service is not available (database required)."
+        )
     return service
 
 

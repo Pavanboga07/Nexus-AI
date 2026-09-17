@@ -139,7 +139,7 @@ class GatewayClient:
         challenge_b64 = data["challenge"]
         challenge_bytes = base64.b64decode(challenge_b64.encode("ascii"))
 
-        # 2. Sign challenge with local IdentityService
+        # 2. Sign challenge with the local identity bound to this agent
         pub_ident = self._identity.get_public_identity()
         raw_sig = await self._identity.sign(challenge_bytes)
         sig_b64 = base64.b64encode(raw_sig).decode("ascii")
@@ -318,35 +318,59 @@ class GatewayClient:
 
 
 class GatewayA2ATransport:
-    """A2ATransport implementation that routes via Gateway or direct HTTP."""
+    """A2ATransport implementation that routes via the Gateway or direct HTTP.
+
+    Selection (decision D2 - gateway-first):
+
+      1. A live Gateway connection exists -> route through the Gateway.
+         This is the PREFERRED and default path: it traverses NAT, gives
+         durable offline buffering, and gives one transport to reason about.
+      2. No live Gateway AND the endpoint is a direct http(s) URL AND direct
+         egress is explicitly enabled (``NEXUS_A2A_DIRECT_EGRESS=true``) ->
+         direct HTTP.
+      3. No live Gateway and direct egress not enabled -> raise a transport
+         error naming the reason.
+
+    Direct egress is opt-in on purpose: silently falling back to a direct HTTP
+    POST means a peer's NAT reachability decides which delivery semantics you
+    get (no offline queue, no ack, different failure modes). An operator should
+    choose that, not discover it.
+
+    KNOWN LIMITATION (multi-agent): the GatewayClient authenticates as the
+    local PRIMARY agent and ``send_relay_envelope`` ignores the ``endpoint``
+    argument, so over the gateway every outbound message is sent as that agent
+    regardless of which local agent originated it. Per-agent gateway
+    connections are the fix and are tracked with the M9 work.
+    """
 
     def __init__(
         self,
         *,
-        http_transport: A2ATransport,
+        http_transport: A2ATransport | None,
         gateway_client: GatewayClient | None = None,
+        allow_direct_egress: bool = False,
     ) -> None:
         self._http = http_transport
         self._gateway = gateway_client
+        self._allow_direct_egress = allow_direct_egress
 
     def set_gateway_client(self, client: GatewayClient | None) -> None:
         self._gateway = client
 
+    @property
+    def using_gateway(self) -> bool:
+        return self._gateway is not None and self._gateway.is_connected
+
     async def send(
         self, endpoint: str, envelope: dict[str, Any]
     ) -> dict[str, Any]:
-        """Send a signed envelope, return the parsed response envelope.
-        
-        Selection rules (Part 13):
-        1. If a live Gateway connection exists: route through Gateway.
-        2. If Gateway is unavailable AND endpoint is a valid direct HTTP(S) URL: use DirectHTTPTransport.
-        3. If neither is available: raise transport unavailable error.
-        """
-        # 1. Prefer Gateway if connected
+        """Send a signed envelope, return the parsed response envelope."""
+        # 1. Prefer the Gateway.
         if self._gateway is not None and self._gateway.is_connected:
             return await self._gateway.send_relay_envelope(envelope)
 
-        # 2. If endpoint explicitly targets gateway but gateway is disconnected
+        # 2. Explicit gateway target with no connection is a hard failure - it
+        #    must not silently become a direct POST to a ws:// URL.
         is_gateway_target = (
             endpoint.startswith("ws://")
             or endpoint.startswith("wss://")
@@ -358,8 +382,21 @@ class GatewayA2ATransport:
                 "Gateway transport is not connected.",
             )
 
-        # 3. Fallback to direct HTTP transport if endpoint is valid http/https
+        # 3. Direct HTTP only when the operator has opted in.
         if endpoint.startswith("http://") or endpoint.startswith("https://"):
+            if not self._allow_direct_egress:
+                raise A2AError(
+                    A2AErrorCode.TRANSPORT_ERROR,
+                    "Gateway is not connected and direct egress is disabled "
+                    "(NEXUS_A2A_DIRECT_EGRESS=false). Direct HTTP would lose "
+                    "the gateway's offline buffering and delivery acks; enable "
+                    "it explicitly if that is intended.",
+                )
+            if self._http is None:
+                raise A2AError(
+                    A2AErrorCode.TRANSPORT_ERROR,
+                    "No HTTP transport is configured for direct egress.",
+                )
             return await self._http.send(endpoint, envelope)
 
         raise A2AError(

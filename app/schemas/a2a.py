@@ -48,12 +48,16 @@ class TrustedAgentListResponse(BaseModel):
 
 class A2AMessageIn(BaseModel):
     """Inbound signed envelope - validated structurally; cryptographic
-    verification happens in the service, never in the schema."""
+    verification happens in the service, never in the schema.
+
+    Mirrors A2AEnvelope (0.2). The 0.2 fields are optional so a 0.1 peer's
+    message still validates.
+    """
 
     model_config = {"extra": "forbid"}
 
     protocol: Literal["nexus-a2a"]
-    version: Literal["0.1"]
+    version: Literal["0.1", "0.2"]
     message_id: str
     task_id: str
     sender: str
@@ -64,6 +68,11 @@ class A2AMessageIn(BaseModel):
     purpose: str
     payload: dict[str, Any]
     signature: str
+    correlation_id: str | None = None
+    reply_to: str | None = None
+    capability: dict[str, Any] | None = None
+    authorization: dict[str, Any] | None = None
+    trace: dict[str, Any] | None = None
 
 
 class A2ASendRequest(BaseModel):

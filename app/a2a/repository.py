@@ -5,11 +5,17 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.a2a.models import A2AMessageRecord, A2ATask, TrustedAgent, TrustStatus
+from app.a2a.models import (
+    A2AMessageRecord,
+    A2ATask,
+    TrustedAgent,
+    TrustedAgentCard,
+    TrustStatus,
+)
 
 
 class TrustedAgentRepository:
@@ -152,6 +158,81 @@ class TaskRepository:
         return task
 
 
+class TrustedAgentCardRepository:
+    """Persistence for VERIFIED agent cards.
+
+    Only DiscoveryService.register_verified_card() writes here, after the
+    card's Ed25519 signature, agent_id<->public_key consistency and time
+    window have been checked. Reads therefore never need to re-verify the
+    signature, though consumers must still honour ``card_expires_at``.
+    """
+
+    async def upsert(
+        self, session: AsyncSession, card_row: TrustedAgentCard
+    ) -> TrustedAgentCard:
+        existing = await session.execute(
+            select(TrustedAgentCard).where(
+                TrustedAgentCard.owner_id == card_row.owner_id,
+                TrustedAgentCard.agent_id == card_row.agent_id,
+            )
+        )
+        found = existing.scalar_one_or_none()
+        if found is not None:
+            found.card = card_row.card
+            found.card_expires_at = card_row.card_expires_at
+            # verified_at is server-defaulted on insert; only overwrite it when
+            # the caller supplied an explicit timestamp. Writing None here would
+            # violate the NOT NULL constraint.
+            found.verified_at = card_row.verified_at or func.now()
+            await session.flush()
+            return found
+        session.add(card_row)
+        await session.flush()
+        return card_row
+
+    async def get(
+        self, session: AsyncSession, owner_id: uuid.UUID, agent_id: str
+    ) -> TrustedAgentCard | None:
+        result = await session.execute(
+            select(TrustedAgentCard).where(
+                TrustedAgentCard.owner_id == owner_id,
+                TrustedAgentCard.agent_id == agent_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def list_for_owner(
+        self,
+        session: AsyncSession,
+        owner_id: uuid.UUID,
+        *,
+        include_expired: bool = False,
+        limit: int = 200,
+    ) -> list[TrustedAgentCard]:
+        stmt = select(TrustedAgentCard).where(
+            TrustedAgentCard.owner_id == owner_id
+        )
+        if not include_expired:
+            stmt = stmt.where(
+                (TrustedAgentCard.card_expires_at.is_(None))
+                | (TrustedAgentCard.card_expires_at > datetime.now(timezone.utc))
+            )
+        stmt = stmt.order_by(TrustedAgentCard.verified_at.desc()).limit(limit)
+        result = await session.execute(stmt)
+        return list(result.scalars())
+
+    async def delete(
+        self, session: AsyncSession, owner_id: uuid.UUID, agent_id: str
+    ) -> bool:
+        result = await session.execute(
+            delete(TrustedAgentCard).where(
+                TrustedAgentCard.owner_id == owner_id,
+                TrustedAgentCard.agent_id == agent_id,
+            )
+        )
+        return bool(result.rowcount)
+
+
 class MessageRecordRepository:
     """Replay protection (unique owner+message_id) + audit queries."""
 
@@ -212,5 +293,6 @@ class MessageRecordRepository:
 __all__ = [
     "MessageRecordRepository",
     "TaskRepository",
+    "TrustedAgentCardRepository",
     "TrustedAgentRepository",
 ]

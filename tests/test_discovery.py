@@ -105,7 +105,11 @@ class TestCardBuilder:
         card = _build_unsigned_card(identity)
         assert card["type"] == "agent-card"
         assert card["protocol"] == "nexus-a2a"
-        assert card["version"] == "0.1"
+        # 0.1 remains supported for peers that have not upgraded (M6), so assert
+        # against the supported set rather than one exact version.
+        from app.a2a.schemas import SUPPORTED_PROTOCOL_VERSIONS
+
+        assert card["version"] in SUPPORTED_PROTOCOL_VERSIONS
         assert card["agent_id"] == identity.agent_id
         assert card["public_key"] == identity.public_key_b64
         assert card["display_name"] == "Test Agent"
@@ -312,7 +316,12 @@ class TestCardSigning:
 @pytest_asyncio.fixture
 async def discovery_app(db_a2a_app):
     """db_a2a_app already has identity + a2a + policy + tools.
-    We add the discovery service on top."""
+    We add the discovery service on top.
+
+    ``session_factory`` is passed so verified cards are actually persisted
+    (a real deployment always has it; without it the verified-card cache is a
+    silent no-op and the persistence path would go untested).
+    """
     from app.a2a.discovery import DiscoveryService
 
     discovery_service = DiscoveryService(
@@ -321,6 +330,7 @@ async def discovery_app(db_a2a_app):
         allow_local_endpoints=True,
         timeout_seconds=5.0,
         max_card_bytes=65_536,
+        session_factory=getattr(db_a2a_app.state, "session_factory", None),
     )
     db_a2a_app.state.discovery_service = discovery_service
     return db_a2a_app
@@ -345,7 +355,9 @@ class TestCardEndpoints:
         card = response.json()
         assert card["type"] == "agent-card"
         assert card["protocol"] == "nexus-a2a"
-        assert card["version"] == "0.1"
+        from app.a2a.schemas import SUPPORTED_PROTOCOL_VERSIONS
+
+        assert card["version"] in SUPPORTED_PROTOCOL_VERSIONS
         assert card["signature"] is not None
 
         # Verify agent_id matches the local identity.
@@ -374,12 +386,41 @@ class TestCardEndpoints:
         assert "echo" in cap_names
         assert "get_current_time" in cap_names
 
-    async def test_card_capabilities_never_expose_input_schema(self, discovery_client) -> None:
+    async def test_card_capabilities_carry_contract_not_private_data(
+        self, discovery_client
+    ) -> None:
+        """Capabilities MAY expose an input schema, but never private data.
+
+        This test previously asserted that no capability ever exposed a schema
+        (`input_schema` absent). M6 deliberately reverses that: a capability
+        contract is what lets an independent developer build a valid request
+        instead of guessing the payload shape, so the schema is part of the
+        public contract.
+
+        What must still hold: an input schema describes what the agent ACCEPTS
+        (not what it knows), and no capability carries memory, policy or key
+        material.
+        """
         response = await discovery_client.get("/a2a/card")
         card = response.json()
         for cap in card["capabilities"]:
+            # A schema is allowed - but only about inputs/outputs.
+            for key in ("input_schema", "output_schema"):
+                schema = cap.get(key)
+                if schema is not None:
+                    assert isinstance(schema, dict)
+            # Never leak the camelCase internal shape by accident.
             assert "inputSchema" not in cap
-            assert "input_schema" not in cap
+            # No capability may carry memory, policy or key material.
+            for forbidden in ("memory", "memories", "policy", "policies",
+                              "private_key", "encrypted_private_key"):
+                assert forbidden not in cap, f"card capability leaks {forbidden}"
+
+        # At least one capability must advertise a real contract, otherwise the
+        # contract model is not actually being published.
+        assert any(
+            cap.get("input_schema") for cap in card["capabilities"]
+        ), "no capability advertises an input contract"
 
 
 class TestDiscoverEndpoint:
@@ -665,12 +706,21 @@ class TestDiscoveryServiceUnavailable:
     async def test_well_known_503_when_identity_not_ready(
         self, discovery_client, discovery_app
     ) -> None:
-        identity_svc = discovery_app.state.identity_service
-        saved_key = identity_svc._private_key
+        """No initialized agent => 503, not a half-built card.
+
+        M4: identity is per-agent, so "ready" is a property of the app's
+        primary-agent binding, not a cached private key on the service.
+        """
+        saved_identity = discovery_app.state.primary_identity
+        saved_flag = discovery_app.state.identity_ok
         try:
-            identity_svc._private_key = None
+            discovery_app.state.primary_identity = None
+            discovery_app.state.identity_ok = False
             response = await discovery_client.get("/.well-known/nexus-agent.json")
             assert response.status_code == 503
-            assert response.json()["detail"] == "Agent identity is not initialised."
+            body = response.json()
+            assert body["error"]["message"] == "Agent identity is not initialised."
+            assert body["error"]["code"] == "service_unavailable"
         finally:
-            identity_svc._private_key = saved_key
+            discovery_app.state.primary_identity = saved_identity
+            discovery_app.state.identity_ok = saved_flag

@@ -60,20 +60,39 @@ class TargetResolver:
         )
 
     async def _http_get(self, url: str) -> httpx.Response | None:
+        # Same SSRF discipline as every other outbound call. The gateway base
+        # is operator-configured but user input is appended to it, so the
+        # composed URL is validated before we dial it.
+        from app.a2a.transport import validate_endpoint
+
+        validate_endpoint(url, allow_local=True)
         if self._http_client:
             return await self._http_client.get(url)
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
             return await client.get(url)
 
     def _verify_card(
         self, card: dict[str, Any], expected_agent_id: str | None = None
     ) -> dict[str, Any] | None:
-        """Verify the integrity, signature, and time window of an agent card."""
+        """Verify a card's schema, fingerprint, Ed25519 signature and time
+        window. Returns the verified card, or None.
+
+        This is a total function (never raises) because it sits on a
+        best-effort resolution path. A None result is always treated as
+        "not discoverable" by callers - an unverified card must never be
+        cached or surfaced as a discovered agent.
+        """
         try:
-            if self._discovery and hasattr(self._discovery, "verify_card"):
-                return self._discovery.verify_card(card, expected_agent_id=expected_agent_id)
+            if self._discovery is not None and hasattr(
+                self._discovery, "verify_card"
+            ):
+                # Single source of truth for card verification.
+                return self._discovery.verify_card(
+                    card, expected_agent_id=expected_agent_id
+                )
             from app.a2a import signing
             from app.a2a.cards import validate_card_schema, validate_card_time_window
+
             validate_card_schema(card)
             if expected_agent_id and card.get("agent_id") != expected_agent_id:
                 return None
@@ -139,8 +158,24 @@ class TargetResolver:
                     if resp and resp.status_code == 200:
                         agent_data = resp.json()
                         card = agent_data.get("agent_card")
-                        if card:
-                            verified_card = self._verify_card(card, expected_agent_id=agent_id)
+                        if not card:
+                            # The directory knows this agent but has no signed
+                            # card for it. A directory entry is a HINT, never a
+                            # trust source: without a signed card there is
+                            # nothing to verify, so the agent stays unknown.
+                            # (Previously an unsigned card was synthesized here
+                            # from gateway-supplied metadata and cached as
+                            # "discovered", which let a compromised relay inject
+                            # agents that had never been signed.)
+                            logger.info(
+                                "gateway_directory_entry_without_card agent_id=%s "
+                                "- not discoverable (no signed card to verify)",
+                                agent_id,
+                            )
+                        else:
+                            verified_card = self._verify_card(
+                                card, expected_agent_id=agent_id
+                            )
                             if verified_card is not None:
                                 self._discovered_cards[agent_id] = verified_card
                                 return TargetResolution(
@@ -152,34 +187,14 @@ class TargetResolver:
                                     is_trusted=False,
                                     card=verified_card,
                                 )
-                            else:
-                                logger.warning("Agent card signature/integrity check failed for %s", agent_id)
-                                return TargetResolution(
-                                    target_name=target_name,
-                                    status=TargetResolutionStatus.UNKNOWN_AGENT,
-                                )
-                        else:
-                            from app.a2a import signing
-                            pk = agent_data.get("public_key")
-                            if pk and signing.agent_id_matches_key(agent_id, pk):
-                                card_dict = {
-                                    "agent_id": agent_id,
-                                    "public_key": pk,
-                                    "display_name": agent_data.get("display_name") or agent_id,
-                                    "handle": agent_data.get("handle"),
-                                    "endpoint": self._gateway_url,
-                                    "is_online": agent_data.get("is_online", False),
-                                }
-                                self._discovered_cards[agent_id] = card_dict
-                                return TargetResolution(
-                                    target_name=target_name,
-                                    status=TargetResolutionStatus.DISCOVERED_AGENT,
-                                    agent_id=agent_id,
-                                    endpoint=self._gateway_url,
-                                    display_name=agent_data.get("display_name") or agent_id,
-                                    is_trusted=False,
-                                    card=card_dict,
-                                )
+                            logger.warning(
+                                "Agent card signature/integrity check failed for %s",
+                                agent_id,
+                            )
+                            return TargetResolution(
+                                target_name=target_name,
+                                status=TargetResolutionStatus.UNKNOWN_AGENT,
+                            )
                 except Exception as exc:
                     logger.warning("Gateway agent lookup failed for %s: %s", agent_id, exc)
 
@@ -263,17 +278,28 @@ class TargetResolver:
                         if "agent_id" in agent_data:
                             agent_id = agent_data["agent_id"]
                             card = agent_data.get("agent_card")
-                            if card:
-                                verified_card = self._verify_card(card, expected_agent_id=agent_id)
-                                if verified_card is None:
-                                    return TargetResolution(
-                                        target_name=target_name,
-                                        status=TargetResolutionStatus.UNKNOWN_AGENT,
-                                    )
-                                self._discovered_cards[agent_id] = verified_card
-                            else:
-                                verified_card = agent_data
-                                self._discovered_cards[agent_id] = agent_data
+                            if not card:
+                                # Same rule as the agent_id path: a directory
+                                # entry without a signed card is a hint with
+                                # nothing to verify, so it is NOT discoverable.
+                                # (Previously the raw gateway metadata was
+                                # cached as a "card" and treated as verified.)
+                                logger.info(
+                                    "gateway_handle_entry_without_card handle=%s "
+                                    "- not discoverable (no signed card to verify)",
+                                    handle_query,
+                                )
+                                return TargetResolution(
+                                    target_name=target_name,
+                                    status=TargetResolutionStatus.UNKNOWN_AGENT,
+                                )
+                            verified_card = self._verify_card(card, expected_agent_id=agent_id)
+                            if verified_card is None:
+                                return TargetResolution(
+                                    target_name=target_name,
+                                    status=TargetResolutionStatus.UNKNOWN_AGENT,
+                                )
+                            self._discovered_cards[agent_id] = verified_card
 
                             is_trusted = any(ta.agent_id == agent_id for ta in all_trusted if ta.status == TrustStatus.ACTIVE.value)
                             return TargetResolution(
@@ -353,7 +379,9 @@ class TargetResolver:
         base_http = self._get_base_http()
         if base_http:
             try:
-                search_url = f"{base_http}/agents/search?q={clean_name}"
+                from urllib.parse import quote
+
+                search_url = f"{base_http}/agents/search?q={quote(clean_name, safe='')}"
                 resp = await self._http_get(search_url)
                 if resp and resp.status_code == 200:
                     data = resp.json()
@@ -371,54 +399,72 @@ class TargetResolver:
                         c = candidates[0]
                         agent_id = c["agent_id"]
                         card = c.get("agent_card")
-                        if card:
-                            verified_card = self._verify_card(card, expected_agent_id=agent_id)
-                            if verified_card is None:
-                                return TargetResolution(
-                                    target_name=target_name,
-                                    status=TargetResolutionStatus.UNKNOWN_AGENT,
-                                )
-                            self._discovered_cards[agent_id] = verified_card
-                        else:
-                            self._discovered_cards[agent_id] = c
+                        if not card:
+                            # Directory entry without a signed card => nothing
+                            # to verify => NOT discoverable.
+                            logger.info(
+                                "gateway_search_entry_without_card name=%s "
+                                "- not discoverable (no signed card to verify)",
+                                clean_name,
+                            )
+                            return TargetResolution(
+                                target_name=target_name,
+                                status=TargetResolutionStatus.UNKNOWN_AGENT,
+                            )
+                        verified_card = self._verify_card(card, expected_agent_id=agent_id)
+                        if verified_card is None:
+                            return TargetResolution(
+                                target_name=target_name,
+                                status=TargetResolutionStatus.UNKNOWN_AGENT,
+                            )
+                        self._discovered_cards[agent_id] = verified_card
 
                         is_trusted = any(ta.agent_id == agent_id for ta in all_trusted if ta.status == TrustStatus.ACTIVE.value)
                         return TargetResolution(
                             target_name=target_name,
                             status=TargetResolutionStatus.KNOWN_AGENT if is_trusted else TargetResolutionStatus.DISCOVERED_AGENT,
                             agent_id=agent_id,
-                            endpoint=c.get("endpoint", self._gateway_url),
-                            display_name=c.get("display_name") or clean_name,
+                            endpoint=verified_card.get("endpoint", self._gateway_url),
+                            display_name=verified_card.get("display_name") or c.get("display_name") or clean_name,
                             is_trusted=is_trusted,
-                            card=self._discovered_cards.get(agent_id),
+                            card=verified_card,
                         )
             except Exception as exc:
                 logger.warning("Gateway directory search failed for %s: %s", clean_name, exc)
 
-        # 3. Known discovered Agent Cards in DiscoveryService
+        # 3. Known discovered Agent Cards in DiscoveryService.
+        #    These come from the verified-card cache: every row was written
+        #    only after signature + time-window verification, so no further
+        #    verification is required here.
         if self._discovery is not None:
             try:
-                cards = (
-                    await self._discovery.list_known_cards(owner_id)
-                    if hasattr(self._discovery, "list_known_cards")
-                    else []
-                )
+                cards = await self._discovery.list_known_cards(owner_id)
+                known = [
+                    c
+                    for c in cards
+                    if isinstance(c, dict) and c.get("agent_id")
+                ]
                 matching_cards = [
-                    card
-                    for card in cards
-                    if clean_name.lower() in card.display_name.lower()
-                    or (getattr(card, "handle", None) and clean_name.lower() == card.handle.lower())
+                    c
+                    for c in known
+                    if clean_name.lower()
+                    in str(c.get("display_name") or "").lower()
+                    or (
+                        c.get("handle")
+                        and clean_name.lstrip("@").lower()
+                        == str(c["handle"]).lstrip("@").lower()
+                    )
                 ]
                 if len(matching_cards) == 1:
-                    card = matching_cards[0]
-                    card_dict = card.model_dump() if hasattr(card, "model_dump") else dict(card)
-                    self._discovered_cards[card.agent_id] = card_dict
+                    c = matching_cards[0]
+                    card_dict = dict(c)
+                    self._discovered_cards[c["agent_id"]] = card_dict
                     return TargetResolution(
                         target_name=target_name,
                         status=TargetResolutionStatus.DISCOVERED_AGENT,
-                        agent_id=card.agent_id,
-                        endpoint=card.endpoint,
-                        display_name=card.display_name,
+                        agent_id=c["agent_id"],
+                        endpoint=card_dict.get("endpoint", self._gateway_url),
+                        display_name=card_dict.get("display_name") or clean_name,
                         is_trusted=False,
                         card=card_dict,
                     )
@@ -426,7 +472,10 @@ class TargetResolver:
                     return TargetResolution(
                         target_name=target_name,
                         status=TargetResolutionStatus.AMBIGUOUS_AGENT,
-                        candidates=[c.display_name for c in matching_cards],
+                        candidates=[
+                            str(c.get("display_name") or c["agent_id"])
+                            for c in matching_cards
+                        ],
                     )
             except Exception as exc:
                 logger.warning("DiscoveryService lookup failed for %s: %s", clean_name, exc)

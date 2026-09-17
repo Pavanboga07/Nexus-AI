@@ -187,7 +187,9 @@ async def test_verify_endpoint_invalid_public_key_bytes(identity_client) -> None
 
 
 async def test_health_reports_identity(identity_client) -> None:
-    response = await identity_client.get("/health")
+    # Subsystem detail moved to the authenticated /system/status; public
+    # /health is deliberately minimal.
+    response = await identity_client.get("/system/status")
     body = response.json()
     assert body["status"] == "ok"
     assert body["identity"] is True

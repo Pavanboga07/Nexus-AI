@@ -36,6 +36,7 @@ Tests all 30 specified scenarios:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -49,10 +50,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.ext.compiler import compiles
 
 from app.a2a.models import A2ATask, TaskStatus, TrustedAgent, TrustStatus
+from app.a2a import signing
+from app.a2a.errors import A2AError
 from app.a2a.repository import TaskRepository, TrustedAgentRepository
 from app.a2a.service import A2AService
 from app.a2a.gateway_client import GatewayA2ATransport, GatewayClient
 from app.a2a.transport import A2ATransport
+from app.identity import crypto
 from app.autonomy.decision_engine import DecisionEngine, DecisionOutcome, DecisionRequest
 from app.autonomy.models import ActionType, DecisionResult, RiskLevel
 from app.database.models import Base, Owner
@@ -102,6 +106,31 @@ from app.workflows.handlers import A2ATaskStepHandler, StepResult, WorkflowStepC
 @compiles(JSONB, "sqlite")
 def _compile_jsonb_sqlite(type_, compiler, **kw):
     return "JSON"
+
+
+class _RealSigner:
+    """Minimal signer implementing the IdentityService surface A2A needs.
+
+    Used to produce REAL Ed25519 signatures in tests, so signature
+    verification code paths are genuinely exercised rather than mocked.
+    """
+
+    __test__ = False
+
+    def __init__(self, private_key) -> None:
+        self._private_key = private_key
+
+    def get_public_identity(self) -> PublicIdentity:
+        raw = crypto.public_key_bytes(self._private_key.public_key())
+        return PublicIdentity(
+            agent_id=crypto.agent_id_from_public_key(raw),
+            public_key=base64.b64encode(raw).decode("ascii"),
+            key_algorithm=crypto.KEY_ALGORITHM,
+            fingerprint=crypto.fingerprint_from_public_key(raw),
+        )
+
+    async def sign(self, data: bytes) -> bytes:
+        return crypto.sign_bytes(self._private_key, data)
 
 
 @pytest_asyncio.fixture
@@ -436,19 +465,41 @@ async def test_gateway_preferred_when_connected():
 # 8. Gateway Fallback to HTTP When Disconnected
 # =============================================================================
 @pytest.mark.asyncio
-async def test_gateway_fallback_to_http_when_disconnected():
+async def test_direct_egress_requires_explicit_opt_in():
+    """Direct HTTP is opt-in (decision D2), not a silent fallback.
+
+    This test previously asserted that a disconnected gateway silently fell
+    back to a direct HTTP POST. That is exactly what D2 reverses: falling back
+    silently means a peer's reachability decides your delivery semantics (no
+    offline buffering, no delivery ack, different failure modes), so the
+    operator must choose it.
+    """
     mock_http = AsyncMock(spec=A2ATransport)
     mock_http.send.return_value = {"status": "http_ok"}
     mock_client = AsyncMock(spec=GatewayClient)
     mock_client.is_connected = False
 
-    transport = GatewayA2ATransport(http_transport=mock_http, gateway_client=mock_client)
     envelope = {
         "recipient": "nexus:ed25519:22222222222222222222222222222222",
         "message_id": "m1",
     }
 
-    res = await transport.send("http://remote.agent.com/a2a", envelope)
+    # Default deployment: refuse and explain.
+    strict = GatewayA2ATransport(
+        http_transport=mock_http, gateway_client=mock_client
+    )
+    with pytest.raises(A2AError) as exc:
+        await strict.send("http://remote.agent.com/a2a", envelope)
+    assert "direct egress is disabled" in exc.value.message
+    mock_http.send.assert_not_awaited()
+
+    # With direct egress enabled the HTTP transport is used.
+    opted_in = GatewayA2ATransport(
+        http_transport=mock_http,
+        gateway_client=mock_client,
+        allow_direct_egress=True,
+    )
+    res = await opted_in.send("http://remote.agent.com/a2a", envelope)
     assert res == {"status": "http_ok"}
     mock_http.send.assert_awaited_once_with("http://remote.agent.com/a2a", envelope)
 
@@ -593,24 +644,47 @@ async def test_response_with_unknown_task_id(session_factory, test_owner):
 # 13. Response Invalid Signature Rejected
 # =============================================================================
 @pytest.mark.asyncio
-async def test_response_invalid_signature_rejected(session_factory, test_owner):
+async def test_response_invalid_signature_rejected(db_session_factory, db_owner_id):
+    """A response whose Ed25519 signature does not verify is rejected and
+    must NOT mutate the correlated task.
+
+    Uses a REAL Ed25519 keypair and a real (but unrelated) key on the trusted
+    agent record, so the signature check genuinely fails. The previous version
+    mocked IdentityService.verify, which meant no code path actually
+    exercised signature verification, and passed a raw dict (which the
+    hardened handle_inbound_response no longer accepts).
+    """
+    from app.a2a.errors import A2AError
+    from app.a2a.schemas import A2AEnvelope, utc_iso_in, utc_now_iso
+
+    sender_priv, sender_pub = crypto.generate_keypair()
+    sender_raw = crypto.public_key_bytes(sender_pub)
+    sender_key_b64 = base64.b64encode(sender_raw).decode("ascii")
+    sender_agent_id = crypto.agent_id_from_public_key(sender_raw)
+
+    # A DIFFERENT key recorded as the trusted peer's key => verification fails.
+    _, other_pub = crypto.generate_keypair()
+    other_key_b64 = base64.b64encode(
+        crypto.public_key_bytes(other_pub)
+    ).decode("ascii")
+
+    local_agent_id = "nexus:ed25519:11111111111111111111111111111111"
     mock_identity = MagicMock(spec=IdentityService)
     mock_identity.get_public_identity.return_value = PublicIdentity(
-        agent_id="nexus:ed25519:11111111111111111111111111111111",
+        agent_id=local_agent_id,
         public_key="bW9ja19wdWJsaWNfa2V5",
         key_algorithm="Ed25519",
         fingerprint="1111-2222",
     )
-    mock_identity.verify = MagicMock(return_value=False)  # Signature check fails!
 
     ta_repo = TrustedAgentRepository()
-    async with session_factory() as session:
+    async with db_session_factory() as session:
         await ta_repo.add(
             session,
             TrustedAgent(
-                owner_id=test_owner,
-                agent_id="nexus:ed25519:22222222222222222222222222222222",
-                public_key="bW9ja19yZXNwb25kZXJfa2V5",
+                owner_id=db_owner_id,
+                agent_id=sender_agent_id,
+                public_key=other_key_b64,
                 display_name="Responder",
                 endpoint="https://example.com/a2a",
                 status=TrustStatus.ACTIVE.value,
@@ -618,8 +692,23 @@ async def test_response_invalid_signature_rejected(session_factory, test_owner):
         )
         await session.commit()
 
+    task_id = f"task_{uuid.uuid4().hex}"
+    task_repo = TaskRepository()
+    async with db_session_factory() as session:
+        await task_repo.upsert(
+            session,
+            A2ATask(
+                owner_id=db_owner_id,
+                task_id=task_id,
+                sender_agent_id=local_agent_id,
+                recipient_agent_id=sender_agent_id,
+                status=TaskStatus.PENDING.value,
+            ),
+        )
+        await session.commit()
+
     a2a = A2AService(
-        session_factory=session_factory,
+        session_factory=db_session_factory,
         identity_service=mock_identity,
         policy_service=MagicMock(),
         memory_manager=None,
@@ -627,30 +716,52 @@ async def test_response_invalid_signature_rejected(session_factory, test_owner):
         rate_limiter=MagicMock(),
     )
 
-    envelope = {
-        "protocol": "nexus-a2a",
-        "version": "0.1",
-        "message_id": "m1",
-        "task_id": "t1",
-        "sender": "nexus:ed25519:22222222222222222222222222222222",
-        "recipient": "nexus:ed25519:11111111111111111111111111111111",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
-        "message_type": "response",
-        "purpose": "scheduling",
-        "payload": {"available": True},
-        "signature": "invalid_sig",
-    }
+    envelope = A2AEnvelope(
+        message_id=f"msg_{uuid.uuid4().hex}",
+        task_id=task_id,
+        sender=sender_agent_id,
+        recipient=local_agent_id,
+        timestamp=utc_now_iso(),
+        expires_at=utc_iso_in(300),
+        message_type="response",
+        purpose="scheduling",
+        payload={"status": "completed", "available": True},
+    )
+    # Sign with the sender key, but the registry holds a different key.
+    signed = await signing.sign_envelope(_RealSigner(sender_priv), envelope)
+    assert signed.signature
 
-    result = await a2a.handle_inbound_response(test_owner, envelope)
-    assert result is None  # Rejected cleanly
+    # Strict path raises (so the HTTP layer can map it to a status code) ...
+    with pytest.raises(A2AError):
+        await a2a.handle_inbound_response(db_owner_id, signed)
+
+    # ... and the tolerant gateway path swallows it without raising.
+    assert await a2a.handle_gateway_delivery(db_owner_id, signed) is None
+
+    # The task must still be PENDING: a bad signature must not complete it.
+    async with db_session_factory() as session:
+        unchanged = await task_repo.get(session, db_owner_id, task_id)
+    assert unchanged is not None
+    assert unchanged.status == TaskStatus.PENDING.value
+    assert unchanged.response_payload is None
 
 
 # =============================================================================
 # 14. Discovery Search by Name and Handle
 # =============================================================================
 @pytest.mark.asyncio
-async def test_discovery_search_by_name_and_handle(session_factory, test_owner):
+async def test_discovery_search_by_name_and_handle(db_session_factory, db_owner_id):
+    """A directory entry WITHOUT a signed card must NOT be discoverable.
+
+    This test previously asserted the opposite: it fed the resolver unsigned
+    gateway metadata (agent_id + display_name, no card, no signature) and
+    expected DISCOVERED_AGENT. That was audit finding H2 - a compromised
+    directory could inject agents that had never been cryptographically
+    verified. A directory entry is a hint; only a verified card is identity.
+
+    The positive path (a properly signed card IS discovered) is covered by
+    tests/test_m1_discovery_regressions.py.
+    """
     mock_http_client = AsyncMock()
     mock_http_client.get.return_value = MagicMock(
         status_code=200,
@@ -667,15 +778,15 @@ async def test_discovery_search_by_name_and_handle(session_factory, test_owner):
     )
 
     target_resolver = TargetResolver(
-        session_factory=session_factory,
+        session_factory=db_session_factory,
         gateway_url="https://gateway.example.com",
         http_client=mock_http_client,
     )
 
-    res = await target_resolver.resolve(test_owner, "@rahul")
-    assert res.status == TargetResolutionStatus.DISCOVERED_AGENT
-    assert res.agent_id == "nexus:ed25519:44444444444444444444444444444444"
-    assert res.display_name == "Rahul Sharma"
+    res = await target_resolver.resolve(db_owner_id, "@rahul")
+    assert res.status == TargetResolutionStatus.UNKNOWN_AGENT
+    assert res.agent_id is None
+    assert res.card is None
 
 
 # =============================================================================

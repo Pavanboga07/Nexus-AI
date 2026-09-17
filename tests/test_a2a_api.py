@@ -44,7 +44,7 @@ async def _register_sender(client, sender, endpoint=TEST_ENDPOINT) -> dict:
 
 async def _allow_sender(db_a2a_app, sender, scope="exact") -> None:
     await db_a2a_app.state.policy_service.create_policy(
-        await db_a2a_app.state.agent._owner_id(),
+        await db_a2a_app.state.agent.owner_id(),
         requester_agent_id=sender.agent_id,
         data_category="availability",
         action="disclose_information",
@@ -162,7 +162,7 @@ async def test_inbound_message_full_flow(
 ) -> None:
     await _register_sender(db_a2a_client, sender)
     await _allow_sender(db_a2a_app, sender, scope="exact")
-    owner_id = await db_a2a_app.state.agent._owner_id()
+    owner_id = await db_a2a_app.state.agent.owner_id()
     await memory_manager.store_memory(
         owner_id, memory_type="semantic",
         content="Boss availability is after 6 PM.",

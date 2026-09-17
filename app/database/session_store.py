@@ -23,7 +23,13 @@ logger = logging.getLogger("nexus.agent.session.db")
 
 
 class DatabaseSessionStore(SessionStore):
-    """Persistent ``SessionStore`` over PostgreSQL."""
+    """Persistent ``SessionStore`` over PostgreSQL.
+
+    Every method takes the acting ``owner_id`` explicitly. The store
+    deliberately does NOT resolve an owner for itself: doing so (the old
+    ``_get_owner_id`` process-wide cache) is exactly what made the API
+    single-tenant and allowed one user to read another's conversation.
+    """
 
     def __init__(
         self,
@@ -35,27 +41,17 @@ class DatabaseSessionStore(SessionStore):
         self._conversations = ConversationRepository()
         self._owners = OwnerRepository()
         self._max_messages = max_messages
-        self._owner_id: uuid.UUID | None = None
-
-    async def _get_owner_id(self) -> uuid.UUID:
-        """Resolve the (single) owner lazily; cached for the process."""
-        if self._owner_id is None:
-            async with self._session_factory() as session:
-                owner = await self._owners.get_or_create_default(session)
-                await session.commit()
-                self._owner_id = owner.id
-        return self._owner_id
 
     async def _to_session(self, conversation, messages: list[MessageModel]) -> Session:
         return Session(
             session_id=str(conversation.id),
+            owner_id=getattr(conversation, "owner_id", None),
             messages=[{"role": m.role, "content": m.content} for m in messages],
             created_at=conversation.created_at,
             updated_at=conversation.updated_at,
         )
 
-    async def create_session(self) -> Session:
-        owner_id = await self._get_owner_id()
+    async def create_session(self, owner_id: uuid.UUID) -> Session:
         async with self._session_factory() as session:
             conversation = await self._conversations.create(session, owner_id)
             await session.commit()
@@ -63,8 +59,7 @@ class DatabaseSessionStore(SessionStore):
             session_obj = await self._to_session(conversation, [])
         return session_obj
 
-    async def get_session(self, session_id: str) -> Session:
-        owner_id = await self._get_owner_id()
+    async def get_session(self, owner_id: uuid.UUID, session_id: str) -> Session:
         try:
             conversation_uuid = uuid.UUID(session_id)
         except ValueError:
@@ -77,8 +72,9 @@ class DatabaseSessionStore(SessionStore):
                 raise SessionNotFoundError(session_id)
             return await self._to_session(conversation, list(conversation.messages))
 
-    async def add_message(self, session_id: str, role: str, content: str):
-        owner_id = await self._get_owner_id()
+    async def add_message(
+        self, owner_id: uuid.UUID, session_id: str, role: str, content: str
+    ):
         try:
             conversation_uuid = uuid.UUID(session_id)
         except ValueError:
@@ -93,8 +89,7 @@ class DatabaseSessionStore(SessionStore):
                 raise SessionNotFoundError(session_id) from None
         return {"role": role, "content": content}
 
-    async def clear_session(self, session_id: str) -> Session:
-        owner_id = await self._get_owner_id()
+    async def clear_session(self, owner_id: uuid.UUID, session_id: str) -> Session:
         try:
             conversation_uuid = uuid.UUID(session_id)
         except ValueError:
@@ -109,8 +104,7 @@ class DatabaseSessionStore(SessionStore):
             logger.info("session_cleared session_id=%s", session_id)
             return await self._to_session(conversation, [])
 
-    async def delete_session(self, session_id: str) -> None:
-        owner_id = await self._get_owner_id()
+    async def delete_session(self, owner_id: uuid.UUID, session_id: str) -> None:
         try:
             conversation_uuid = uuid.UUID(session_id)
         except ValueError:
@@ -124,8 +118,7 @@ class DatabaseSessionStore(SessionStore):
             raise SessionNotFoundError(session_id)
         logger.info("session_deleted session_id=%s", session_id)
 
-    async def list_sessions(self) -> list[str]:
-        owner_id = await self._get_owner_id()
+    async def list_sessions(self, owner_id: uuid.UUID) -> list[str]:
         from sqlalchemy import select
 
         from app.database.models import Conversation
@@ -137,6 +130,17 @@ class DatabaseSessionStore(SessionStore):
                 )
             )
             return [str(row[0]) for row in result.all()]
+
+    async def fallback_owner_id(self) -> uuid.UUID:
+        """The single owner row, for deployments running WITHOUT auth.
+
+        Development fallback only. With authentication enforced the acting
+        owner always comes from the request (``RequestContext.owner_id``).
+        """
+        async with self._session_factory() as session:
+            owner = await self._owners.get_or_create_default(session)
+            await session.commit()
+            return owner.id
 
 
 __all__ = ["DatabaseSessionStore"]

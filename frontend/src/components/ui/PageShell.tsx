@@ -25,10 +25,13 @@ export function PageShell({
       <div className="sticky top-0 z-10 bg-neutral-950/80 backdrop-blur-sm border-b border-neutral-800/50">
         <div className={`${maxWidth} mx-auto px-6 py-3 flex items-center justify-between`}>
           <div className="flex items-center gap-3">
+            {/* Back to the agent page, not "/" - the root is a redirect that
+                bounces through an auth check, so using it here made every
+                detail screen's back button feel like a reload. */}
             <Link
-              href="/"
+              href="/agent"
               className="text-neutral-500 hover:text-neutral-300 transition-colors p-1 -ml-1 rounded hover:bg-neutral-800/50"
-              title="Back to chat"
+              title="Back to your agent"
             >
               <ArrowLeft className="w-4 h-4" />
             </Link>

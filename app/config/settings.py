@@ -66,6 +66,23 @@ class Settings(BaseSettings):
     nexus_llm_timeout: float = Field(default=60.0, gt=0)
     nexus_max_session_messages: int = Field(default=100, gt=0)
     nexus_log_level: str = "INFO"
+    #: "json" (default) is one object per line, queryable by a log aggregator and
+    #: always carrying `trace_id`. "text" is the human-readable format, kept for
+    #: local debugging - a developer tailing a terminal reads plain text faster
+    #: than escaped JSON.
+    nexus_log_format: Literal["json", "text"] = "json"
+    #: Reported in every log line so a shared log index can tell deployments
+    #: apart. Not the hostname: that changes on every redeploy.
+    nexus_service_name: str = "nexus"
+
+    # --- CORS -------------------------------------------------------------
+    # Comma-separated list of browser origins allowed to call the API.
+    # Never "*" in production: the API is credential-bearing, and a wildcard
+    # origin with credentials enabled is both spec-invalid and a CSRF vector.
+    nexus_cors_origins: str = (
+        "http://localhost:3000,http://127.0.0.1:3000,"
+        "http://localhost:3001,http://127.0.0.1:3001"
+    )
 
     # --- Database (Part 2) ------------------------------------------------
     database_url: str = "postgresql+asyncpg://nexus:nexus@localhost:5433/nexus"
@@ -154,6 +171,33 @@ class Settings(BaseSettings):
     # Maximum execution attempts per workflow step before permanent failure.
     nexus_workflow_max_step_attempts: int = Field(default=3, ge=1, le=10)
 
+    # --- Durable jobs (M7) --------------------------------------------------------
+    # How often the worker polls for runnable jobs when the queue is empty.
+    nexus_job_poll_interval_seconds: float = Field(default=1.0, gt=0)
+    # Jobs claimed per poll.
+    nexus_job_batch_size: int = Field(default=5, ge=1, le=100)
+    # How long a claimed job is leased to one worker before another may retry
+    # it. Also the upper bound on how long a crashed worker's job is stuck.
+    nexus_job_lease_seconds: float = Field(default=300.0, gt=0)
+    # Per-job execution timeout. A hung handler must not hold the worker.
+    nexus_job_timeout_seconds: float = Field(default=120.0, gt=0)
+
+    # --- LLM resilience (M7) ------------------------------------------------------
+    # Attempts for a transient provider failure (5xx, connection, empty
+    # response). Previously only an empty response was retried, once.
+    nexus_llm_max_attempts: int = Field(default=3, ge=1, le=10)
+    # Base delay for exponential backoff between LLM attempts.
+    nexus_llm_retry_base_seconds: float = Field(default=0.5, gt=0)
+
+    # --- Natural-language orchestration (Part 12 / M6, decision D5) ---------------
+    # OFF by default. Orchestration routes free-text user messages through an
+    # LLM intent resolver and a fuzzy target resolver, and its failures are
+    # invisible: a mis-resolved name sends a message to the wrong agent, and a
+    # mis-parsed intent performs the wrong action. Explicit "ask @person" flows
+    # and the workflow API remain available regardless, so disabling this costs
+    # convenience, not capability.
+    nexus_orchestration_enabled: bool = Field(default=False)
+
     # --- Autonomy & Decision Engine (Part 10) -------------------------------------
     nexus_autonomy_default_mode: str = Field(default="bounded")
     nexus_autonomy_max_steps: int = Field(default=10, ge=1, le=50)
@@ -164,6 +208,36 @@ class Settings(BaseSettings):
     # --- Gateway Relay (Part 11) --------------------------------------------------
     # WebSocket URL of the hosted Nexus Gateway relay
     nexus_gateway_url: str | None = Field(default=None)
+
+    # --- A2A egress policy (M6, decision D2) --------------------------------------
+    # Gateway-first: when the gateway is connected, ALL A2A traffic goes through
+    # it. Direct HTTP egress is opt-in because falling back silently would mean
+    # a peer's reachability decides your delivery semantics (no offline
+    # buffering, no delivery ack, different failure modes).
+    nexus_a2a_direct_egress: bool = Field(default=False)
+
+    # --- Authentication (M3) ------------------------------------------------------
+    # Secret used to sign session cookies. MUST be set in production; without
+    # it the app cannot issue or verify sessions and refuses to enforce auth.
+    # Generate with: python -c "import secrets; print(secrets.token_urlsafe(32))"
+    nexus_session_key: str | None = Field(default=None)
+    # Session lifetime in seconds (default 14 days).
+    nexus_session_ttl_seconds: int = Field(default=60 * 60 * 24 * 14, gt=0)
+    # Enforce authentication on the API. Defaults to False in development and
+    # True otherwise - see `auth_is_required` below.
+    nexus_auth_required: bool | None = Field(default=None)
+    # Allow self-service account registration.
+    nexus_allow_registration: bool = Field(default=True)
+    # Set the session cookie's Secure flag (HTTPS-only). Defaults to True
+    # outside development; must be False for plain-HTTP local setups.
+    nexus_cookie_secure: bool | None = Field(default=None)
+    # Optional OIDC issuer; when set, the OIDC login route is advertised.
+    nexus_oidc_issuer: str | None = Field(default=None)
+    nexus_oidc_client_id: str | None = Field(default=None)
+    nexus_oidc_client_secret: str | None = Field(default=None)
+    # Adopt the single pre-auth owner row on first registration so existing
+    # memory/identity/policies are not orphaned by the auth migration.
+    nexus_adopt_legacy_owner: bool = Field(default=True)
 
 
 
@@ -232,6 +306,45 @@ class Settings(BaseSettings):
 
     # --- Resolved LLM configuration ---------------------------------------
     # NEXUS_LLM_* wins over the legacy OPENAI_* alias.
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        """Parse the comma-separated CORS allow-list into a list.
+
+        A literal "*" is passed through so development setups can opt in
+        explicitly, but ``allow_credentials`` is disabled for that case in
+        main.py - a wildcard origin with credentials is rejected by browsers
+        and would be a credential-leak vector.
+        """
+        return [o.strip() for o in self.nexus_cors_origins.split(",") if o.strip()]
+
+    @property
+    def cors_allows_any_origin(self) -> bool:
+        return "*" in self.cors_origins_list
+
+    @property
+    def auth_is_required(self) -> bool:
+        """Whether authentication is enforced.
+
+        Defaults to False in development (so a local checkout works with no
+        setup) and True in staging/production. An explicit
+        NEXUS_AUTH_REQUIRED always wins, so a production-like dev box can be
+        hardened and a test deployment can opt out.
+        """
+        if self.nexus_auth_required is not None:
+            return self.nexus_auth_required
+        return not self.is_development
+
+    @property
+    def cookie_secure_effective(self) -> bool:
+        """Secure flag for the session cookie (HTTPS-only).
+
+        Defaults to True outside development. An explicit setting wins, which
+        is what a local plain-HTTP deployment needs.
+        """
+        if self.nexus_cookie_secure is not None:
+            return self.nexus_cookie_secure
+        return not self.is_development
 
     @property
     def llm_api_key(self) -> str | None:

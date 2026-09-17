@@ -231,15 +231,17 @@ class AutonomyExecutor:
                 purpose = action.purpose
                 payload = action.payload.get("payload", action.payload)
                 if self._a2a_service and target_agent:
-                    from app.schemas.tasks import TaskDelegateRequest
-                    req_obj = TaskDelegateRequest(
+                    # A2AService.delegate_task takes keyword-only arguments
+                    # after owner_id; passing a request object positionally
+                    # raised TypeError on every remote-task step.
+                    task_res = await self._a2a_service.delegate_task(
+                        owner_id,
                         recipient_agent_id=target_agent,
                         task_type=task_type,
                         purpose=purpose,
                         payload=payload,
                     )
-                    task_res = await self._a2a_service.delegate_task(owner_id, req_obj)
-                    step_output = task_res.to_dict() if hasattr(task_res, "to_dict") else {"task_id": str(task_res)}
+                    step_output = task_res if isinstance(task_res, dict) else {"task_id": str(task_res)}
                 else:
                     step_output = {"target_agent_id": target_agent, "task_type": task_type, "status": "simulated"}
                 run.remote_tasks += 1
@@ -261,11 +263,23 @@ class AutonomyExecutor:
                         steps=steps_spec,
                     )
                     run.workflow_id = wf.workflow_id
-                    wf_run = await self._workflow_service.run_workflow(wf.workflow_id)
-                    step_output = {"workflow_id": str(wf.workflow_id), "status": wf_run.status}
+                    # WorkflowService exposes advance_workflow(), not the
+                    # never-implemented run_workflow(); create_workflow() only
+                    # persists the PENDING record, so the first step must be
+                    # advanced explicitly.
+                    wf_run = await self._workflow_service.advance_workflow(
+                        wf.workflow_id
+                    )
+                    step_output = {
+                        "workflow_id": str(wf.workflow_id),
+                        "status": wf_run.status,
+                    }
                     if wf_run.status == "waiting_approval":
                         run.status = RunStatus.WAITING_APPROVAL.value
-                        return ExecutionResult(status=RunStatus.WAITING_APPROVAL, step_output=step_output)
+                        return ExecutionResult(
+                            status=RunStatus.WAITING_APPROVAL,
+                            step_output=step_output,
+                        )
                 else:
                     step_output = {"workflow_type": wf_type, "status": "simulated"}
 

@@ -50,7 +50,8 @@ from app.a2a.cards import (
     validate_card_time_window,
 )
 from app.a2a.errors import A2AError, A2AErrorCode
-from app.a2a.models import TrustedAgent
+from app.a2a.models import TrustedAgent, TrustedAgentCard
+from app.a2a.repository import TrustedAgentCardRepository
 from app.a2a.service import A2AService
 from app.a2a.transport import validate_endpoint
 from app.identity.service import IdentityService
@@ -69,12 +70,17 @@ class DiscoveryService:
         allow_local_endpoints: bool = False,
         timeout_seconds: float = 10.0,
         max_card_bytes: int = 65_536,
+        session_factory: Any = None,
     ) -> None:
         self._identity = identity_service
         self._a2a = a2a_service
         self._allow_local = allow_local_endpoints
         self._timeout = timeout_seconds
         self._max_card_bytes = max_card_bytes
+        #: Optional: when provided, verified cards are cached in PostgreSQL so
+        #: capability discovery does not re-fetch the peer on every lookup.
+        self._session_factory = session_factory
+        self._card_repo = TrustedAgentCardRepository()
 
     async def fetch_card(self, url: str) -> dict[str, Any]:
         """Fetch a remote agent card by URL.
@@ -172,6 +178,116 @@ class DiscoveryService:
             card = resp.json()
             return self.verify_card(card, expected_agent_id=agent_id)
 
+    async def register_verified_card(
+        self,
+        owner_id,
+        card: dict[str, Any],
+        *,
+        display_name: str | None = None,
+        expected_agent_id: str | None = None,
+    ) -> tuple[TrustedAgent, dict[str, Any]]:
+        """THE single writer for a discovered remote agent.
+
+        Every path that turns a card into local state (direct fetch, gateway
+        directory lookup, operator-supplied card) must funnel through here so
+        the verification invariant cannot be bypassed:
+
+            no card enters local state without a verified Ed25519 signature
+            over its canonical form, with agent_id <-> public_key consistency
+            and a valid time window.
+
+        Verification happens HERE rather than at the call sites, so a caller
+        cannot forget it. Raises A2AError on any verification failure.
+
+        Returns the TrustedAgent record and the verified card.
+        """
+        verified = self.verify_card(card, expected_agent_id=expected_agent_id)
+        agent_id = verified["agent_id"]
+
+        name = display_name or verified["display_name"]
+        endpoint = verified["endpoint"]
+
+        agent = await self._a2a.register_trusted_agent(
+            owner_id,
+            agent_id=agent_id,
+            public_key=verified["public_key"],
+            display_name=name,
+            endpoint=endpoint,
+        )
+
+        # Persist the VERIFIED card so capability discovery does not have to
+        # re-fetch the peer, and so the cached card is trustworthy by
+        # construction (nothing unverified is ever written here).
+        await self._store_card(owner_id, agent_id, verified)
+
+        logger.info(
+            "verified_card_registered agent_id=%s display_name=%s endpoint=%s "
+            "capabilities=%d",
+            agent_id,
+            name,
+            endpoint,
+            len(verified.get("capabilities") or []),
+        )
+        return agent, verified
+
+    async def _store_card(
+        self, owner_id, agent_id: str, verified_card: dict[str, Any]
+    ) -> None:
+        """Persist a previously verified card (best effort, never raises)."""
+        if self._session_factory is None:
+            return
+        try:
+            expires_at = None
+            raw_expiry = verified_card.get("expires_at")
+            if isinstance(raw_expiry, str):
+                from app.a2a.schemas import parse_iso
+
+                expires_at = parse_iso(raw_expiry)
+            async with self._session_factory() as session:
+                await self._card_repo.upsert(
+                    session,
+                    TrustedAgentCard(
+                        owner_id=owner_id,
+                        agent_id=agent_id,
+                        card=verified_card,
+                        card_expires_at=expires_at,
+                    ),
+                )
+                await session.commit()
+        except Exception as exc:
+            # Caching a card must never break the discovery that produced it.
+            logger.warning("card_cache_write_failed agent_id=%s: %s", agent_id, exc)
+
+    async def get_known_card(
+        self, owner_id, agent_id: str
+    ) -> dict[str, Any] | None:
+        """Return a previously VERIFIED, unexpired card, or None."""
+        if self._session_factory is None:
+            return None
+        from app.a2a.repository import TrustedAgentCardRepository
+
+        async with self._session_factory() as session:
+            row = await TrustedAgentCardRepository().get(
+                session, owner_id, agent_id
+            )
+        return row.card if row is not None else None
+
+    async def list_known_cards(self, owner_id) -> list[dict[str, Any]]:
+        """Return all previously VERIFIED, unexpired cards for this owner.
+
+        These are safe to treat as attested: every row was written only after
+        ``register_verified_card`` verified its signature and time window.
+        """
+        if self._session_factory is None:
+            return []
+        from app.a2a.repository import TrustedAgentCardRepository
+
+        async with self._session_factory() as session:
+            rows = await TrustedAgentCardRepository().list_for_owner(
+                session, owner_id
+            )
+        return [row.card for row in rows]
+
     async def discover_and_register(
         self,
         owner_id,
@@ -179,7 +295,7 @@ class DiscoveryService:
         *,
         display_name: str | None = None,
     ) -> tuple[TrustedAgent, dict[str, Any]]:
-        """Fetch a remote card, verify it, and register the agent.
+        """Fetch a remote card by URL, verify it, and register the agent.
 
         Returns the TrustedAgent record and the verified card dict.
         Uses ``display_name`` override if provided, otherwise the card's
@@ -188,24 +304,9 @@ class DiscoveryService:
         Raises A2AError (CONFLICT) if the agent is already registered.
         """
         card = await self.fetch_card(url)
-
-        name = display_name or card["display_name"]
-        endpoint = card["endpoint"]
-
-        agent = await self._a2a.register_trusted_agent(
-            owner_id,
-            agent_id=card["agent_id"],
-            public_key=card["public_key"],
-            display_name=name,
-            endpoint=endpoint,
+        return await self.register_verified_card(
+            owner_id, card, display_name=display_name
         )
-
-        logger.info(
-            "discovery_registered agent_id=%s display_name=%s",
-            card["agent_id"],
-            name,
-        )
-        return agent, card
 
     # --- Private HTTP helper ------------------------------------------------
 

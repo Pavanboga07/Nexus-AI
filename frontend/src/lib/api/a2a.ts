@@ -1,11 +1,46 @@
-import { apiFetch } from "./client";
-import { AgentCard, TrustedAgent } from "@/types/api";
+/**
+ * Trusted (remote) agents.
+ *
+ * Shapes here are the ones the API actually returns. Two of them were wrong
+ * before: `TrustedAgent` advertised `public_key_b64` and `endpoint_url`, but
+ * `TrustedAgentOut` has neither (`public_key` and `endpoint`) - so anything
+ * reading them got `undefined` with no error. And the audit endpoint returns
+ * `messages`, not `entries`.
+ */
 
-export async function listTrustedAgents(): Promise<{
+import { apiFetch } from "./client";
+
+export type TrustedAgent = {
+  agent_id: string;
+  display_name: string;
+  /** The peer's A2A endpoint. Named `endpoint`, not `endpoint_url`. */
+  endpoint: string;
+  status: string;
+  created_at?: string | null;
+};
+
+export type TrustedAgentList = {
   agents: TrustedAgent[];
   total: number;
-}> {
-  return apiFetch<{ agents: TrustedAgent[]; total: number }>("/a2a/agents");
+};
+
+export type A2AAuditEntry = {
+  id: string;
+  message_id: string;
+  task_id: string;
+  sender_agent_id: string;
+  recipient_agent_id: string;
+  message_type: string;
+  purpose: string;
+  policy_decision?: string | null;
+  status: string;
+  error_code?: string | null;
+  created_at?: string | null;
+  processed_at?: string | null;
+};
+
+export async function listTrustedAgents(): Promise<TrustedAgentList> {
+  return apiFetch<TrustedAgentList>("/a2a/agents");
 }
 
 export async function registerTrustedAgent(params: {
@@ -20,93 +55,60 @@ export async function registerTrustedAgent(params: {
   });
 }
 
-export async function revokeTrustedAgent(
+/**
+ * Revoke trust. Revocation is a POST (the record is kept so the decision is
+ * auditable); DELETE removes the record entirely.
+ */
+export async function revokeTrustedAgent(agentId: string): Promise<TrustedAgent> {
+  return apiFetch<TrustedAgent>(
+    `/a2a/agents/${encodeURIComponent(agentId)}/revoke`,
+    { method: "POST" }
+  );
+}
+
+export async function deleteTrustedAgent(
   agentId: string
-): Promise<TrustedAgent> {
-  return apiFetch<TrustedAgent>(`/a2a/agents/${agentId}/revoke`, {
-    method: "POST",
+): Promise<{ deleted: boolean; agent_id: string | null }> {
+  return apiFetch(`/a2a/agents/${encodeURIComponent(agentId)}`, {
+    method: "DELETE",
   });
 }
 
-export async function discoverRemoteAgent(
-  url: string,
-  displayName?: string
-): Promise<{
-  card: AgentCard;
-  verified: boolean;
-  registered: boolean;
-  trusted_agent?: TrustedAgent;
+/**
+ * The A2A audit trail (metadata only - the backend never stores content).
+ */
+export async function getA2AAudit(limit = 100): Promise<{
+  messages: A2AAuditEntry[];
+  total: number;
 }> {
-  const res = await apiFetch<any>("/a2a/discover", {
+  return apiFetch<{ messages: A2AAuditEntry[]; total: number }>(
+    `/a2a/audit/list?limit=${limit}`
+  );
+}
+
+/**
+ * Send a request to a trusted agent.
+ *
+ * `purpose` and `data_category` are policy dimensions: the receiving agent
+ * evaluates them before disclosing anything, so they are not decoration.
+ */
+export async function sendToAgent(params: {
+  recipient_agent_id: string;
+  purpose: string;
+  action: string;
+  data_category: string;
+  payload?: Record<string, unknown>;
+  endpoint?: string;
+}): Promise<{ task_id: string; recipient: string; status: string; payload?: unknown }> {
+  return apiFetch("/a2a/send", {
     method: "POST",
     body: JSON.stringify({
-      url,
-      display_name: displayName,
+      recipient_agent_id: params.recipient_agent_id,
+      purpose: params.purpose,
+      action: params.action,
+      data_category: params.data_category,
+      payload: params.payload ?? {},
+      endpoint: params.endpoint ?? null,
     }),
   });
-
-  return {
-    card: {
-      agent_id: res.card.agent_id,
-      name: res.card.display_name,
-      description: res.card.protocol,
-      version: res.card.version,
-      endpoints: { a2a: res.card.endpoint },
-      capabilities: (res.card.capabilities || []).map((c: any) =>
-        typeof c === "string" ? c : c.name
-      ),
-      public_key: res.card.public_key,
-      signature: res.card.signature,
-      created_at: res.card.issued_at,
-      expires_at: res.card.expires_at,
-    },
-    verified: true,
-    registered: true,
-    trusted_agent: {
-      agent_id: res.agent_id,
-      display_name: res.display_name,
-      public_key_b64: res.card.public_key,
-      endpoint_url: res.endpoint,
-      capabilities: (res.card.capabilities || []).map((c: any) =>
-        typeof c === "string" ? c : c.name
-      ),
-      status: res.status,
-      created_at: res.card.issued_at,
-      updated_at: res.card.issued_at,
-    },
-  };
-}
-
-export async function getA2AAudit(): Promise<{
-  entries: Array<{
-    id: string;
-    sender_id: string;
-    recipient_id: string;
-    message_type: string;
-    direction: "inbound" | "outbound";
-    status: string;
-    error?: string;
-    timestamp: string;
-  }>;
-  total: number;
-}> {
-  return apiFetch("/a2a/audit/list");
-}
-
-export async function searchGatewayDirectory(q: string): Promise<{
-  agents: Array<{
-    agent_id: string;
-    display_name: string;
-    handle?: string;
-    public_key: string;
-    endpoint: string;
-    capabilities: string[];
-    is_online: boolean;
-    verified: boolean;
-    is_trusted: boolean;
-    card?: any;
-  }>;
-  total: number;
-}> {
-  return apiFetch(`/a2a/directory/search?q=${encodeURIComponent(q)}`);
 }

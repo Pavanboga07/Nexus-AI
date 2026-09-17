@@ -7,42 +7,27 @@ import {
   PolicyRule,
 } from "@/types/api";
 
+/**
+ * Policy rules, consents and the decision audit.
+ *
+ * These three functions used to return hand-rolled objects - renaming
+ * `data_category` to `rule_type`, `purpose` to `resource`, and hardcoding
+ * `single_use: false` - so the pages rendered plausible-looking values that the
+ * backend never sent. The API's own shapes are used verbatim now: a field that
+ * does not exist is a TypeScript error rather than a confident guess.
+ */
 export async function listPolicies(): Promise<{
   policies: PolicyRule[];
   total: number;
 }> {
-  const res = await apiFetch<{ policies: any[]; total: number }>("/policy");
-  return {
-    policies: (res.policies || []).map((p) => ({
-      id: p.id,
-      rule_type: p.data_category || "explicit",
-      action: p.action,
-      resource: p.purpose || "*",
-      decision: p.decision,
-      priority: p.priority,
-    })),
-    total: res.total,
-  };
+  return apiFetch<{ policies: PolicyRule[]; total: number }>("/policy");
 }
 
 export async function listConsents(): Promise<{
   consents: Consent[];
   total: number;
 }> {
-  const res = await apiFetch<{ consents: any[]; total: number }>("/consent");
-  return {
-    consents: (res.consents || []).map((c) => ({
-      consent_id: c.id,
-      owner_id: c.requester_agent_id,
-      action: c.action,
-      resource: c.purpose,
-      single_use: false,
-      used: false,
-      expires_at: c.expires_at || "",
-      created_at: c.expires_at || "",
-    })),
-    total: res.total,
-  };
+  return apiFetch<{ consents: Consent[]; total: number }>("/consent");
 }
 
 export async function evaluatePolicy(
@@ -53,10 +38,17 @@ export async function evaluatePolicy(
     requester_agent_id: payload.peer_agent_id || "self",
     data_category: actionParts[0] || "tool",
     action: actionParts[1] || payload.action,
-    purpose: "user-evaluation",
+    purpose: payload.purpose || "user-evaluation",
     resource_id: payload.resource,
   };
-  const res = await apiFetch<any>("/policy/evaluate", {
+  const res = await apiFetch<{
+    decision: PolicyDecision;
+    reason: string;
+    matched_policy_id?: string | null;
+    matched_consent_id?: string | null;
+    requires_user_approval: boolean;
+    disclosure_scope?: PolicyRule["disclosure_scope"] | null;
+  }>("/policy/evaluate", {
     method: "POST",
     body: JSON.stringify(body),
   });
@@ -64,38 +56,30 @@ export async function evaluatePolicy(
   return {
     decision: res.decision,
     reason: res.reason,
-    rule_id: res.matched_policy_id || res.matched_consent_id,
+    rule_id: res.matched_policy_id || res.matched_consent_id || undefined,
+    requires_user_approval: res.requires_user_approval,
+    disclosure_scope: res.disclosure_scope ?? undefined,
   };
 }
 
+export type PolicyAuditEntry = {
+  id: string;
+  requester_agent_id: string;
+  data_category: string;
+  action: string;
+  purpose: string;
+  decision: PolicyDecision;
+  reason: string;
+  matched_policy_id?: string | null;
+  matched_consent_id?: string | null;
+  created_at?: string | null;
+};
+
 export async function getPolicyAudit(): Promise<{
-  audits: Array<{
-    id: string;
-    owner_id?: string;
-    timestamp: string;
-    action: string;
-    resource: string;
-    decision: PolicyDecision;
-    reason: string;
-    matched_rule_id?: string;
-    peer_agent_id?: string;
-  }>;
+  decisions: PolicyAuditEntry[];
   total: number;
 }> {
-  const res = await apiFetch<{ decisions: any[]; total: number }>(
+  return apiFetch<{ decisions: PolicyAuditEntry[]; total: number }>(
     "/policy/audit"
   );
-  return {
-    audits: (res.decisions || []).map((d) => ({
-      id: d.id,
-      timestamp: d.created_at || new Date().toISOString(),
-      action: `${d.data_category}:${d.action}`,
-      resource: d.purpose,
-      decision: d.decision,
-      reason: d.reason,
-      matched_rule_id: d.matched_policy_id || d.matched_consent_id,
-      peer_agent_id: d.requester_agent_id,
-    })),
-    total: res.total,
-  };
 }

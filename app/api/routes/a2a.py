@@ -12,6 +12,7 @@ from app.a2a.errors import A2AError
 from app.a2a.schemas import A2AEnvelope
 from app.a2a.service import A2AService
 from app.agent.agent import NexusAgent
+from app.api.auth_context import request_owner_id
 from app.api.dependencies import get_agent, get_a2a_service
 from app.schemas.a2a import (
     A2AAuditEntryOut,
@@ -30,8 +31,8 @@ logger = logging.getLogger("nexus.api.a2a")
 router = APIRouter()
 
 
-async def _owner_id(agent: NexusAgent) -> uuid.UUID:
-    return await agent._owner_id()
+async def _owner_id(request: Request) -> uuid.UUID:
+    return request_owner_id(request)
 
 
 @router.post(
@@ -42,11 +43,12 @@ async def _owner_id(agent: NexusAgent) -> uuid.UUID:
     summary="Register a trusted remote agent",
 )
 async def register_agent(
+    request: Request,
     payload: TrustedAgentCreate,
     agent: NexusAgent = Depends(get_agent),
     a2a_service: A2AService = Depends(get_a2a_service),
 ) -> TrustedAgentOut:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     try:
         record = await a2a_service.register_trusted_agent(
             owner_id,
@@ -67,10 +69,11 @@ async def register_agent(
     summary="List trusted agents",
 )
 async def list_agents(
+    request: Request,
     agent: NexusAgent = Depends(get_agent),
     a2a_service: A2AService = Depends(get_a2a_service),
 ) -> TrustedAgentListResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     agents = await a2a_service.list_trusted_agents(owner_id)
     items = [TrustedAgentOut(**a.to_dict()) for a in agents]  # type: ignore[arg-type]
     return TrustedAgentListResponse(agents=items, total=len(items))
@@ -84,11 +87,12 @@ async def list_agents(
     responses={404: {"description": "Agent not found"}},
 )
 async def get_agent_record(
+    request: Request,
     agent_id: str,
     agent: NexusAgent = Depends(get_agent),
     a2a_service: A2AService = Depends(get_a2a_service),
 ) -> TrustedAgentOut:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     record = await a2a_service.get_trusted_agent(owner_id, agent_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Agent not found.")
@@ -103,11 +107,12 @@ async def get_agent_record(
     responses={404: {"description": "Agent not found"}},
 )
 async def delete_agent(
+    request: Request,
     agent_id: str,
     agent: NexusAgent = Depends(get_agent),
     a2a_service: A2AService = Depends(get_a2a_service),
 ) -> DeleteResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     deleted = await a2a_service.delete_trusted_agent(owner_id, agent_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Agent not found.")
@@ -122,11 +127,12 @@ async def delete_agent(
     responses={404: {"description": "Agent not found"}},
 )
 async def revoke_agent(
+    request: Request,
     agent_id: str,
     agent: NexusAgent = Depends(get_agent),
     a2a_service: A2AService = Depends(get_a2a_service),
 ) -> TrustedAgentOut:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     revoked = await a2a_service.revoke_trusted_agent(owner_id, agent_id)
     if not revoked:
         raise HTTPException(status_code=404, detail="Agent not found.")
@@ -149,11 +155,23 @@ async def receive_message(
     agent: NexusAgent = Depends(get_agent),
     a2a_service: A2AService = Depends(get_a2a_service),
 ):
+    """Inbound peer message.
+
+    Authenticated by the Ed25519 envelope signature plus the trusted-agent
+    registry - NOT by a session. A remote agent has no account on this
+    deployment, so requiring a session cookie here would make peer messaging
+    impossible.
+
+    NOTE (tracked in M6): the receiving owner is currently inferred from the
+    local identity (one agent per deployment). Once the envelope carries the
+    recipient's owner/agent in protocol 0.2, this must resolve the owner from
+    the envelope instead.
+    """
     raw = await request.body()
     try:
         a2a_service.check_size(raw)
         envelope = A2AEnvelope.model_validate_json(raw)
-        owner_id = await _owner_id(agent)
+        owner_id = await _owner_id(request)
         response = await a2a_service.handle_inbound(owner_id, envelope)
     except A2AError as exc:
         return JSONResponse(status_code=exc.http_status, content=exc.to_dict())
@@ -173,11 +191,12 @@ async def receive_message(
     summary="Send a signed request to a trusted remote agent",
 )
 async def send_message(
+    request: Request,
     payload: A2ASendRequest,
     agent: NexusAgent = Depends(get_agent),
     a2a_service: A2AService = Depends(get_a2a_service),
 ) -> A2ASendResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     try:
         result = await a2a_service.send_request(
             owner_id,
@@ -200,11 +219,12 @@ async def send_message(
     summary="A2A message audit trail (owner-scoped, metadata only)",
 )
 async def list_a2a_audit(
+    request: Request,
     limit: int = Query(default=100, ge=1, le=500),
     agent: NexusAgent = Depends(get_agent),
     a2a_service: A2AService = Depends(get_a2a_service),
 ) -> A2AAuditResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     records = await a2a_service.list_audit(owner_id, limit=limit)
     entries = [A2AAuditEntryOut(**r.to_dict()) for r in records]  # type: ignore[arg-type]
     return A2AAuditResponse(messages=entries, total=len(entries))

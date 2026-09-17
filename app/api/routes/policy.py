@@ -9,9 +9,10 @@ from __future__ import annotations
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from app.agent.agent import NexusAgent
+from app.api.auth_context import request_owner_id
 from app.api.dependencies import get_agent, get_policy_service
 from app.policy.engine import EvaluationRequest
 from app.policy.service import PolicyService, PolicyServiceError
@@ -33,8 +34,8 @@ logger = logging.getLogger("nexus.api.policy")
 router = APIRouter()
 
 
-async def _owner_id(agent: NexusAgent) -> uuid.UUID:
-    return await agent._owner_id()
+async def _owner_id(request: Request) -> uuid.UUID:
+    return request_owner_id(request)
 
 
 def _policy_out(policy) -> PolicyOut:
@@ -54,10 +55,11 @@ def _consent_out(consent) -> ConsentOut:
     summary="List the owner's policies",
 )
 async def list_policies(
+    request: Request,
     agent: NexusAgent = Depends(get_agent),
     policy_service: PolicyService = Depends(get_policy_service),
 ) -> PolicyListResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     policies = await policy_service.list_policies(owner_id)
     items = [_policy_out(p) for p in policies]
     return PolicyListResponse(policies=items, total=len(items))
@@ -71,11 +73,12 @@ async def list_policies(
     summary="Create a policy rule",
 )
 async def create_policy(
+    request: Request,
     payload: PolicyCreate,
     agent: NexusAgent = Depends(get_agent),
     policy_service: PolicyService = Depends(get_policy_service),
 ) -> PolicyOut:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     try:
         policy = await policy_service.create_policy(
             owner_id,
@@ -104,6 +107,7 @@ async def create_policy(
     responses={404: {"description": "Policy not found"}},
 )
 async def delete_policy(
+    request: Request,
     policy_id: str,
     agent: NexusAgent = Depends(get_agent),
     policy_service: PolicyService = Depends(get_policy_service),
@@ -114,7 +118,7 @@ async def delete_policy(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Policy not found."
         ) from None
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     deleted = await policy_service.delete_policy(owner_id, policy_uuid)
     if not deleted:
         raise HTTPException(
@@ -130,10 +134,11 @@ async def delete_policy(
     summary="List the owner's consents",
 )
 async def list_consents(
+    request: Request,
     agent: NexusAgent = Depends(get_agent),
     policy_service: PolicyService = Depends(get_policy_service),
 ) -> ConsentListResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     consents = await policy_service.list_consents(owner_id)
     items = [_consent_out(c) for c in consents]
     return ConsentListResponse(consents=items, total=len(items))
@@ -152,11 +157,12 @@ async def list_consents(
     ),
 )
 async def create_consent(
+    request: Request,
     payload: ConsentCreate,
     agent: NexusAgent = Depends(get_agent),
     policy_service: PolicyService = Depends(get_policy_service),
 ) -> ConsentOut:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     try:
         consent = await policy_service.create_consent(
             owner_id,
@@ -184,6 +190,7 @@ async def create_consent(
     responses={404: {"description": "Consent not found"}},
 )
 async def delete_consent(
+    request: Request,
     consent_id: str,
     agent: NexusAgent = Depends(get_agent),
     policy_service: PolicyService = Depends(get_policy_service),
@@ -194,7 +201,7 @@ async def delete_consent(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Consent not found."
         ) from None
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     deleted = await policy_service.delete_consent(owner_id, consent_uuid)
     if not deleted:
         raise HTTPException(
@@ -210,11 +217,12 @@ async def delete_consent(
     summary="Evaluate an authorization request",
 )
 async def evaluate_policy(
+    request: Request,
     payload: PolicyEvaluateRequest,
     agent: NexusAgent = Depends(get_agent),
     policy_service: PolicyService = Depends(get_policy_service),
 ) -> PolicyEvaluateResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     result = await policy_service.evaluate(
         owner_id,
         EvaluationRequest(
@@ -235,11 +243,12 @@ async def evaluate_policy(
     summary="Audit trail of policy decisions (owner-scoped)",
 )
 async def list_audit(
+    request: Request,
     limit: int = Query(default=100, ge=1, le=500),
     agent: NexusAgent = Depends(get_agent),
     policy_service: PolicyService = Depends(get_policy_service),
 ) -> AuditListResponse:
-    owner_id = await _owner_id(agent)
+    owner_id = await _owner_id(request)
     decisions = await policy_service.list_decisions(owner_id, limit=limit)
     entries = []
     for record in decisions:

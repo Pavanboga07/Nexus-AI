@@ -101,11 +101,14 @@ async def test_stored_private_key_is_encrypted_at_rest(db_session_factory) -> No
         stored = row.encrypted_private_key
 
     # The stored blob must not contain the raw private key material.
-    private_raw = crypto.private_key_bytes(service._private_key)  # type: ignore[arg-type]
+    # (M4: key material is no longer cached on the service - it is resolved per
+    # operation - so decrypt the stored row explicitly to compare.)
+    private_raw = crypto.decrypt_private_key(stored, TEST_SECRET)
     assert private_raw not in base64.b64decode(stored)
     assert private_raw.hex() not in stored
-    # And it must decrypt correctly with the right secret.
-    assert crypto.decrypt_private_key(stored, TEST_SECRET) == private_raw
+    # Also prove the ciphertext differs from the plaintext (i.e. it really is
+    # encrypted) and is long enough to carry a nonce + tag.
+    assert len(base64.b64decode(stored)) >= len(private_raw) + 12 + 16
 
 
 async def test_wrong_secret_fails_startup_hard(db_session_factory) -> None:
@@ -164,7 +167,11 @@ async def test_service_verify_does_not_need_private_key(db_session_factory) -> N
     signature = crypto.sign_bytes(private, b"independent")
 
     fresh = _make_service(db_session_factory, owner_id)  # never initialised
-    assert fresh._private_key is None
+    # M4: the service holds NO key material at all until an operation runs, so
+    # verification is genuinely stateless rather than "happens not to need the
+    # cached key".
+    assert not hasattr(fresh, "_private_key")
+    assert fresh._primary_public is None
     assert await fresh.verify(crypto.public_key_bytes(public), b"independent", signature)
 
 

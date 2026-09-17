@@ -156,13 +156,35 @@ async def db_engine() -> AsyncIterator[AsyncEngine | None]:
 async def db_session_factory(
     db_engine: AsyncEngine,
 ) -> AsyncIterator:
+    """A session factory with FULL table isolation between tests.
+
+    This used to truncate a hardcoded list of four tables
+    (``memories, messages, conversations, owners``). That list stopped covering
+    the schema many parts ago, so rows in newer tables (jobs, agents, policies,
+    workflows, trusted_agent_cards, auth_sessions, ...) leaked between tests -
+    which is how a test can pass alone and fail in a suite.
+
+    Truncation is derived from the model metadata, so a new table is covered
+    automatically instead of silently reintroducing leakage.
+    """
     factory = create_session_factory(db_engine)
-    yield factory
-    # Truncate all tables between tests for full isolation.
-    async with db_engine.begin() as conn:
-        await conn.execute(
-            text("TRUNCATE memories, messages, conversations, owners CASCADE")
+
+    async def _truncate_all() -> None:
+        from app.database.models import Base
+
+        tables = ", ".join(
+            f'"{t.name}"' for t in reversed(Base.metadata.sorted_tables)
         )
+        if not tables:
+            return
+        async with db_engine.begin() as conn:
+            await conn.execute(text(f"TRUNCATE {tables} CASCADE"))
+
+    # Clean on the way IN as well as out: a previous interrupted run must not
+    # poison this one.
+    await _truncate_all()
+    yield factory
+    await _truncate_all()
 
 
 @pytest_asyncio.fixture
@@ -301,11 +323,19 @@ async def db_a2a_app(
         encryption_secret="a2a-api-test-secret-not-real",
         owner_id=owner_id,
     )
-    await identity_service.initialize_identity()
+    # M4: identity is per-agent. Initialise the owner's primary agent and bind
+    # the adapter the protocol stack consumes (app.state.primary_identity).
+    from app.identity.bound import AgentIdentity
+
+    agent_summary = await identity_service.initialize_primary_agent(owner_id)
+    primary_identity = await AgentIdentity.for_agent(
+        identity_service=identity_service,
+        agent_row_id=agent_summary.id,
+    )
 
     a2a_service = A2AService(
         session_factory=db_session_factory,
-        identity_service=identity_service,
+        identity_service=primary_identity,
         policy_service=db_tools_app.state.policy_service,
         memory_manager=memory_manager,
         transport=LoopbackTransport(),
@@ -313,6 +343,8 @@ async def db_a2a_app(
         allow_local_endpoints=True,
     )
     db_tools_app.state.identity_service = identity_service
+    db_tools_app.state.primary_identity = primary_identity
+    db_tools_app.state.identity_ok = True
     db_tools_app.state.a2a_service = a2a_service
     return db_tools_app
 
@@ -342,6 +374,71 @@ async def db_client(db_app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
         transport=transport, base_url="http://test"
     ) as async_client:
         yield async_client
+
+
+# --- M3: authentication stack -----------------------------------------------
+
+#: Fixed secret so session cookies are deterministic across test runs.
+TEST_SESSION_SECRET = "test-session-secret-not-real-do-not-use"
+
+
+@pytest.fixture
+def authed_app(db_app: FastAPI, db_session_factory) -> FastAPI:
+    """App with the auth service attached and auth ENFORCED AND THE REAL
+    SERVICES ATTACHED.
+
+    Existing fixtures bypass auth (they set app.state.agent directly and leave
+    auth_required=False, which exercises the development fallback). Tests that
+    need real authentication use this fixture.
+
+    Identity and policy services are attached so the protected endpoints reach
+    their real handlers (rather than 503-ing on a missing dependency); that is
+    what makes the 401-vs-200 assertions meaningful rather than vacuous.
+    """
+    from app.auth.service import AuthService
+    from app.database.repositories import OwnerRepository
+    from app.identity.service import IdentityService
+    from app.policy.service import PolicyService
+    from app.database.models import Owner
+
+    # A dedicated owner row for identity binding in this fixture (distinct from
+    # the per-registration owners the auth tests create).
+    db_app.state.auth_service = AuthService(
+        session_factory=db_session_factory,
+        session_secret=TEST_SESSION_SECRET,
+        session_ttl_seconds=3600,
+        allow_registration=True,
+    )
+    db_app.state.auth_required = True
+    db_app.state.registration_open = True
+    db_app.state.cookie_secure = False  # plain-HTTP test transport
+    db_app.state.session_ttl_seconds = 3600
+    db_app.state.adopt_legacy_owner = False  # each test user gets its own owner
+
+    db_app.state.policy_service = PolicyService(session_factory=db_session_factory)
+    return db_app
+
+
+@pytest_asyncio.fixture
+async def authed_client(authed_app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    transport = httpx.ASGITransport(app=authed_app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test"
+    ) as async_client:
+        yield async_client
+
+
+@pytest_asyncio.fixture
+async def auth_service_standalone(db_session_factory):
+    """Bare AuthService for unit-level auth tests."""
+    from app.auth.service import AuthService
+
+    return AuthService(
+        session_factory=db_session_factory,
+        session_secret=TEST_SESSION_SECRET,
+        session_ttl_seconds=3600,
+        allow_registration=True,
+    )
 
 
 @pytest_asyncio.fixture
