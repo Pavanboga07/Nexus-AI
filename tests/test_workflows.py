@@ -1394,6 +1394,67 @@ async def test_a6_fail_reason_truncated_to_250(
     assert len(fetched.steps[0].failure_reason or "") <= 250
 
 
+@pytest.mark.asyncio
+async def test_a6_cancel_reason_truncated_to_250(
+    workflow_service_instance: WorkflowService,
+    test_owner: uuid.UUID,
+    db_session_factory,
+):
+    wf = await workflow_service_instance.create_workflow(
+        test_owner,
+        workflow_type="a6_test",
+        purpose="a6_cancel_truncation",
+        steps=[WorkflowStepSpec(step_type="availability_check")],
+    )
+    long_reason = "x" * 500
+    cancelled = await workflow_service_instance.cancel_workflow(
+        test_owner, wf.workflow_id, reason=long_reason
+    )
+    assert cancelled.status == WorkflowStatus.CANCELLED.value
+    assert cancelled.failure_reason is not None
+    assert len(cancelled.failure_reason) <= 250
+
+
+@pytest.mark.asyncio
+async def test_a6_expired_waiting_surfaces_expired_on_list(
+    workflow_service_instance: WorkflowService,
+    policy_service: PolicyService,
+    test_owner: uuid.UUID,
+    db_session_factory,
+):
+    await policy_service.create_policy(
+        test_owner,
+        requester_agent_id="nexus:self",
+        data_category="calendar",
+        action="read",
+        purpose="a6_expiry_list",
+        decision="ASK",
+    )
+    wf = await workflow_service_instance.create_workflow(
+        test_owner,
+        workflow_type="a6_test",
+        purpose="a6_expiry_list",
+        steps=[WorkflowStepSpec(step_type="availability_check")],
+    )
+    started = await workflow_service_instance.start_workflow(
+        test_owner, wf.workflow_id
+    )
+    assert started.status == WorkflowStatus.RUNNING.value
+    await drain_workflow_jobs(db_session_factory, workflow_service_instance)
+    parked = await workflow_service_instance.get_workflow(
+        test_owner, wf.workflow_id
+    )
+    assert parked.status == WorkflowStatus.WAITING_APPROVAL.value
+    async with db_session_factory() as session:
+        wf_db = await workflow_service_instance._repo.get(session, wf.workflow_id)
+        assert wf_db is not None
+        wf_db.expires_at = datetime.now(timezone.utc) - timedelta(seconds=10)
+        await session.commit()
+    listed = await workflow_service_instance.list_workflows(test_owner)
+    match = next(w for w in listed if w.workflow_id == wf.workflow_id)
+    assert match.status == WorkflowStatus.EXPIRED.value
+
+
 # -----------------------------------------------------------------------------
 # A5: ADVANCE VIA JOBS, NOT INLINE IN REQUESTS
 # -----------------------------------------------------------------------------

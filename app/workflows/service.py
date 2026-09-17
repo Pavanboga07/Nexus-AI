@@ -690,7 +690,7 @@ class WorkflowService:
                 return wf
 
             wf.status = WorkflowStatus.CANCELLED.value
-            wf.failure_reason = reason
+            wf.failure_reason = reason[:250] if isinstance(reason, str) else reason
             now = _utcnow()
             wf.completed_at = now
 
