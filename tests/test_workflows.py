@@ -1518,3 +1518,150 @@ async def test_a5_kill_mid_workflow_recovers_and_completes(
     final = await workflow_service_instance.get_workflow(test_owner, wf.workflow_id)
     assert final.status == WorkflowStatus.COMPLETED.value
     assert all(s.status == StepStatus.COMPLETED.value for s in final.steps)
+
+
+# -----------------------------------------------------------------------------
+# A7: CONTEXT KEYS AND RETRY MAPPING
+# -----------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a7_same_type_steps_retrievable_by_number(
+    workflow_service_instance: WorkflowService,
+    policy_service: PolicyService,
+    test_owner: uuid.UUID,
+    db_session_factory,
+):
+    """Two steps of the same type stay individually retrievable by step number.
+
+    The legacy ``ctx[step_type]`` alias is overwritten by the second step;
+    the canonical ``ctx["step_{n}"]`` keys (via ``get_step_output``) must not be.
+    """
+    from app.workflows.service import get_step_output
+
+    await policy_service.create_policy(
+        test_owner,
+        requester_agent_id="nexus:self",
+        data_category="calendar",
+        action="read",
+        purpose="a7_ctx",
+        decision="ALLOW",
+    )
+    wf = await workflow_service_instance.create_workflow(
+        test_owner,
+        workflow_type="a7_test",
+        purpose="a7_ctx",
+        steps=[
+            WorkflowStepSpec(
+                step_type="availability_check",
+                input_payload={"candidate_slots": ["10:00"]},
+            ),
+            WorkflowStepSpec(
+                step_type="availability_check",
+                input_payload={"candidate_slots": ["14:00"]},
+            ),
+        ],
+    )
+    started = await workflow_service_instance.start_workflow(
+        test_owner, wf.workflow_id
+    )
+    assert started.status == WorkflowStatus.RUNNING.value
+    await drain_workflow_jobs(db_session_factory, workflow_service_instance)
+    final = await workflow_service_instance.get_workflow(
+        test_owner, wf.workflow_id
+    )
+    assert final.status == WorkflowStatus.COMPLETED.value
+    ctx = final.context_data or {}
+    assert ctx["step_1"]["available_slots"] == ["10:00"]
+    assert ctx["step_2"]["available_slots"] == ["14:00"]
+    # The legacy type alias keeps back-compat (last write wins).
+    assert ctx["availability_check"] == ctx["step_2"]
+    # The canonical numbered reads prefer their own key.
+    assert get_step_output(ctx, 1) == ctx["step_1"]
+    assert get_step_output(ctx, 2) == ctx["step_2"]
+    assert get_step_output(ctx, 1) != get_step_output(ctx, 2)
+
+
+@pytest.mark.asyncio
+async def test_a7_policy_denied_a2a_send_is_non_transient_no_retry(
+    workflow_service_instance: WorkflowService,
+    policy_service: PolicyService,
+    test_owner: uuid.UUID,
+    db_session_factory,
+):
+    """A coded policy-denied A2A send fails non-transient: no 3x retry.
+
+    The denial here is a coded ``A2AError`` whose message carries none of the
+    old substring-tripwires, so substring matching would retry it as transient.
+    """
+    from app.a2a.errors import A2AError, A2AErrorCode
+    from app.workflows.handlers import A2ATaskStepHandler
+
+    denied = A2AError(A2AErrorCode.UNTRUSTED_SENDER, "sender is not trusted")
+
+    class DenyA2A:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def delegate_task(self, owner_id, **kwargs):
+            self.calls += 1
+            raise denied
+
+    fake = DenyA2A()
+    handler = A2ATaskStepHandler()
+    direct_ctx = WorkflowStepContext(
+        owner_id=test_owner,
+        workflow_id=uuid.uuid4(),
+        step_id=uuid.uuid4(),
+        step_number=1,
+        purpose="a7_retry",
+        workflow_context={},
+        a2a_service=fake,
+    )
+    direct = await handler.execute(
+        direct_ctx,
+        {
+            "recipient_agent_id": "nexus:ed25519:99999999999999999999999999999999",
+            "task_type": "availability_check",
+        },
+    )
+    assert direct.status == StepStatus.FAILED
+    assert direct.is_transient is False
+
+    # End-to-end: the workflow fails immediately without consuming retries.
+    await policy_service.create_policy(
+        test_owner,
+        requester_agent_id="nexus:self",
+        data_category="a2a",
+        action="delegate_task",
+        purpose="a7_retry",
+        decision="ALLOW",
+    )
+    workflow_service_instance._a2a_service = fake
+    wf = await workflow_service_instance.create_workflow(
+        test_owner,
+        workflow_type="a7_test",
+        purpose="a7_retry",
+        steps=[
+            WorkflowStepSpec(
+                step_type="a2a_task",
+                input_payload={
+                    "recipient_agent_id": "nexus:ed25519:99999999999999999999999999999999",
+                    "task_type": "availability_check",
+                },
+            ),
+        ],
+    )
+    started = await workflow_service_instance.start_workflow(
+        test_owner, wf.workflow_id
+    )
+    assert started.status == WorkflowStatus.RUNNING.value
+    await drain_workflow_jobs(db_session_factory, workflow_service_instance)
+    final = await workflow_service_instance.get_workflow(
+        test_owner, wf.workflow_id
+    )
+    assert final.status == WorkflowStatus.FAILED.value
+    assert final.steps[0].status == StepStatus.FAILED.value
+    assert final.steps[0].attempt_count == 0
+    # 1 direct call above + exactly 1 workflow attempt (no retries).
+    assert fake.calls == 2

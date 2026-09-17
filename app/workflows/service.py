@@ -24,7 +24,6 @@ from app.policy.models import PolicyDecision
 from app.policy.service import PolicyService
 from app.schemas.workflows import WorkflowStepSpec
 from app.workflows.errors import (
-    WorkflowAccessDeniedError,
     WorkflowConflictError,
     WorkflowExpiredError,
     WorkflowNotFoundError,
@@ -36,6 +35,7 @@ from app.workflows.handlers import (
     WorkflowStepHandlerRegistry,
     _slugify,
     build_default_step_registry,
+    get_step_output,
 )
 from app.workflows.models import (
     StepStatus,
@@ -460,7 +460,7 @@ class WorkflowService:
                 res = StepResult(
                     status=StepStatus.FAILED,
                     failure_reason=str(exc),
-                    is_transient=True,
+                    is_transient=False,
                 )
 
             # Process handler result
@@ -906,4 +906,5 @@ class WorkflowService:
 
 __all__ = [
     "WorkflowService",
+    "get_step_output",
 ]

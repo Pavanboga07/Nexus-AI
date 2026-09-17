@@ -29,7 +29,6 @@ from app.schemas.workflows import (
     WorkflowStepOut,
 )
 from app.workflows.errors import (
-    WorkflowAccessDeniedError,
     WorkflowConflictError,
     WorkflowExpiredError,
     WorkflowNotFoundError,

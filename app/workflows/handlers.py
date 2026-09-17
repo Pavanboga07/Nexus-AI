@@ -16,8 +16,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
+from app.a2a.errors import A2AError, A2AErrorCode
 from app.policy.engine import EvaluationRequest
-from app.policy.models import DisclosureScope
 from app.tools.schemas import ToolInvocation
 from app.workflows.models import StepStatus
 
@@ -27,6 +27,54 @@ logger = logging.getLogger("nexus.workflows.handlers")
 def _slugify(text: str) -> str:
     cleaned = re.sub(r"[^a-z0-9:_\-.]+", "_", text.lower()).strip("_")
     return cleaned[:64] if cleaned else "workflow"
+
+
+def get_step_output(
+    workflow_context: dict[str, Any] | None,
+    step_number: int,
+    step_type: str | None = None,
+) -> Any | None:
+    """Canonical read of a prior step's output by step number.
+
+    Advancement writes every step result under both ``step_{n}`` and the
+    legacy ``ctx[step_type]`` alias; the alias is overwritten when two steps
+    share a type, so numbered reads are authoritative. When ``step_type`` is
+    given, the alias is used only as a back-compat fallback.
+    """
+    ctx = workflow_context or {}
+    numbered = f"step_{step_number}"
+    if numbered in ctx:
+        return ctx[numbered]
+    if step_type is not None and step_type in ctx:
+        return ctx[step_type]
+    return None
+
+
+def _prior_step_field(
+    workflow_context: dict[str, Any] | None,
+    current_step_number: int,
+    field: str,
+) -> Any | None:
+    """Newest prior numbered step output containing ``field``, if any."""
+    for n in range(current_step_number - 1, 0, -1):
+        out = get_step_output(workflow_context, n)
+        if isinstance(out, dict) and field in out:
+            return out[field]
+    return None
+
+
+# A2A failures worth retrying: the transport never reached a policy verdict
+# (network/timeout/HTTP failures surface as TRANSPORT_ERROR, including
+# timeouts) plus infrastructure "try again later" signals. Every other coded
+# failure — auth, trust, validation, task lifecycle, capabilities — is final,
+# as is any uncoded (programming) error.
+_TRANSIENT_A2A_CODES = frozenset(
+    {
+        A2AErrorCode.TRANSPORT_ERROR,
+        A2AErrorCode.RATE_LIMITED,
+        A2AErrorCode.DISCOVERY_FAILED,
+    }
+)
 
 
 @dataclass
@@ -193,19 +241,30 @@ class A2ATaskStepHandler(BaseWorkflowStepHandler):
         payload = dict(input_payload.get("payload") or {})
         endpoint = input_payload.get("endpoint")
 
-        # Dynamic parameter resolution from workflow context
+        # Dynamic parameter resolution from workflow context: prefer the
+        # canonical numbered step outputs (same-type steps overwrite the
+        # legacy type alias), keeping the old alias keys as fallback.
         # e.g. if payload has {"use_selected_slot": True} or requested_time is missing
         if input_payload.get("use_selected_slot") or payload.get("use_selected_slot"):
-            selected = context.workflow_context.get("selected_candidate", {}).get(
+            wc = context.workflow_context or {}
+            selected = _prior_step_field(
+                wc, context.step_number, "selected_slot"
+            ) or (wc.get("selected_candidate") or {}).get(
                 "selected_slot"
-            ) or context.workflow_context.get("selected_slot")
+            ) or wc.get("selected_slot")
             if selected:
                 payload["requested_time"] = selected
                 payload["time"] = selected
                 payload["proposed_time"] = selected
 
         if task_type == "meeting_proposal" and "proposed_time" not in payload:
-            time_val = payload.get("time") or payload.get("requested_time") or context.workflow_context.get("candidate_selection", {}).get("selected_slot")
+            wc = context.workflow_context or {}
+            time_val = (
+                payload.get("time")
+                or payload.get("requested_time")
+                or _prior_step_field(wc, context.step_number, "selected_slot")
+                or (wc.get("candidate_selection") or {}).get("selected_slot")
+            )
             if time_val:
                 payload["proposed_time"] = time_val
 
@@ -218,26 +277,22 @@ class A2ATaskStepHandler(BaseWorkflowStepHandler):
                 payload=payload,
                 endpoint=endpoint,
             )
-        except Exception as exc:
-            # Check if this error is transient (e.g. network/timeout vs policy deny/revocation)
-            err_msg = str(exc)
-            is_non_transient = any(
-                term in err_msg.lower()
-                for term in (
-                    "policy",
-                    "denied",
-                    "revoked",
-                    "unauthorized",
-                    "not_found",
-                    "invalid_envelope",
-                    "signature",
-                )
-            )
+        except A2AError as exc:
+            transient = exc.code in _TRANSIENT_A2A_CODES
             logger.error("A2A delegation failed: %s", exc)
             return StepResult(
                 status=StepStatus.FAILED,
-                failure_reason=err_msg,
-                is_transient=not is_non_transient,
+                failure_reason=str(exc),
+                is_transient=transient,
+            )
+        except Exception as exc:
+            # Uncoded errors are programming errors, not remote flakes:
+            # fail closed without consuming the retry budget.
+            logger.error("A2A delegation failed: %s", exc)
+            return StepResult(
+                status=StepStatus.FAILED,
+                failure_reason=str(exc),
+                is_transient=False,
             )
 
         task_id = result.get("task_id")
@@ -296,10 +351,11 @@ class ToolStepHandler(BaseWorkflowStepHandler):
         try:
             res = await context.tool_service.execute(context.owner_id, invocation)
         except Exception as exc:
+            # Uncoded tool crashes are programming errors: fail closed.
             return StepResult(
                 status=StepStatus.FAILED,
                 failure_reason=str(exc),
-                is_transient=True,
+                is_transient=False,
             )
 
         if not res.success:
@@ -348,4 +404,5 @@ __all__ = [
     "WorkflowStepContext",
     "WorkflowStepHandlerRegistry",
     "build_default_step_registry",
+    "get_step_output",
 ]
