@@ -1413,6 +1413,13 @@ async def test_a6_cancel_reason_truncated_to_250(
     assert cancelled.status == WorkflowStatus.CANCELLED.value
     assert cancelled.failure_reason is not None
     assert len(cancelled.failure_reason) <= 250
+    # Re-fetch fresh from the DB (not the returned object) to prove
+    # what Postgres actually stored.
+    refetched = await workflow_service_instance.get_workflow(
+        test_owner, wf.workflow_id
+    )
+    assert refetched.failure_reason is not None
+    assert len(refetched.failure_reason) <= 250
 
 
 @pytest.mark.asyncio
