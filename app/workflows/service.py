@@ -558,6 +558,10 @@ class WorkflowService:
                 target_step = await self._step_repo.get(session, step_id)
                 if not target_step or target_step.workflow_id != workflow_id:
                     raise WorkflowNotFoundError(f"Step {step_id} not found.")
+                if target_step.status != StepStatus.WAITING.value:
+                    raise WorkflowConflictError(
+                        f"Step {step_id} is not awaiting approval (current status: {target_step.status})"
+                    )
             else:
                 steps = await self._step_repo.list_for_workflow(session, workflow_id)
                 for s in steps:

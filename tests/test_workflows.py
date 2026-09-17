@@ -947,3 +947,76 @@ async def test_workflow_api_lifecycle(db_workflow_client: AsyncClient):
     cancel_resp = await db_workflow_client.post(f"/workflows/{wf_id_2}/cancel", json={"reason": "User cancelled"})
     assert cancel_resp.status_code == 200
     assert cancel_resp.json()["status"] == "cancelled"
+
+
+# -----------------------------------------------------------------------------
+# A3: APPROVAL ACCEPTS ONLY THE WAITING STEP
+# -----------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_workflow_approve_rejects_non_waiting_step_id(
+    workflow_service_instance: WorkflowService,
+    policy_service: PolicyService,
+    test_owner: uuid.UUID,
+):
+    # Both steps ASK so the workflow is still WAITING_APPROVAL after step 1 completes.
+    await policy_service.create_policy(
+        test_owner,
+        requester_agent_id="nexus:self",
+        data_category="calendar",
+        action="read",
+        purpose="test_workflow",
+        decision="ASK",
+    )
+    await policy_service.create_policy(
+        test_owner,
+        requester_agent_id="nexus:self",
+        data_category="scheduling",
+        action="compute",
+        purpose="test_workflow",
+        decision="ASK",
+    )
+
+    steps = [
+        WorkflowStepSpec(
+            step_type="availability_check",
+            input_payload={"candidate_slots": ["10:00"]},
+        ),
+        WorkflowStepSpec(
+            step_type="candidate_selection",
+            input_payload={"user_slots": ["10:00"], "remote_slots": ["10:00"]},
+        ),
+    ]
+    wf = await workflow_service_instance.create_workflow(
+        test_owner, workflow_type="test", purpose="test_workflow", steps=steps
+    )
+
+    # Start -> paused at step 1
+    w1 = await workflow_service_instance.start_workflow(test_owner, wf.workflow_id)
+    assert w1.status == WorkflowStatus.WAITING_APPROVAL.value
+    assert w1.steps[0].status == StepStatus.WAITING.value
+
+    # Approve step 1 -> step 1 completes, step 2 pauses; workflow still WAITING_APPROVAL
+    w2 = await workflow_service_instance.approve_workflow(test_owner, wf.workflow_id)
+    assert w2.status == WorkflowStatus.WAITING_APPROVAL.value
+    assert w2.steps[0].status == StepStatus.COMPLETED.value
+    assert w2.steps[1].status == StepStatus.WAITING.value
+
+    completed_step_id = w2.steps[0].step_id
+    before_status = w2.steps[0].status
+    before_output = w2.steps[0].output_payload
+    before_completed_at = w2.steps[0].completed_at
+
+    # Re-approving the now-COMPLETED step must be rejected, not re-executed.
+    with pytest.raises(WorkflowConflictError):
+        await workflow_service_instance.approve_workflow(
+            test_owner, wf.workflow_id, step_id=completed_step_id
+        )
+
+    after = await workflow_service_instance.get_workflow(test_owner, wf.workflow_id)
+    after_step = next(s for s in after.steps if s.step_id == completed_step_id)
+    assert after_step.status == before_status == StepStatus.COMPLETED.value
+    assert after_step.output_payload == before_output
+    assert after_step.completed_at == before_completed_at
+    assert after.status == WorkflowStatus.WAITING_APPROVAL.value
