@@ -56,6 +56,7 @@ from app.tools.builtin import BUILTIN_TOOLS
 from app.tools.registry import ToolRegistry
 from app.tools.service import ToolService
 from app.workflows.service import WorkflowService
+from test_workflows import drain_workflow_jobs
 
 
 @pytest_asyncio.fixture
@@ -911,8 +912,11 @@ async def test_a2_create_workflow_propagates_waiting_remote(
             is_pre_approved=True,
         )
         assert run.workflow_id is not None
-        assert run.status == RunStatus.WAITING_REMOTE.value
+        # A5 timing: start_workflow only enqueues advancement, so the step
+        # returns in-progress; the workflow parks once its jobs drain.
+        assert result.status == RunStatus.RUNNING
+        wf_id = run.workflow_id
 
-    assert result.status == RunStatus.WAITING_REMOTE
-    wf = await wf_service.get_workflow(test_owner, run.workflow_id)
+    await drain_workflow_jobs(db_session_factory, wf_service)
+    wf = await wf_service.get_workflow(test_owner, wf_id)
     assert wf.status == WorkflowStatus.WAITING_REMOTE.value

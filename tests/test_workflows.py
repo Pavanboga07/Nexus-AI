@@ -60,8 +60,42 @@ from app.workflows.models import (
     WorkflowStatus,
     WorkflowStep,
 )
+from app.jobs import JobQueue, JobRegistry, JobWorker
 from app.workflows.service import WorkflowService
 from tests.test_a2a_service import LoopbackTransport
+
+
+# -----------------------------------------------------------------------------
+# A5: JOB-BASED ADVANCEMENT DRAIN HELPER
+# -----------------------------------------------------------------------------
+
+
+async def drain_workflow_jobs(db_session_factory, workflow_service) -> int:
+    """Run pending workflow.advance jobs inline until the queue is empty.
+
+    Advancement no longer runs inside start/approve/resume requests: those
+    calls only enqueue a ``workflow.advance`` job (same kind + payload shape
+    as the handler registered in ``app/main.py``) and return a fresh read.
+    Tests asserting post-advancement states must drain first. A real
+    ``JobWorker`` claims and runs the jobs against the real service — nothing
+    about the service itself is mocked. Returns the number of jobs run.
+    """
+    queue = JobQueue(session_factory=db_session_factory)
+    registry = JobRegistry()
+
+    async def _advance(job) -> None:
+        wid = uuid.UUID(str(job.payload.get("workflow_id")))
+        await workflow_service.advance_workflow(wid)
+
+    registry.register("workflow.advance", _advance)
+    worker = JobWorker(queue=queue, registry=registry, kinds=["workflow.advance"])
+    total = 0
+    for _ in range(100):
+        ran = await worker.run_once()
+        total += ran
+        if ran == 0:
+            break
+    return total
 
 
 @pytest_asyncio.fixture
@@ -150,7 +184,9 @@ async def test_workflow_create_empty_steps_fails(
 
 @pytest.mark.asyncio
 async def test_workflow_unknown_step_fails_safely(
-    workflow_service_instance: WorkflowService, test_owner: uuid.UUID
+    workflow_service_instance: WorkflowService,
+    test_owner: uuid.UUID,
+    db_session_factory,
 ):
     steps = [
         WorkflowStepSpec(step_type="completely_unknown_action"),
@@ -163,6 +199,11 @@ async def test_workflow_unknown_step_fails_safely(
     )
 
     started_wf = await workflow_service_instance.start_workflow(test_owner, wf.workflow_id)
+    assert started_wf.status == WorkflowStatus.RUNNING.value
+    await drain_workflow_jobs(db_session_factory, workflow_service_instance)
+    started_wf = await workflow_service_instance.get_workflow(
+        test_owner, wf.workflow_id
+    )
     assert started_wf.status == WorkflowStatus.FAILED.value
     assert "Unsupported step type" in (started_wf.failure_reason or "")
     assert started_wf.steps[0].status == StepStatus.FAILED.value
@@ -178,6 +219,7 @@ async def test_workflow_policy_deny_halts_without_retry(
     workflow_service_instance: WorkflowService,
     policy_service: PolicyService,
     test_owner: uuid.UUID,
+    db_session_factory,
 ):
     # Set explicit policy DENY for calendar read
     await policy_service.create_policy(
@@ -203,6 +245,9 @@ async def test_workflow_policy_deny_halts_without_retry(
     )
 
     result = await workflow_service_instance.start_workflow(test_owner, wf.workflow_id)
+    assert result.status == WorkflowStatus.RUNNING.value
+    await drain_workflow_jobs(db_session_factory, workflow_service_instance)
+    result = await workflow_service_instance.get_workflow(test_owner, wf.workflow_id)
     assert result.status == WorkflowStatus.FAILED.value
     assert "Policy DENY" in (result.failure_reason or "")
     assert result.steps[0].status == StepStatus.FAILED.value
@@ -214,6 +259,7 @@ async def test_workflow_policy_step1_allow_step2_ask_and_approval_flow(
     workflow_service_instance: WorkflowService,
     policy_service: PolicyService,
     test_owner: uuid.UUID,
+    db_session_factory,
 ):
     # Step 1: calendar read -> ALLOW
     await policy_service.create_policy(
@@ -254,6 +300,11 @@ async def test_workflow_policy_step1_allow_step2_ask_and_approval_flow(
 
     # Start workflow -> step 1 completes, step 2 triggers ASK -> workflow pauses at WAITING_APPROVAL
     paused_wf = await workflow_service_instance.start_workflow(test_owner, wf.workflow_id)
+    assert paused_wf.status == WorkflowStatus.RUNNING.value
+    await drain_workflow_jobs(db_session_factory, workflow_service_instance)
+    paused_wf = await workflow_service_instance.get_workflow(
+        test_owner, wf.workflow_id
+    )
     assert paused_wf.status == WorkflowStatus.WAITING_APPROVAL.value
     assert paused_wf.steps[0].status == StepStatus.COMPLETED.value
     assert paused_wf.steps[1].status == StepStatus.WAITING.value
@@ -261,6 +312,11 @@ async def test_workflow_policy_step1_allow_step2_ask_and_approval_flow(
     # Owner approves step 2
     resumed_wf = await workflow_service_instance.approve_workflow(
         test_owner, paused_wf.workflow_id, step_id=paused_wf.steps[1].step_id
+    )
+    assert resumed_wf.status == WorkflowStatus.RUNNING.value
+    await drain_workflow_jobs(db_session_factory, workflow_service_instance)
+    resumed_wf = await workflow_service_instance.get_workflow(
+        test_owner, wf.workflow_id
     )
 
     assert resumed_wf.status == WorkflowStatus.COMPLETED.value
@@ -273,6 +329,7 @@ async def test_workflow_approval_does_not_authorize_unrelated_step(
     workflow_service_instance: WorkflowService,
     policy_service: PolicyService,
     test_owner: uuid.UUID,
+    db_session_factory,
 ):
     # Step 1: ASK
     await policy_service.create_policy(
@@ -309,11 +366,17 @@ async def test_workflow_approval_does_not_authorize_unrelated_step(
 
     # Start -> paused at step 1
     w1 = await workflow_service_instance.start_workflow(test_owner, wf.workflow_id)
+    assert w1.status == WorkflowStatus.RUNNING.value
+    await drain_workflow_jobs(db_session_factory, workflow_service_instance)
+    w1 = await workflow_service_instance.get_workflow(test_owner, wf.workflow_id)
     assert w1.status == WorkflowStatus.WAITING_APPROVAL.value
     assert w1.steps[0].status == StepStatus.WAITING.value
 
     # Approve step 1 -> executes step 1, but step 2 encounters ASK and pauses AGAIN
     w2 = await workflow_service_instance.approve_workflow(test_owner, wf.workflow_id)
+    assert w2.status == WorkflowStatus.RUNNING.value
+    await drain_workflow_jobs(db_session_factory, workflow_service_instance)
+    w2 = await workflow_service_instance.get_workflow(test_owner, wf.workflow_id)
     assert w2.status == WorkflowStatus.WAITING_APPROVAL.value
     assert w2.steps[0].status == StepStatus.COMPLETED.value
     assert w2.steps[1].status == StepStatus.WAITING.value
@@ -519,6 +582,9 @@ async def test_workflow_bounded_retry_transient_success(
     )
 
     res = await svc.start_workflow(test_owner, wf.workflow_id)
+    assert res.status == WorkflowStatus.RUNNING.value
+    await drain_workflow_jobs(db_session_factory, svc)
+    res = await svc.get_workflow(test_owner, wf.workflow_id)
     assert res.status == WorkflowStatus.COMPLETED.value
     assert res.steps[0].attempt_count == 2
     assert flaky_handler.count == 3
@@ -557,6 +623,9 @@ async def test_workflow_bounded_retry_exceeded_fails(
     )
 
     res = await svc.start_workflow(test_owner, wf.workflow_id)
+    assert res.status == WorkflowStatus.RUNNING.value
+    await drain_workflow_jobs(db_session_factory, svc)
+    res = await svc.get_workflow(test_owner, wf.workflow_id)
     assert res.status == WorkflowStatus.FAILED.value
     assert res.steps[0].status == StepStatus.FAILED.value
 
@@ -604,6 +673,7 @@ async def test_workflow_cancellation(
     workflow_service_instance: WorkflowService,
     policy_service: PolicyService,
     test_owner: uuid.UUID,
+    db_session_factory,
 ):
     # Step 1 ALLOW, Step 2 ASK
     await policy_service.create_policy(
@@ -636,6 +706,9 @@ async def test_workflow_cancellation(
 
     # Start -> paused at Step 2
     paused = await workflow_service_instance.start_workflow(test_owner, wf.workflow_id)
+    assert paused.status == WorkflowStatus.RUNNING.value
+    await drain_workflow_jobs(db_session_factory, workflow_service_instance)
+    paused = await workflow_service_instance.get_workflow(test_owner, wf.workflow_id)
     assert paused.status == WorkflowStatus.WAITING_APPROVAL.value
     assert paused.steps[0].status == StepStatus.COMPLETED.value
     assert paused.steps[1].status == StepStatus.WAITING.value
@@ -660,6 +733,7 @@ async def test_workflow_tool_step_execution(
     workflow_service_instance: WorkflowService,
     policy_service: PolicyService,
     test_owner: uuid.UUID,
+    db_session_factory,
 ):
     # Allow tool policy
     await policy_service.create_policy(
@@ -689,6 +763,9 @@ async def test_workflow_tool_step_execution(
     )
 
     result = await workflow_service_instance.start_workflow(test_owner, wf.workflow_id)
+    assert result.status == WorkflowStatus.RUNNING.value
+    await drain_workflow_jobs(db_session_factory, workflow_service_instance)
+    result = await workflow_service_instance.get_workflow(test_owner, wf.workflow_id)
     assert result.status == WorkflowStatus.COMPLETED.value
     assert result.steps[0].status == StepStatus.COMPLETED.value
     assert result.steps[0].output_payload.get("text") == "hello from workflow"
@@ -869,6 +946,11 @@ async def test_meeting_coordination_workflow_e2e(
     )
 
     completed_wf = await workflow_service.start_workflow(owner_user_a, wf.workflow_id)
+    assert completed_wf.status == WorkflowStatus.RUNNING.value
+    await drain_workflow_jobs(db_session_factory, workflow_service)
+    completed_wf = await workflow_service.get_workflow(
+        owner_user_a, wf.workflow_id
+    )
 
     # 6. Verification
     assert completed_wf.status == WorkflowStatus.COMPLETED.value
@@ -903,7 +985,9 @@ async def test_meeting_coordination_workflow_e2e(
 
 
 @pytest.mark.asyncio
-async def test_workflow_api_lifecycle(db_workflow_client: AsyncClient):
+async def test_workflow_api_lifecycle(
+    db_workflow_client: AsyncClient, db_workflow_app, db_session_factory
+):
     # 1. Create Workflow via API
     create_payload = {
         "workflow_type": "meeting_coordination",
@@ -935,11 +1019,19 @@ async def test_workflow_api_lifecycle(db_workflow_client: AsyncClient):
     assert get_resp.status_code == 200
     assert get_resp.json()["workflow_id"] == workflow_id
 
-    # 4. Start Workflow (Policy ALLOW for calendar needed, else ASK)
+    # 4. Start Workflow (advancement runs via jobs: the response is a fresh
+    # read, so it reports running; drain then re-read for the outcome)
     start_resp = await db_workflow_client.post(f"/workflows/{workflow_id}/start")
     assert start_resp.status_code == 200
     started_data = start_resp.json()
-    assert started_data["status"] in {"completed", "waiting_approval"}
+    assert started_data["status"] == "running"
+
+    await drain_workflow_jobs(
+        db_session_factory, db_workflow_app.state.workflow_service
+    )
+    get_after_start = await db_workflow_client.get(f"/workflows/{workflow_id}")
+    assert get_after_start.status_code == 200
+    assert get_after_start.json()["status"] in {"completed", "waiting_approval"}
 
     # 5. Cancel Workflow test
     create_resp2 = await db_workflow_client.post("/workflows", json=create_payload)
@@ -959,6 +1051,7 @@ async def test_workflow_approve_rejects_non_waiting_step_id(
     workflow_service_instance: WorkflowService,
     policy_service: PolicyService,
     test_owner: uuid.UUID,
+    db_session_factory,
 ):
     # Both steps ASK so the workflow is still WAITING_APPROVAL after step 1 completes.
     await policy_service.create_policy(
@@ -994,11 +1087,17 @@ async def test_workflow_approve_rejects_non_waiting_step_id(
 
     # Start -> paused at step 1
     w1 = await workflow_service_instance.start_workflow(test_owner, wf.workflow_id)
+    assert w1.status == WorkflowStatus.RUNNING.value
+    await drain_workflow_jobs(db_session_factory, workflow_service_instance)
+    w1 = await workflow_service_instance.get_workflow(test_owner, wf.workflow_id)
     assert w1.status == WorkflowStatus.WAITING_APPROVAL.value
     assert w1.steps[0].status == StepStatus.WAITING.value
 
     # Approve step 1 -> step 1 completes, step 2 pauses; workflow still WAITING_APPROVAL
     w2 = await workflow_service_instance.approve_workflow(test_owner, wf.workflow_id)
+    assert w2.status == WorkflowStatus.RUNNING.value
+    await drain_workflow_jobs(db_session_factory, workflow_service_instance)
+    w2 = await workflow_service_instance.get_workflow(test_owner, wf.workflow_id)
     assert w2.status == WorkflowStatus.WAITING_APPROVAL.value
     assert w2.steps[0].status == StepStatus.COMPLETED.value
     assert w2.steps[1].status == StepStatus.WAITING.value
@@ -1087,7 +1186,7 @@ async def _a4_allow_all(policy_service: PolicyService, owner_id: uuid.UUID) -> N
     )
 
 
-async def _a4_park_remote_step(wf_svc: WorkflowService, owner_id: uuid.UUID):
+async def _a4_park_remote_step(db_session_factory, wf_svc: WorkflowService, owner_id: uuid.UUID):
     wf = await wf_svc.create_workflow(
         owner_id,
         workflow_type="a4_test",
@@ -1101,6 +1200,9 @@ async def _a4_park_remote_step(wf_svc: WorkflowService, owner_id: uuid.UUID):
         ],
     )
     parked = await wf_svc.start_workflow(owner_id, wf.workflow_id)
+    assert parked.status == WorkflowStatus.RUNNING.value
+    await drain_workflow_jobs(db_session_factory, wf_svc)
+    parked = await wf_svc.get_workflow(owner_id, wf.workflow_id)
     assert parked.status == WorkflowStatus.WAITING_REMOTE.value
     remote_step = next(s for s in parked.steps if s.step_number == 1)
     assert remote_step.status == StepStatus.WAITING.value
@@ -1149,7 +1251,7 @@ async def test_a4_callback_bus_resume(
     bus.register_task_completion_callback(wf_svc.handle_task_completion)
 
     await _a4_allow_all(policy_service, test_owner)
-    parked, parked_task_id = await _a4_park_remote_step(wf_svc, test_owner)
+    parked, parked_task_id = await _a4_park_remote_step(db_session_factory, wf_svc, test_owner)
     assert parked_task_id == task_id
 
     payload = {"available": True, "slot": "10:00"}
@@ -1158,6 +1260,7 @@ async def test_a4_callback_bus_resume(
         if asyncio.iscoroutine(res):
             await res
 
+    await drain_workflow_jobs(db_session_factory, wf_svc)
     final = await wf_svc.get_workflow(test_owner, parked.workflow_id)
     assert final.status == WorkflowStatus.COMPLETED.value
     resumed = next(s for s in final.steps if s.step_number == 1)
@@ -1177,7 +1280,7 @@ async def test_a4_deny_on_resume_not_ingested(
         memory_manager=memory_manager,
     )
     await _a4_allow_all(policy_service, test_owner)
-    parked, parked_task_id = await _a4_park_remote_step(wf_svc, test_owner)
+    parked, parked_task_id = await _a4_park_remote_step(db_session_factory, wf_svc, test_owner)
 
     await _a4_set_step_policy(policy_service, test_owner, "DENY")
 
@@ -1205,7 +1308,7 @@ async def test_a4_ask_on_resume_parks_without_ingesting(
         memory_manager=memory_manager,
     )
     await _a4_allow_all(policy_service, test_owner)
-    parked, parked_task_id = await _a4_park_remote_step(wf_svc, test_owner)
+    parked, parked_task_id = await _a4_park_remote_step(db_session_factory, wf_svc, test_owner)
 
     await _a4_set_step_policy(policy_service, test_owner, "ASK")
 
@@ -1218,3 +1321,61 @@ async def test_a4_ask_on_resume_parks_without_ingesting(
     assert not resumed.output_payload
     assert final.status == WorkflowStatus.WAITING_APPROVAL.value
     assert "a4-ask-secret" not in str(final.context_data or {})
+
+
+# -----------------------------------------------------------------------------
+# A5: ADVANCE VIA JOBS, NOT INLINE IN REQUESTS
+# -----------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a5_kill_mid_workflow_recovers_and_completes(
+    workflow_service_instance: WorkflowService,
+    policy_service: PolicyService,
+    test_owner: uuid.UUID,
+    db_session_factory,
+):
+    """A workflow abandoned mid-RUNNING (worker died before draining) resumes
+    via crash recovery and completes once jobs drain (A5 acceptance)."""
+    await policy_service.create_policy(
+        test_owner,
+        requester_agent_id="nexus:self",
+        data_category="*",
+        action="*",
+        purpose="a5_kill_test",
+        decision="ALLOW",
+    )
+    steps = [
+        WorkflowStepSpec(
+            step_type="availability_check",
+            input_payload={"candidate_slots": ["10:00", "14:00"]},
+        ),
+        WorkflowStepSpec(
+            step_type="candidate_selection",
+            input_payload={"user_slots": ["14:00"], "remote_slots": ["14:00"]},
+        ),
+    ]
+    wf = await workflow_service_instance.create_workflow(
+        test_owner,
+        workflow_type="a5_kill_test",
+        purpose="a5_kill_test",
+        steps=steps,
+    )
+
+    # Start only enqueues advancement: the request returns a RUNNING read.
+    started = await workflow_service_instance.start_workflow(
+        test_owner, wf.workflow_id
+    )
+    assert started.status == WorkflowStatus.RUNNING.value
+
+    # Simulate the worker dying mid-RUNNING: abandon the drain entirely. The
+    # workflow sits RUNNING with its advance job still queued.
+    recovered = await workflow_service_instance.recover_interrupted_workflows()
+    assert wf.workflow_id in recovered
+
+    # Drain whatever jobs remain (the orphaned start job is a harmless no-op
+    # against the recovered workflow) and assert completion.
+    await drain_workflow_jobs(db_session_factory, workflow_service_instance)
+    final = await workflow_service_instance.get_workflow(test_owner, wf.workflow_id)
+    assert final.status == WorkflowStatus.COMPLETED.value
+    assert all(s.status == StepStatus.COMPLETED.value for s in final.steps)

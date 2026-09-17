@@ -18,6 +18,7 @@ from typing import Any, Sequence
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.jobs.queue import JobQueue
 from app.policy.engine import EvaluationRequest
 from app.policy.models import PolicyDecision
 from app.policy.service import PolicyService
@@ -230,7 +231,20 @@ class WorkflowService:
             purpose=wf.purpose,
         )
 
-        return await self.advance_workflow(workflow_id)
+        await self._enqueue_advance(workflow_id)
+        return await self._get_wf(workflow_id)
+
+    async def _enqueue_advance(self, workflow_id: uuid.UUID) -> None:
+        """Defer advancement to the jobs worker instead of running it inline.
+
+        The payload shape matches the ``workflow.advance`` handler registered
+        in ``app/main.py`` verbatim. The worker (or the test drain helper)
+        runs :meth:`advance_workflow`; a crash between here and the job run
+        leaves a RUNNING workflow that ``recover_interrupted_workflows``
+        resumes, so advancement survives restarts.
+        """
+        queue = JobQueue(session_factory=self._session_factory)
+        await queue.enqueue("workflow.advance", {"workflow_id": str(workflow_id)})
 
     async def advance_workflow(self, workflow_id: uuid.UUID) -> Workflow:
         """Advance the workflow through pending steps until completion, pause, or failure."""
@@ -608,7 +622,8 @@ class WorkflowService:
             detail="Owner approved step",
         )
 
-        return await self.advance_workflow(workflow_id)
+        await self._enqueue_advance(workflow_id)
+        return await self._get_wf(workflow_id)
 
     # --- Cancellation ---------------------------------------------------------
 
@@ -751,7 +766,8 @@ class WorkflowService:
                 status=WorkflowStatus.RUNNING.value,
                 detail="A2A task response arrived",
             )
-            return await self.advance_workflow(workflow_id)
+            await self._enqueue_advance(workflow_id)
+            return await self._get_wf(workflow_id)
         return None
 
     # --- Crash Recovery -------------------------------------------------------
