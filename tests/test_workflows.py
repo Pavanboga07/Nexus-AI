@@ -1291,6 +1291,110 @@ async def test_a4_ask_on_resume_parks_without_ingesting(
 
 
 # -----------------------------------------------------------------------------
+# A6: RECOVERY SCOPE, EXPIRY-ON-TOUCH, TRUNCATION
+# -----------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a6_recovery_returns_abandoned_waiting_approval(
+    workflow_service_instance: WorkflowService,
+    policy_service: PolicyService,
+    test_owner: uuid.UUID,
+    db_session_factory,
+):
+    await policy_service.create_policy(
+        test_owner,
+        requester_agent_id="nexus:self",
+        data_category="calendar",
+        action="read",
+        purpose="a6_recovery",
+        decision="ASK",
+    )
+    wf = await workflow_service_instance.create_workflow(
+        test_owner,
+        workflow_type="a6_test",
+        purpose="a6_recovery",
+        steps=[WorkflowStepSpec(step_type="availability_check")],
+    )
+    started = await workflow_service_instance.start_workflow(
+        test_owner, wf.workflow_id
+    )
+    assert started.status == WorkflowStatus.RUNNING.value
+    await drain_workflow_jobs(db_session_factory, workflow_service_instance)
+    parked = await workflow_service_instance.get_workflow(
+        test_owner, wf.workflow_id
+    )
+    assert parked.status == WorkflowStatus.WAITING_APPROVAL.value
+    recovered = await workflow_service_instance.recover_interrupted_workflows()
+    assert wf.workflow_id in recovered
+
+
+@pytest.mark.asyncio
+async def test_a6_expired_waiting_surfaces_expired_on_get(
+    workflow_service_instance: WorkflowService,
+    policy_service: PolicyService,
+    test_owner: uuid.UUID,
+    db_session_factory,
+):
+    await policy_service.create_policy(
+        test_owner,
+        requester_agent_id="nexus:self",
+        data_category="calendar",
+        action="read",
+        purpose="a6_expiry_touch",
+        decision="ASK",
+    )
+    wf = await workflow_service_instance.create_workflow(
+        test_owner,
+        workflow_type="a6_test",
+        purpose="a6_expiry_touch",
+        steps=[WorkflowStepSpec(step_type="availability_check")],
+    )
+    started = await workflow_service_instance.start_workflow(
+        test_owner, wf.workflow_id
+    )
+    assert started.status == WorkflowStatus.RUNNING.value
+    await drain_workflow_jobs(db_session_factory, workflow_service_instance)
+    parked = await workflow_service_instance.get_workflow(
+        test_owner, wf.workflow_id
+    )
+    assert parked.status == WorkflowStatus.WAITING_APPROVAL.value
+    async with db_session_factory() as session:
+        wf_db = await workflow_service_instance._repo.get(session, wf.workflow_id)
+        assert wf_db is not None
+        wf_db.expires_at = datetime.now(timezone.utc) - timedelta(seconds=10)
+        await session.commit()
+    fetched = await workflow_service_instance.get_workflow(
+        test_owner, wf.workflow_id
+    )
+    assert fetched.status == WorkflowStatus.EXPIRED.value
+
+
+@pytest.mark.asyncio
+async def test_a6_fail_reason_truncated_to_250(
+    workflow_service_instance: WorkflowService,
+    test_owner: uuid.UUID,
+    db_session_factory,
+):
+    wf = await workflow_service_instance.create_workflow(
+        test_owner,
+        workflow_type="a6_test",
+        purpose="a6_truncation",
+        steps=[WorkflowStepSpec(step_type="availability_check")],
+    )
+    long_reason = "x" * 500
+    async with db_session_factory() as session:
+        await workflow_service_instance._fail_step_and_workflow(
+            session, wf.workflow_id, wf.steps[0].step_id, long_reason
+        )
+        await session.commit()
+    fetched = await workflow_service_instance._get_wf(wf.workflow_id)
+    assert fetched.failure_reason is not None
+    assert len(fetched.failure_reason) <= 250
+    assert len(fetched.steps[0].failure_reason or "") <= 250
+
+
+# -----------------------------------------------------------------------------
 # A5: ADVANCE VIA JOBS, NOT INLINE IN REQUESTS
 # -----------------------------------------------------------------------------
 

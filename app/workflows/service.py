@@ -176,9 +176,11 @@ class WorkflowService:
     ) -> Workflow:
         async with self._session_factory() as session:
             wf = await self._repo.get_for_owner(session, owner_id, workflow_id)
-        if wf is None:
-            raise WorkflowNotFoundError(f"Workflow {workflow_id} not found.")
-        return wf
+            if wf is None:
+                raise WorkflowNotFoundError(f"Workflow {workflow_id} not found.")
+            if await self._expire_if_overdue(session, wf):
+                return wf
+            return wf
 
     async def list_workflows(
         self,
@@ -187,9 +189,12 @@ class WorkflowService:
         limit: int = 100,
     ) -> Sequence[Workflow]:
         async with self._session_factory() as session:
-            return await self._repo.list_for_owner(
+            wfs = await self._repo.list_for_owner(
                 session, owner_id, status=status, limit=limit
             )
+            for wf in wfs:
+                await self._expire_if_overdue(session, wf)
+            return wfs
 
     # --- Lifecycle Operations -------------------------------------------------
 
@@ -246,6 +251,39 @@ class WorkflowService:
         queue = JobQueue(session_factory=self._session_factory)
         await queue.enqueue("workflow.advance", {"workflow_id": str(workflow_id)})
 
+    async def _expire_if_overdue(self, session: AsyncSession, wf: Workflow) -> bool:
+        """Expire the workflow if past its TTL. Returns True when expired.
+
+        Performs check + expire + commit + audit. Callers return early when
+        True. Uses the same predicate and audit event as advance_workflow.
+        """
+        now = _utcnow()
+        if wf.expires_at <= now and wf.status in {
+            WorkflowStatus.RUNNING.value,
+            WorkflowStatus.PENDING.value,
+            WorkflowStatus.WAITING_APPROVAL.value,
+            WorkflowStatus.WAITING_REMOTE.value,
+        }:
+            wf.status = WorkflowStatus.EXPIRED.value
+            wf.failure_reason = "Workflow expired"
+            for s in wf.steps or []:
+                if s.status in {StepStatus.PENDING.value, StepStatus.WAITING.value}:
+                    s.status = StepStatus.SKIPPED.value
+                elif s.status == StepStatus.RUNNING.value:
+                    s.status = StepStatus.FAILED.value
+                    s.failure_reason = "parent expired while step running"
+                    s.completed_at = now
+            await session.commit()
+            self._audit(
+                "workflow_expired",
+                workflow_id=wf.workflow_id,
+                owner_id=wf.owner_id,
+                status=wf.status,
+                purpose=wf.purpose,
+            )
+            return True
+        return False
+
     async def advance_workflow(self, workflow_id: uuid.UUID) -> Workflow:
         """Advance the workflow through pending steps until completion, pause, or failure."""
         while True:
@@ -255,25 +293,7 @@ class WorkflowService:
                     raise WorkflowNotFoundError(f"Workflow {workflow_id} not found.")
 
                 now = _utcnow()
-                if wf.expires_at <= now and wf.status in {
-                    WorkflowStatus.RUNNING.value,
-                    WorkflowStatus.PENDING.value,
-                    WorkflowStatus.WAITING_APPROVAL.value,
-                    WorkflowStatus.WAITING_REMOTE.value,
-                }:
-                    wf.status = WorkflowStatus.EXPIRED.value
-                    wf.failure_reason = "Workflow expired"
-                    for s in wf.steps:
-                        if s.status in {StepStatus.PENDING.value, StepStatus.WAITING.value}:
-                            s.status = StepStatus.SKIPPED.value
-                    await session.commit()
-                    self._audit(
-                        "workflow_expired",
-                        workflow_id=workflow_id,
-                        owner_id=wf.owner_id,
-                        status=wf.status,
-                        purpose=wf.purpose,
-                    )
+                if await self._expire_if_overdue(session, wf):
                     return wf
 
                 if wf.status != WorkflowStatus.RUNNING.value:
@@ -329,6 +349,18 @@ class WorkflowService:
                         )
                         return wf
 
+                    return wf
+
+                # Sequentiality guard: another advancer may already own a
+                # RUNNING step (handler runs outside the transaction). If so,
+                # roll back the pending-step lock and return.
+                running_steps = (
+                    await self._step_repo.find_running_steps_for_workflow(
+                        session, workflow_id
+                    )
+                )
+                if running_steps:
+                    await session.rollback()
                     return wf
 
                 # Mark step RUNNING durably
@@ -437,6 +469,13 @@ class WorkflowService:
                     step_db = await self._step_repo.get(session, step.step_id)
                     wf_db = await self._repo.get(session, workflow_id)
                     if step_db and wf_db:
+                        if wf_db.status in {
+                            WorkflowStatus.COMPLETED.value,
+                            WorkflowStatus.FAILED.value,
+                            WorkflowStatus.CANCELLED.value,
+                            WorkflowStatus.EXPIRED.value,
+                        }:
+                            return await self._get_wf(workflow_id)
                         step_db.status = StepStatus.COMPLETED.value
                         step_db.completed_at = _utcnow()
                         step_db.output_payload = res.output_payload
@@ -531,15 +570,16 @@ class WorkflowService:
         reason: str,
     ) -> None:
         now = _utcnow()
+        truncated = reason[:250] if isinstance(reason, str) else reason
         step = await self._step_repo.get(session, step_id)
         if step:
             step.status = StepStatus.FAILED.value
-            step.failure_reason = reason
+            step.failure_reason = truncated
             step.completed_at = now
         wf = await self._repo.get(session, workflow_id)
         if wf:
             wf.status = WorkflowStatus.FAILED.value
-            wf.failure_reason = reason
+            wf.failure_reason = truncated
             wf.completed_at = now
 
     async def _get_wf(self, workflow_id: uuid.UUID) -> Workflow:
@@ -560,6 +600,9 @@ class WorkflowService:
             wf = await self._repo.get_for_owner(session, owner_id, workflow_id)
             if wf is None:
                 raise WorkflowNotFoundError(f"Workflow {workflow_id} not found.")
+
+            if await self._expire_if_overdue(session, wf):
+                return wf
 
             if wf.status != WorkflowStatus.WAITING_APPROVAL.value:
                 raise WorkflowConflictError(
@@ -648,12 +691,17 @@ class WorkflowService:
 
             wf.status = WorkflowStatus.CANCELLED.value
             wf.failure_reason = reason
-            wf.completed_at = _utcnow()
+            now = _utcnow()
+            wf.completed_at = now
 
             steps = await self._step_repo.list_for_workflow(session, workflow_id)
             for s in steps:
                 if s.status in {StepStatus.PENDING.value, StepStatus.WAITING.value}:
                     s.status = StepStatus.SKIPPED.value
+                elif s.status == StepStatus.RUNNING.value:
+                    s.status = StepStatus.FAILED.value
+                    s.failure_reason = "parent cancelled while step running"
+                    s.completed_at = now
 
             await session.commit()
 
@@ -743,6 +791,14 @@ class WorkflowService:
                     )
                     return await self._get_wf(workflow_id)
 
+            if wf.status in {
+                WorkflowStatus.COMPLETED.value,
+                WorkflowStatus.FAILED.value,
+                WorkflowStatus.CANCELLED.value,
+                WorkflowStatus.EXPIRED.value,
+            }:
+                return await self._get_wf(workflow_id)
+
             step.status = StepStatus.COMPLETED.value
             step.completed_at = _utcnow()
             step.output_payload = response_payload
@@ -773,7 +829,7 @@ class WorkflowService:
     # --- Crash Recovery -------------------------------------------------------
 
     async def recover_interrupted_workflows(self) -> list[uuid.UUID]:
-        """Recovers workflows left in RUNNING status after a process crash."""
+        """Recovers workflows left in a non-terminal state after a crash."""
         recovered_ids: list[uuid.UUID] = []
         async with self._session_factory() as session:
             running_wfs = await self._repo.find_interrupted_workflows(session)
@@ -785,8 +841,24 @@ class WorkflowService:
                     wf.status = WorkflowStatus.EXPIRED.value
                     wf.failure_reason = "Expired while interrupted"
                     for s in wf.steps:
-                        if s.status in {StepStatus.PENDING.value, StepStatus.RUNNING.value}:
+                        if s.status in {
+                            StepStatus.PENDING.value,
+                            StepStatus.WAITING.value,
+                        }:
                             s.status = StepStatus.SKIPPED.value
+                        elif s.status == StepStatus.RUNNING.value:
+                            s.status = StepStatus.FAILED.value
+                            s.failure_reason = (
+                                "parent expired while step running"
+                            )
+                            s.completed_at = now
+                    self._audit(
+                        "workflow_expired",
+                        workflow_id=wf.workflow_id,
+                        owner_id=wf.owner_id,
+                        status=wf.status,
+                        purpose=wf.purpose,
+                    )
                     continue
 
                 # Find steps left in RUNNING
@@ -806,7 +878,12 @@ class WorkflowService:
                             f"Step {cs.step_number} failed after crash recovery"
                         )
 
-                if wf.status == WorkflowStatus.RUNNING.value:
+                if wf.status in {
+                    WorkflowStatus.RUNNING.value,
+                    WorkflowStatus.WAITING_APPROVAL.value,
+                    WorkflowStatus.WAITING_REMOTE.value,
+                    WorkflowStatus.PENDING.value,
+                }:
                     recovered_ids.append(wf.workflow_id)
 
             await session.commit()

@@ -90,11 +90,20 @@ class WorkflowRepository:
     async def find_interrupted_workflows(
         self, session: AsyncSession
     ) -> Sequence[Workflow]:
-        """Find workflows left in RUNNING status (e.g. after crash)."""
+        """Find workflows left in a non-terminal state (e.g. after crash)."""
         result = await session.execute(
             select(Workflow)
             .options(selectinload(Workflow.steps))
-            .where(Workflow.status == WorkflowStatus.RUNNING.value)
+            .where(
+                Workflow.status.in_(
+                    [
+                        WorkflowStatus.RUNNING.value,
+                        WorkflowStatus.WAITING_APPROVAL.value,
+                        WorkflowStatus.WAITING_REMOTE.value,
+                        WorkflowStatus.PENDING.value,
+                    ]
+                )
+            )
             .order_by(Workflow.created_at.asc())
         )
         return result.scalars().all()
