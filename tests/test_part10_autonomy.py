@@ -624,3 +624,95 @@ async def test_autonomy_http_api_endpoints(db_autonomy_client: AsyncClient):
     res = await db_autonomy_client.get(f"/autonomy/runs/{run_id}/audit")
     assert res.status_code == 200
     assert "audits" in res.json()
+
+
+# =============================================================================
+# A1. AUTONOMY -> WORKFLOW CALL ARITY
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_a1_cancel_run_cancels_linked_workflow(
+    autonomy_service_instance: AutonomyService,
+    db_session_factory,
+    test_owner: uuid.UUID,
+):
+    """Cancelling a workflow-backed run must cancel the linked workflow (A1)."""
+    from app.schemas.workflows import WorkflowStepSpec
+    from app.workflows.models import WorkflowStatus
+
+    wf_service: WorkflowService = autonomy_service_instance._workflows
+    wf = await wf_service.create_workflow(
+        test_owner,
+        workflow_type="meeting_coordination",
+        purpose="a1_cancel_link",
+        steps=[
+            WorkflowStepSpec(
+                step_type="availability_check",
+                input_payload={"date": "tomorrow", "candidate_slots": ["10:00"]},
+            ),
+        ],
+    )
+
+    run = await autonomy_service_instance.create_run(
+        test_owner,
+        goal="A1 linked cancellation",
+        execute_immediately=False,
+    )
+    async with db_session_factory() as session:
+        db_run = await autonomy_service_instance._run_repo.get(
+            session, run.id, test_owner
+        )
+        assert db_run is not None
+        db_run.workflow_id = wf.workflow_id
+        await session.commit()
+
+    cancelled = await autonomy_service_instance.cancel_run(test_owner, run.id)
+    assert cancelled.status == RunStatus.CANCELLED.value
+
+    wf_after = await wf_service.get_workflow(test_owner, wf.workflow_id)
+    assert wf_after.status == WorkflowStatus.CANCELLED.value
+
+
+@pytest.mark.asyncio
+async def test_a1_reconcile_workflow_backed_run_terminal(
+    autonomy_service_instance: AutonomyService,
+    db_session_factory,
+    test_owner: uuid.UUID,
+):
+    """reconcile_on_startup must map a terminal linked workflow onto the run (A1)."""
+    from app.schemas.workflows import WorkflowStepSpec
+
+    wf_service: WorkflowService = autonomy_service_instance._workflows
+    wf = await wf_service.create_workflow(
+        test_owner,
+        workflow_type="meeting_coordination",
+        purpose="a1_reconcile_terminal",
+        steps=[
+            WorkflowStepSpec(
+                step_type="availability_check",
+                input_payload={"date": "tomorrow", "candidate_slots": ["10:00"]},
+            ),
+        ],
+    )
+    # Drive the linked workflow to a terminal state.
+    await wf_service.cancel_workflow(test_owner, wf.workflow_id)
+
+    async with db_session_factory() as session:
+        linked_run = AutonomyRun(
+            owner_id=test_owner,
+            workflow_id=wf.workflow_id,
+            goal="A1 reconcile terminal workflow",
+            status=RunStatus.RUNNING.value,
+            started_at=datetime.now(timezone.utc),
+        )
+        session.add(linked_run)
+        await session.commit()
+        run_id = linked_run.id
+
+    reconciled = await autonomy_service_instance.reconcile_on_startup()
+    assert reconciled >= 1
+
+    recovered = await autonomy_service_instance.get_run(test_owner, run_id)
+    assert recovered.status == RunStatus.FAILED.value
+    assert "cancelled" in (recovered.failure_reason or "").lower()

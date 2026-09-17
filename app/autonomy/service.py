@@ -288,7 +288,7 @@ class AutonomyService:
             # If linked workflow exists, cancel it
             if run.workflow_id and self._workflows:
                 try:
-                    await self._workflows.cancel_workflow(run.workflow_id)
+                    await self._workflows.cancel_workflow(run.owner_id, run.workflow_id)
                 except Exception as exc:
                     logger.warning("Failed to cancel linked workflow %s: %s", run.workflow_id, exc)
 
@@ -339,7 +339,7 @@ class AutonomyService:
                 # Check if it was waiting on a linked workflow
                 if r.workflow_id and self._workflows:
                     try:
-                        wf = await self._workflows.get_workflow(r.workflow_id)
+                        wf = await self._workflows.get_workflow(r.owner_id, r.workflow_id)
                         if wf.status == "completed":
                             r.status = RunStatus.COMPLETED.value
                             r.completed_at = now
