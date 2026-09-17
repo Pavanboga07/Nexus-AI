@@ -440,6 +440,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.workflow_service = workflow_service
     app.state.workflows_ok = workflow_service is not None
 
+    # Resume path: remote A2A responses arrive on the bus, so the workflow
+    # engine must listen for them — otherwise WAITING_REMOTE steps never wake.
+    if a2a_service is not None and workflow_service is not None:
+        a2a_service.register_task_completion_callback(
+            workflow_service.handle_task_completion
+        )
+
     # Crash recovery: workflows paused mid-run (awaiting a remote task or an
     # approval) are left in a non-terminal state by a process restart. Resume
     # them now, mirroring autonomy's reconcile_on_startup(). Without this,

@@ -670,6 +670,64 @@ class WorkflowService:
             if not wf:
                 return None
 
+            # Re-evaluate the step's own policy before ingesting anything: the
+            # authorization that allowed the delegation may have changed while
+            # the remote task was in flight. Same call the advance loop uses.
+            handler = self._registry.get(step.step_type)
+            if handler is not None:
+                resume_ctx = WorkflowStepContext(
+                    owner_id=wf.owner_id,
+                    workflow_id=step.workflow_id,
+                    step_id=step.step_id,
+                    step_number=step.step_number,
+                    purpose=wf.purpose,
+                    workflow_context=dict(wf.context_data or {}),
+                    memory_manager=self._memory_manager,
+                    policy_service=self._policy,
+                    tool_service=self._tool_service,
+                    a2a_service=self._a2a_service,
+                    identity_service=self._identity_service,
+                )
+                resume_eval = await self._policy.evaluate(
+                    wf.owner_id,
+                    handler.get_evaluation_request(
+                        resume_ctx, step.input_payload or {}
+                    ),
+                )
+                if resume_eval.decision is PolicyDecision.DENY:
+                    reason = f"Policy DENY on resume: {resume_eval.reason}"[:250]
+                    await self._fail_step_and_workflow(
+                        session, workflow_id, step.step_id, reason
+                    )
+                    await session.commit()
+                    self._audit(
+                        "step_failed",
+                        workflow_id=workflow_id,
+                        step_id=step.step_id,
+                        task_id=task_id,
+                        owner_id=wf.owner_id,
+                        purpose=wf.purpose,
+                        policy_decision="DENY",
+                        detail=resume_eval.reason,
+                    )
+                    return await self._get_wf(workflow_id)
+                if resume_eval.decision is PolicyDecision.ASK:
+                    step.status = StepStatus.WAITING.value
+                    step.failure_reason = "Waiting for owner approval"
+                    wf.status = WorkflowStatus.WAITING_APPROVAL.value
+                    await session.commit()
+                    self._audit(
+                        "workflow_waiting",
+                        workflow_id=workflow_id,
+                        step_id=step.step_id,
+                        task_id=task_id,
+                        owner_id=wf.owner_id,
+                        purpose=wf.purpose,
+                        policy_decision="ASK",
+                        detail="Awaiting owner approval",
+                    )
+                    return await self._get_wf(workflow_id)
+
             step.status = StepStatus.COMPLETED.value
             step.completed_at = _utcnow()
             step.output_payload = response_payload

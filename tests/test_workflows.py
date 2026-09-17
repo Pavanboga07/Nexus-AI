@@ -1020,3 +1020,201 @@ async def test_workflow_approve_rejects_non_waiting_step_id(
     assert after_step.output_payload == before_output
     assert after_step.completed_at == before_completed_at
     assert after.status == WorkflowStatus.WAITING_APPROVAL.value
+
+
+# -----------------------------------------------------------------------------
+# A4: RESUME PATH — CALLBACK WIRING + POLICY ON RESUME
+# -----------------------------------------------------------------------------
+
+
+class A4RemoteWaitStepHandler(BaseWorkflowStepHandler):
+    """Parks the workflow in WAITING_REMOTE like a real async A2A delegation."""
+
+    step_type = "a4_remote_wait"
+    data_category = "a2a"
+    action = "delegate_task"
+
+    def __init__(self, task_id: str):
+        self._task_id = task_id
+
+    async def execute(
+        self, context: WorkflowStepContext, input_payload: dict[str, Any]
+    ) -> StepResult:
+        return StepResult(
+            status=StepStatus.WAITING,
+            output_payload={},
+            task_id=self._task_id,
+        )
+
+
+def _a4_registry(task_id: str) -> WorkflowStepHandlerRegistry:
+    registry = WorkflowStepHandlerRegistry()
+    registry.register(A4RemoteWaitStepHandler(task_id))
+    registry.register(AvailabilityStepHandler())
+    return registry
+
+
+def _a4_bus(
+    db_session_factory, policy_service, memory_manager
+) -> A2AService:
+    return A2AService(
+        session_factory=db_session_factory,
+        identity_service=None,
+        policy_service=policy_service,
+        memory_manager=memory_manager,
+        transport=LoopbackTransport(),
+        rate_limiter=SlidingWindowRateLimiter(60),
+        allow_local_endpoints=True,
+    )
+
+
+async def _a4_allow_all(policy_service: PolicyService, owner_id: uuid.UUID) -> None:
+    await policy_service.create_policy(
+        owner_id,
+        requester_agent_id="nexus:self",
+        data_category="a2a",
+        action="delegate_task",
+        purpose="a4_resume",
+        decision="ALLOW",
+    )
+    await policy_service.create_policy(
+        owner_id,
+        requester_agent_id="nexus:self",
+        data_category="calendar",
+        action="read",
+        purpose="a4_resume",
+        decision="ALLOW",
+    )
+
+
+async def _a4_park_remote_step(wf_svc: WorkflowService, owner_id: uuid.UUID):
+    wf = await wf_svc.create_workflow(
+        owner_id,
+        workflow_type="a4_test",
+        purpose="a4_resume",
+        steps=[
+            WorkflowStepSpec(step_type="a4_remote_wait"),
+            WorkflowStepSpec(
+                step_type="availability_check",
+                input_payload={"candidate_slots": ["10:00"]},
+            ),
+        ],
+    )
+    parked = await wf_svc.start_workflow(owner_id, wf.workflow_id)
+    assert parked.status == WorkflowStatus.WAITING_REMOTE.value
+    remote_step = next(s for s in parked.steps if s.step_number == 1)
+    assert remote_step.status == StepStatus.WAITING.value
+    assert remote_step.task_id
+    return parked, remote_step.task_id
+
+
+async def _a4_set_step_policy(
+    policy_service: PolicyService, owner_id: uuid.UUID, decision: str
+) -> None:
+    for p in await policy_service.list_policies(owner_id):
+        if p.data_category == "a2a" and p.action == "delegate_task":
+            await policy_service.delete_policy(owner_id, p.id)
+    await policy_service.create_policy(
+        owner_id,
+        requester_agent_id="nexus:self",
+        data_category="a2a",
+        action="delegate_task",
+        purpose="a4_resume",
+        decision=decision,
+    )
+
+
+def test_a4_workflow_resume_callback_wired_in_main():
+    import inspect
+
+    from app import main as main_module
+
+    src = inspect.getsource(main_module.lifespan)
+    assert "register_task_completion_callback" in src
+    assert "workflow_service.handle_task_completion" in src
+
+
+@pytest.mark.asyncio
+async def test_a4_callback_bus_resume(
+    db_session_factory, policy_service, memory_manager, test_owner: uuid.UUID
+):
+    task_id = f"a4-task-{uuid.uuid4().hex[:8]}"
+    wf_svc = WorkflowService(
+        session_factory=db_session_factory,
+        policy_service=policy_service,
+        registry=_a4_registry(task_id),
+        memory_manager=memory_manager,
+    )
+    bus = _a4_bus(db_session_factory, policy_service, memory_manager)
+    bus.register_task_completion_callback(wf_svc.handle_task_completion)
+
+    await _a4_allow_all(policy_service, test_owner)
+    parked, parked_task_id = await _a4_park_remote_step(wf_svc, test_owner)
+    assert parked_task_id == task_id
+
+    payload = {"available": True, "slot": "10:00"}
+    for cb in list(bus._task_completion_callbacks):
+        res = cb(parked_task_id, payload)
+        if asyncio.iscoroutine(res):
+            await res
+
+    final = await wf_svc.get_workflow(test_owner, parked.workflow_id)
+    assert final.status == WorkflowStatus.COMPLETED.value
+    resumed = next(s for s in final.steps if s.step_number == 1)
+    assert resumed.status == StepStatus.COMPLETED.value
+    assert resumed.output_payload == payload
+
+
+@pytest.mark.asyncio
+async def test_a4_deny_on_resume_not_ingested(
+    db_session_factory, policy_service, memory_manager, test_owner: uuid.UUID
+):
+    task_id = f"a4-task-{uuid.uuid4().hex[:8]}"
+    wf_svc = WorkflowService(
+        session_factory=db_session_factory,
+        policy_service=policy_service,
+        registry=_a4_registry(task_id),
+        memory_manager=memory_manager,
+    )
+    await _a4_allow_all(policy_service, test_owner)
+    parked, parked_task_id = await _a4_park_remote_step(wf_svc, test_owner)
+
+    await _a4_set_step_policy(policy_service, test_owner, "DENY")
+
+    payload = {"available": True, "slot": "10:00", "marker": "a4-deny-secret"}
+    await wf_svc.handle_task_completion(parked_task_id, payload)
+
+    final = await wf_svc.get_workflow(test_owner, parked.workflow_id)
+    resumed = next(s for s in final.steps if s.step_number == 1)
+    assert resumed.status != StepStatus.COMPLETED.value
+    assert not resumed.output_payload
+    ctx = final.context_data or {}
+    assert "a4-deny-secret" not in str(ctx)
+    assert final.status == WorkflowStatus.FAILED.value
+
+
+@pytest.mark.asyncio
+async def test_a4_ask_on_resume_parks_without_ingesting(
+    db_session_factory, policy_service, memory_manager, test_owner: uuid.UUID
+):
+    task_id = f"a4-task-{uuid.uuid4().hex[:8]}"
+    wf_svc = WorkflowService(
+        session_factory=db_session_factory,
+        policy_service=policy_service,
+        registry=_a4_registry(task_id),
+        memory_manager=memory_manager,
+    )
+    await _a4_allow_all(policy_service, test_owner)
+    parked, parked_task_id = await _a4_park_remote_step(wf_svc, test_owner)
+
+    await _a4_set_step_policy(policy_service, test_owner, "ASK")
+
+    payload = {"available": True, "slot": "10:00", "marker": "a4-ask-secret"}
+    await wf_svc.handle_task_completion(parked_task_id, payload)
+
+    final = await wf_svc.get_workflow(test_owner, parked.workflow_id)
+    resumed = next(s for s in final.steps if s.step_number == 1)
+    assert resumed.status == StepStatus.WAITING.value
+    assert not resumed.output_payload
+    assert final.status == WorkflowStatus.WAITING_APPROVAL.value
+    assert "a4-ask-secret" not in str(final.context_data or {})
