@@ -417,7 +417,7 @@ def test_handle_inbound_response_has_a_single_definition():
 
 
 def test_autonomy_executor_calls_existing_workflow_methods():
-    """run_workflow() never existed; advance_workflow() does."""
+    """run_workflow() never existed; start_workflow() is the entry point (A2)."""
     from app.autonomy import executor as executor_module
     from app.workflows.service import WorkflowService
 
@@ -425,9 +425,9 @@ def test_autonomy_executor_calls_existing_workflow_methods():
     assert "self._workflow_service.run_workflow(" not in src, (
         "AutonomyExecutor calls a nonexistent method"
     )
-    assert "self._workflow_service.advance_workflow(" in src
+    assert "self._workflow_service.start_workflow(" in src
 
-    for name in ("create_workflow", "advance_workflow"):
+    for name in ("create_workflow", "start_workflow", "advance_workflow"):
         assert hasattr(WorkflowService, name), f"WorkflowService.{name} missing"
 
 
