@@ -716,3 +716,203 @@ async def test_a1_reconcile_workflow_backed_run_terminal(
     recovered = await autonomy_service_instance.get_run(test_owner, run_id)
     assert recovered.status == RunStatus.FAILED.value
     assert "cancelled" in (recovered.failure_reason or "").lower()
+
+
+# =============================================================================
+# A2. CREATE_WORKFLOW USES REGISTERED STEP TYPES + start_workflow
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_a2_create_workflow_advances_with_registered_step_type(
+    autonomy_service_instance: AutonomyService,
+    db_session_factory,
+    policy_service: PolicyService,
+    test_owner: uuid.UUID,
+):
+    """CREATE_WORKFLOW must use a registered step type and really start (A2)."""
+    from app.autonomy.models import AutonomyRun
+    from app.autonomy.planner import PlanAction
+    from app.workflows.models import WorkflowStatus
+
+    await policy_service.create_policy(
+        test_owner,
+        requester_agent_id="nexus:self",
+        data_category="*",
+        action="*",
+        purpose="tool_test",
+        decision="ALLOW",
+    )
+
+    executor = autonomy_service_instance._executor
+    config = await autonomy_service_instance.get_config(test_owner)
+    action = PlanAction(
+        step_number=1,
+        action_type=ActionType.CREATE_WORKFLOW.value,
+        purpose="tool_test",
+        proposed_action="Run echo tool via workflow",
+        payload={
+            "workflow_type": "tool_workflow",
+            "tool_name": "echo",
+            "arguments": {"text": "hello from autonomy"},
+            "purpose": "tool_test",
+        },
+    )
+    shell = await autonomy_service_instance.create_run(
+        test_owner,
+        goal="A2 workflow start",
+        execute_immediately=False,
+    )
+    async with db_session_factory() as session:
+        run = await session.get(AutonomyRun, shell.id)
+        assert run is not None
+        result = await executor.execute_step(
+            session,
+            owner_id=test_owner,
+            run=run,
+            config=config,
+            action=action,
+            is_pre_approved=True,
+        )
+        assert run.workflow_id is not None
+
+    wf_service: WorkflowService = autonomy_service_instance._workflows
+    wf = await wf_service.get_workflow(test_owner, run.workflow_id)
+    assert wf.steps[0].step_type == "tool_execution"
+    assert wf.status != WorkflowStatus.PENDING.value
+    assert result.status == RunStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_a2_create_workflow_unmappable_payload_fails_closed(
+    autonomy_service_instance: AutonomyService,
+    db_session_factory,
+    test_owner: uuid.UUID,
+):
+    """A CREATE_WORKFLOW payload mapping to no step type must fail closed (A2)."""
+    from app.autonomy.models import AutonomyRun
+    from app.autonomy.planner import PlanAction
+
+    executor = autonomy_service_instance._executor
+    config = await autonomy_service_instance.get_config(test_owner)
+    action = PlanAction(
+        step_number=1,
+        action_type=ActionType.CREATE_WORKFLOW.value,
+        purpose="a2_unmappable",
+        proposed_action="Unmappable workflow",
+        payload={"workflow_type": "mystery", "note": "maps to nothing"},
+    )
+    shell = await autonomy_service_instance.create_run(
+        test_owner,
+        goal="A2 unmappable payload",
+        execute_immediately=False,
+    )
+    async with db_session_factory() as session:
+        run = await session.get(AutonomyRun, shell.id)
+        assert run is not None
+        result = await executor.execute_step(
+            session,
+            owner_id=test_owner,
+            run=run,
+            config=config,
+            action=action,
+            is_pre_approved=True,
+        )
+        assert run.workflow_id is None
+
+    assert result.status == RunStatus.FAILED
+    assert "no registered step type" in (result.step_output or {}).get("error", "")
+
+
+@pytest.mark.asyncio
+async def test_a2_create_workflow_propagates_waiting_remote(
+    autonomy_service_instance: AutonomyService,
+    db_session_factory,
+    policy_service: PolicyService,
+    memory_manager,
+    test_owner: uuid.UUID,
+):
+    """A workflow parked in WAITING_REMOTE must park the run too (A2)."""
+    from app.autonomy.executor import AutonomyExecutor
+    from app.autonomy.models import AutonomyRun
+    from app.autonomy.planner import PlanAction
+    from app.tools.builtin import BUILTIN_TOOLS
+    from app.tools.registry import ToolRegistry
+    from app.tools.service import ToolService
+    from app.workflows.models import WorkflowStatus
+
+    await policy_service.create_policy(
+        test_owner,
+        requester_agent_id="nexus:self",
+        data_category="a2a",
+        action="delegate_task",
+        purpose="remote_task",
+        decision="ALLOW",
+    )
+
+    class _PendingA2A:
+        async def delegate_task(self, owner_id, **kwargs):
+            return {"task_id": "task-pending-1", "status": "pending", "payload": {}}
+
+    tool_registry = ToolRegistry()
+    for tool in BUILTIN_TOOLS:
+        tool_registry.register(tool)
+    tool_service = ToolService(
+        registry=tool_registry,
+        policy_service=policy_service,
+        session_factory=db_session_factory,
+        timeout_seconds=2.0,
+        max_result_bytes=4096,
+    )
+    wf_service = WorkflowService(
+        session_factory=db_session_factory,
+        policy_service=policy_service,
+        tool_service=tool_service,
+        a2a_service=_PendingA2A(),
+        memory_manager=memory_manager,
+        default_ttl_seconds=3600,
+        max_step_attempts=3,
+    )
+    executor = AutonomyExecutor(
+        decision_engine=autonomy_service_instance._decision_engine,
+        workflow_service=wf_service,
+        a2a_service=_PendingA2A(),
+        tool_service=tool_service,
+        memory_manager=memory_manager,
+    )
+    config = await autonomy_service_instance.get_config(test_owner)
+    action = PlanAction(
+        step_number=1,
+        action_type=ActionType.CREATE_WORKFLOW.value,
+        purpose="remote_task",
+        proposed_action="Delegate availability check to peer",
+        payload={
+            "workflow_type": "remote_workflow",
+            "target_agent_id": "nexus:ed25519:peer",
+            "recipient_agent_id": "nexus:ed25519:peer",
+            "task_type": "availability_check",
+            "purpose": "remote_task",
+        },
+    )
+    shell = await autonomy_service_instance.create_run(
+        test_owner,
+        goal="A2 remote propagation",
+        execute_immediately=False,
+    )
+    async with db_session_factory() as session:
+        run = await session.get(AutonomyRun, shell.id)
+        assert run is not None
+        result = await executor.execute_step(
+            session,
+            owner_id=test_owner,
+            run=run,
+            config=config,
+            action=action,
+            is_pre_approved=True,
+        )
+        assert run.workflow_id is not None
+        assert run.status == RunStatus.WAITING_REMOTE.value
+
+    assert result.status == RunStatus.WAITING_REMOTE
+    wf = await wf_service.get_workflow(test_owner, run.workflow_id)
+    assert wf.status == WorkflowStatus.WAITING_REMOTE.value

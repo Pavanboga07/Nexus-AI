@@ -248,13 +248,17 @@ class AutonomyExecutor:
 
             elif act_norm == ActionType.CREATE_WORKFLOW.value:
                 wf_type = action.payload.get("workflow_type", "autonomous_workflow")
-                steps_spec = [
-                    WorkflowStepSpec(
-                        step_number=1,
-                        step_type="generic_action",
-                        input_payload=action.payload,
+                payload = action.payload or {}
+                if payload.get("target_agent_id") or payload.get("recipient_agent_id"):
+                    step_type: str = "a2a_task"
+                elif payload.get("tool_name"):
+                    step_type = "tool_execution"
+                else:
+                    return ExecutionResult(
+                        status=RunStatus.FAILED,
+                        step_output={"error": "CREATE_WORKFLOW payload maps to no registered step type"},
                     )
-                ]
+                steps_spec = [WorkflowStepSpec(step_type=step_type, input_payload=payload)]
                 if self._workflow_service:
                     wf = await self._workflow_service.create_workflow(
                         owner_id,
@@ -263,12 +267,10 @@ class AutonomyExecutor:
                         steps=steps_spec,
                     )
                     run.workflow_id = wf.workflow_id
-                    # WorkflowService exposes advance_workflow(), not the
-                    # never-implemented run_workflow(); create_workflow() only
-                    # persists the PENDING record, so the first step must be
-                    # advanced explicitly.
-                    wf_run = await self._workflow_service.advance_workflow(
-                        wf.workflow_id
+                    # create_workflow() only persists the PENDING record, so the
+                    # workflow must be started explicitly to advance the first step.
+                    wf_run = await self._workflow_service.start_workflow(
+                        owner_id, wf.workflow_id
                     )
                     step_output = {
                         "workflow_id": str(wf.workflow_id),
@@ -278,6 +280,12 @@ class AutonomyExecutor:
                         run.status = RunStatus.WAITING_APPROVAL.value
                         return ExecutionResult(
                             status=RunStatus.WAITING_APPROVAL,
+                            step_output=step_output,
+                        )
+                    if wf_run.status == "waiting_remote":
+                        run.status = RunStatus.WAITING_REMOTE.value
+                        return ExecutionResult(
+                            status=RunStatus.WAITING_REMOTE,
                             step_output=step_output,
                         )
                 else:
