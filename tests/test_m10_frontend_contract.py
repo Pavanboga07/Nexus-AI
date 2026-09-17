@@ -190,15 +190,23 @@ def test_orchestration_loader_maps_run_id_and_state_to_pending() -> None:
 
 
 def test_orchestration_loader_categorizes_waiting_and_done_buckets() -> None:
-    """Non-pending orchestration states must land in waiting/done buckets.
+    """Non-pending orchestration states must land in waitingOutbox/recentlyDecided.
 
-    B1's spec requires mapping non-pending states (waiting_remote/executing
-    -> waiting-on-others; terminal -> done) so B5's outbox/done panes have
-    data to consume, but the loader only filtered pending. Waiting runs must
-    land in the waiting bucket (not pending, not dropped) and terminal runs in
-    the done bucket. State strings are taken from the backend enum, not
-    guessed, and compared case-insensitively like the pending predicate.
+    B1's spec requires mapping non-pending states (WAITING_REMOTE/EXECUTING
+    -> waiting-on-others; COMPLETED/FAILED/CANCELLED/EXPIRED -> terminal) so
+    B5's outbox/decided panes have data to consume, but the loader only
+    filtered pending. Waiting-on-others runs must land in `waitingOutbox`
+    (not pending, not dropped) and terminal runs in `recentlyDecided`.
+    State strings are taken from the backend enum, not guessed, and compared
+    case-insensitively like the pending predicate.
+
+    Static check (this repo has no frontend unit runner): every behavior
+    below is asserted as guarded structure — state-set literal contents,
+    predicate-to-set delegation, and guard-to-push adjacency — never as a
+    bare "state string appears somewhere in the file".
     """
+    import re
+
     from app.orchestration.models import OrchestrationState
 
     source = (SRC / "lib" / "api" / "approvals.ts").read_text(encoding="utf-8")
@@ -217,44 +225,230 @@ def test_orchestration_loader_categorizes_waiting_and_done_buckets() -> None:
         "has terminal runs without changing what Inbox reads."
     )
 
-    # Waiting bucket: exactly the non-terminal in-flight states.
-    for state in (
+    # The loader's buckets use the same names end to end (no waiting/done
+    # aliases alongside waitingOutbox/recentlyDecided).
+    buckets = re.search(
+        r"export\s+type\s+OrchestrationBuckets\s*=\s*\{(.*?)\};",
+        source,
+        re.S,
+    )
+    assert buckets, "OrchestrationBuckets is gone from approvals.ts"
+    bucket_body = buckets.group(1)
+    assert re.search(r"\bpending\s*:\s*ApprovalItem\[\]", bucket_body), (
+        "OrchestrationBuckets must keep the `pending` bucket the fan-out reads."
+    )
+    assert re.search(r"\bwaitingOutbox\s*:\s*ApprovalItem\[\]", bucket_body), (
+        "OrchestrationBuckets must name the waiting bucket `waitingOutbox`, "
+        "matching ApprovalsResult — a `waiting` alias splits the scheme."
+    )
+    assert re.search(r"\brecentlyDecided\s*:\s*ApprovalItem\[\]", bucket_body), (
+        "OrchestrationBuckets must name the terminal bucket "
+        "`recentlyDecided`, matching ApprovalsResult — a `done` alias splits "
+        "the scheme."
+    )
+    assert not re.search(r"(?<![A-Za-z])waiting\s*:", bucket_body), (
+        "OrchestrationBuckets still declares a `waiting` alias; use "
+        "`waitingOutbox` everywhere."
+    )
+    assert not re.search(r"(?<![A-Za-z])done\s*:", bucket_body), (
+        "OrchestrationBuckets still declares a `done` alias; use "
+        "`recentlyDecided` everywhere."
+    )
+
+    # waitingOutbox state set holds exactly the non-terminal in-flight
+    # states — verified against the enum, with no extras and none missing.
+    # A bare substring check would pass if a state merely appeared in a
+    # comment; matching the Set literal contents proves the loader reads it.
+    m_waiting_states = re.search(
+        r"ORCHESTRATION_WAITING_OUTBOX_STATES\s*=\s*new\s+Set\(\[(.*?)\]\)",
+        source,
+        re.S,
+    )
+    assert m_waiting_states, (
+        "ORCHESTRATION_WAITING_OUTBOX_STATES set is gone from approvals.ts"
+    )
+    waiting_states = set(re.findall(r'"([A-Z_]+)"', m_waiting_states.group(1)))
+    assert waiting_states == {
         OrchestrationState.WAITING_REMOTE.value,
         OrchestrationState.EXECUTING.value,
-    ):
-        assert state in source, (
-            f"the waiting bucket must recognise {state!r} "
-            "(app/orchestration/models.py OrchestrationState)."
-        )
+    }, (
+        "the waitingOutbox set must hold exactly WAITING_REMOTE + EXECUTING "
+        f"(app/orchestration/models.py OrchestrationState); got "
+        f"{sorted(waiting_states)}"
+    )
 
-    # Done bucket: exactly the terminal states, verified against the enum.
-    for state in (
+    # recentlyDecided set holds exactly the terminal states.
+    m_decided_states = re.search(
+        r"ORCHESTRATION_RECENTLY_DECIDED_STATES\s*=\s*new\s+Set\(\[(.*?)\]\)",
+        source,
+        re.S,
+    )
+    assert m_decided_states, (
+        "ORCHESTRATION_RECENTLY_DECIDED_STATES set is gone from approvals.ts"
+    )
+    decided_states = set(re.findall(r'"([A-Z_]+)"', m_decided_states.group(1)))
+    assert decided_states == {
         OrchestrationState.COMPLETED.value,
         OrchestrationState.FAILED.value,
         OrchestrationState.CANCELLED.value,
         OrchestrationState.EXPIRED.value,
-    ):
-        assert state in source, (
-            f"the done bucket must recognise terminal {state!r} "
-            "(app/orchestration/models.py OrchestrationState)."
-        )
+    }, (
+        "the recentlyDecided set must hold exactly the terminal states "
+        f"(COMPLETED/FAILED/CANCELLED/EXPIRED); got {sorted(decided_states)}"
+    )
 
-    assert "toUpperCase" in source or "toLowerCase" in source, (
-        "orchestration states are UPPERCASE — bucketing must compare "
+    # Each predicate delegates to its own set (and only that set): this is
+    # the link between the literals above and the branches below. A swapped
+    # predicate would route every waiting run into the decided bucket.
+    m_waiting_pred = re.search(
+        r"function\s+isWaitingOutbox\([^)]*\)[^{]*\{(.*?)\n\}",
+        source,
+        re.S,
+    )
+    assert m_waiting_pred, "isWaitingOutbox predicate is gone from approvals.ts"
+    assert "ORCHESTRATION_WAITING_OUTBOX_STATES" in m_waiting_pred.group(1), (
+        "isWaitingOutbox must read ORCHESTRATION_WAITING_OUTBOX_STATES."
+    )
+    assert "ORCHESTRATION_RECENTLY_DECIDED_STATES" not in m_waiting_pred.group(
+        1
+    ), "isWaitingOutbox is cross-wired to the terminal set."
+    assert (
+        "toUpperCase" in m_waiting_pred.group(1)
+        or "toLowerCase" in m_waiting_pred.group(1)
+    ), (
+        "orchestration states are UPPERCASE — isWaitingOutbox must compare "
         "case-insensitively like the pending predicate."
     )
 
-    # listApprovals must actually populate both buckets.
+    m_decided_pred = re.search(
+        r"function\s+isRecentlyDecided\([^)]*\)[^{]*\{(.*?)\n\}",
+        source,
+        re.S,
+    )
+    assert m_decided_pred, (
+        "isRecentlyDecided predicate is gone from approvals.ts"
+    )
+    assert "ORCHESTRATION_RECENTLY_DECIDED_STATES" in m_decided_pred.group(1), (
+        "isRecentlyDecided must read ORCHESTRATION_RECENTLY_DECIDED_STATES."
+    )
+    assert "ORCHESTRATION_WAITING_OUTBOX_STATES" not in m_decided_pred.group(
+        1
+    ), "isRecentlyDecided is cross-wired to the waiting set."
+    assert (
+        "toUpperCase" in m_decided_pred.group(1)
+        or "toLowerCase" in m_decided_pred.group(1)
+    ), (
+        "orchestration states are UPPERCASE — isRecentlyDecided must compare "
+        "case-insensitively like the pending predicate."
+    )
+
+    # The old predicate names are gone: one scheme, not two.
+    assert "isOrchestrationWaiting" not in source, (
+        "isOrchestrationWaiting survives; the unified predicate is "
+        "isWaitingOutbox."
+    )
+    assert "isOrchestrationTerminal" not in source, (
+        "isOrchestrationTerminal survives; the unified predicate is "
+        "isRecentlyDecided."
+    )
+
+    # Loader branches: each push call site sits inside its own guard. This is
+    # the behavior under test — a waiting-state run lands in waitingOutbox, a
+    # terminal run in recentlyDecided, never crossed and never pending. The
+    # regexes span the guard and the push so a push moved under the wrong
+    # branch (or into no branch) fails, where a substring check would pass.
+    loader_at = source.find("async function loadOrchestration")
+    assert loader_at != -1, "loadOrchestration is gone from approvals.ts"
+    loader_end = source.find("\n}\n", loader_at)
+    loader = source[
+        loader_at : loader_end if loader_end != -1 else loader_at + 3000
+    ]
+    assert re.search(
+        r"if\s*\(\s*isOrchestrationPending\s*\(\s*r\.state\s*\)\s*\)"
+        r"\s*pending\.push\s*\(",
+        loader,
+    ), (
+        "loadOrchestration must push into `pending` only under the "
+        "isOrchestrationPending(r.state) guard."
+    )
+    assert re.search(
+        r"else\s+if\s*\(\s*isWaitingOutbox\s*\(\s*r\.state\s*\)\s*\)"
+        r"[^\n]*\n\s*waitingOutbox\.push\s*\(",
+        loader,
+    ), (
+        "loadOrchestration must push into `waitingOutbox` only under the "
+        "isWaitingOutbox(r.state) guard — the push call site must sit inside "
+        "the waiting-states branch."
+    )
+    assert re.search(
+        r"else\s+if\s*\(\s*isRecentlyDecided\s*\(\s*r\.state\s*\)\s*\)"
+        r"[^\n]*\n\s*recentlyDecided\.push\s*\(",
+        loader,
+    ), (
+        "loadOrchestration must push into `recentlyDecided` only under the "
+        "isRecentlyDecided(r.state) guard — the push call site must sit "
+        "inside the terminal-states branch."
+    )
+    # Old bucket pushes are gone from the loader.
+    assert "waiting.push" not in loader, (
+        "loadOrchestration still pushes into a `waiting` alias; the unified "
+        "bucket is `waitingOutbox`."
+    )
+    assert "done.push" not in loader, (
+        "loadOrchestration still pushes into a `done` alias; the unified "
+        "bucket is `recentlyDecided`."
+    )
+    # The deliberate silent drop is documented where it happens, naming the
+    # ignored intermediate states and pointing at B5 (see approvals.ts loop).
+    for dropped in (
+        OrchestrationState.UNDERSTANDING.value,
+        OrchestrationState.PLANNING.value,
+        OrchestrationState.AUTHORIZING.value,
+        OrchestrationState.PROCESSING_RESULT.value,
+    ):
+        assert dropped in loader, (
+            f"the silent-drop comment must name ignored {dropped!r} "
+            "(app/orchestration/models.py OrchestrationState) so a reader "
+            "knows the fall-through is deliberate."
+        )
+    assert "B5" in loader, (
+        "the silent-drop comment must point at B5, which owns whether any "
+        "ignored intermediate state ever needs a surface."
+    )
+
+    # listApprovals must actually populate both buckets under the same names
+    # (declaring the fields without filling them leaves B5 with nothing to
+    # consume). Assert the wiring, not the mere presence of the words.
     fanout = source.find("export async function listApprovals")
     assert fanout != -1, "listApprovals is gone from approvals.ts"
     fanout_block = source[fanout : fanout + 4000]
-    assert "waitingOutbox" in fanout_block, (
-        "listApprovals must populate `waitingOutbox`; declaring the field "
-        "without filling it leaves B5 with nothing to consume."
+    assert re.search(
+        r"waitingOutbox\s*=\s*orchestration\.items\.waitingOutbox",
+        fanout_block,
+    ), (
+        "listApprovals must assign orchestration.items.waitingOutbox into "
+        "`waitingOutbox`; declaring the field without filling it leaves B5 "
+        "with nothing to consume."
     )
-    assert "recentlyDecided" in fanout_block, (
-        "listApprovals must populate `recentlyDecided`; declaring the field "
-        "without filling it leaves B5 with nothing to consume."
+    assert re.search(
+        r"recentlyDecided\s*=\s*orchestration\.items\.recentlyDecided",
+        fanout_block,
+    ), (
+        "listApprovals must assign orchestration.items.recentlyDecided into "
+        "`recentlyDecided`; declaring the field without filling it leaves B5 "
+        "with nothing to consume."
+    )
+    assert not re.search(
+        r"orchestration\.items\.waiting(?![A-Za-z])", fanout_block
+    ), (
+        "listApprovals still reads the old orchestration.items.waiting alias; "
+        "the unified field is waitingOutbox."
+    )
+    assert not re.search(
+        r"orchestration\.items\.done(?![A-Za-z])", fanout_block
+    ), (
+        "listApprovals still reads the old orchestration.items.done alias; "
+        "the unified field is recentlyDecided."
     )
 
 

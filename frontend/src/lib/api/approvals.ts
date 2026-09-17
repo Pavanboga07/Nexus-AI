@@ -173,8 +173,9 @@ async function loadAutonomy(): Promise<ApprovalItem[]> {
  * OrchestrationRunResponse carries `state`, not `status`, and its values are
  * the OrchestrationState enum (UPPERCASE: WAITING_APPROVAL, ...), unlike the
  * lowercase statuses of the other three sources. Compared case-insensitively
- * so either spelling surfaces instead of silently emptying the source. Other
- * states are bucketed below for the outbox/done panes, not dropped.
+ * so either spelling surfaces instead of silently emptying the source. The
+ * other actionable states are bucketed below into waitingOutbox /
+ * recentlyDecided; pure intermediates fall through deliberately (see loop).
  */
 function isOrchestrationPending(state: unknown): boolean {
   return (
@@ -183,27 +184,27 @@ function isOrchestrationPending(state: unknown): boolean {
 }
 
 /** In-flight states that mean "waiting on others, not on you". */
-const ORCHESTRATION_WAITING_STATES = new Set(["WAITING_REMOTE", "EXECUTING"]);
+const ORCHESTRATION_WAITING_OUTBOX_STATES = new Set(["WAITING_REMOTE", "EXECUTING"]);
 
-function isOrchestrationWaiting(state: unknown): boolean {
+function isWaitingOutbox(state: unknown): boolean {
   return (
     typeof state === "string" &&
-    ORCHESTRATION_WAITING_STATES.has(state.toUpperCase())
+    ORCHESTRATION_WAITING_OUTBOX_STATES.has(state.toUpperCase())
   );
 }
 
 /** Terminal states, exactly as in OrchestrationState (models.py). */
-const ORCHESTRATION_TERMINAL_STATES = new Set([
+const ORCHESTRATION_RECENTLY_DECIDED_STATES = new Set([
   "COMPLETED",
   "FAILED",
   "CANCELLED",
   "EXPIRED",
 ]);
 
-function isOrchestrationTerminal(state: unknown): boolean {
+function isRecentlyDecided(state: unknown): boolean {
   return (
     typeof state === "string" &&
-    ORCHESTRATION_TERMINAL_STATES.has(state.toUpperCase())
+    ORCHESTRATION_RECENTLY_DECIDED_STATES.has(state.toUpperCase())
   );
 }
 
@@ -228,23 +229,32 @@ function toOrchestrationItem(r: any): ApprovalItem {
 
 export type OrchestrationBuckets = {
   pending: ApprovalItem[];
-  waiting: ApprovalItem[];
-  done: ApprovalItem[];
+  waitingOutbox: ApprovalItem[];
+  recentlyDecided: ApprovalItem[];
 };
 
 async function loadOrchestration(): Promise<OrchestrationBuckets> {
   const data = await apiFetch<{ runs?: any[] }>("/orchestration/runs");
   const runs = data.runs ?? (Array.isArray(data) ? (data as any[]) : []);
   const pending: ApprovalItem[] = [];
-  const waiting: ApprovalItem[] = [];
-  const done: ApprovalItem[] = [];
+  const waitingOutbox: ApprovalItem[] = [];
+  const recentlyDecided: ApprovalItem[] = [];
   for (const r of runs) {
     if (isOrchestrationPending(r.state)) pending.push(toOrchestrationItem(r));
-    else if (isOrchestrationWaiting(r.state))
-      waiting.push(toOrchestrationItem(r));
-    else if (isOrchestrationTerminal(r.state)) done.push(toOrchestrationItem(r));
+    else if (isWaitingOutbox(r.state))
+      waitingOutbox.push(toOrchestrationItem(r));
+    else if (isRecentlyDecided(r.state))
+      recentlyDecided.push(toOrchestrationItem(r));
+    // Deliberate silent drop (B1 follow-up, for B5): any other
+    // OrchestrationState — UNDERSTANDING, RESOLVING_TARGET,
+    // WAITING_FOR_DISCOVERY, WAITING_FOR_TRUST, PLANNING, AUTHORIZING,
+    // PROCESSING_RESULT (exact names per app/orchestration/models.py
+    // OrchestrationState) — falls through here with no push. These are
+    // non-actionable intermediate states with no consumer: not pending (no
+    // human decision needed), not waiting-on-others, not terminal. B5 owns
+    // whether any of them ever needs a surface.
   }
-  return { pending, waiting, done };
+  return { pending, waitingOutbox, recentlyDecided };
 }
 
 export async function listApprovals(): Promise<ApprovalsResult> {
@@ -271,8 +281,8 @@ export async function listApprovals(): Promise<ApprovalsResult> {
 
   if ("items" in orchestration) {
     items.push(...orchestration.items.pending);
-    waitingOutbox = orchestration.items.waiting;
-    recentlyDecided = orchestration.items.done;
+    waitingOutbox = orchestration.items.waitingOutbox;
+    recentlyDecided = orchestration.items.recentlyDecided;
   } else {
     unavailable.push({ source: "orchestration", reason: orchestration.error });
   }
