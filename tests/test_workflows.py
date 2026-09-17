@@ -1665,3 +1665,318 @@ async def test_a7_policy_denied_a2a_send_is_non_transient_no_retry(
     assert final.steps[0].attempt_count == 0
     # 1 direct call above + exactly 1 workflow attempt (no retries).
     assert fake.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_a7_transient_a2a_send_retries_then_succeeds(
+    workflow_service_instance: WorkflowService,
+    policy_service: PolicyService,
+    test_owner: uuid.UUID,
+    db_session_factory,
+):
+    """A coded transient A2A send retries instead of failing immediately.
+
+    Pair to ``test_a7_policy_denied_a2a_send_is_non_transient_no_retry``:
+    TRANSPORT_ERROR / RATE_LIMITED classify transient (``is_transient`` True),
+    the step retries, then succeeds.
+    """
+    from app.a2a.errors import A2AError, A2AErrorCode
+    from app.workflows.handlers import A2ATaskStepHandler
+
+    class TransientA2A:
+        def __init__(self, err: A2AError) -> None:
+            self.err = err
+            self.calls = 0
+
+        async def delegate_task(self, owner_id, **kwargs):
+            self.calls += 1
+            raise self.err
+
+    handler = A2ATaskStepHandler()
+    for code in (A2AErrorCode.TRANSPORT_ERROR, A2AErrorCode.RATE_LIMITED):
+        err = A2AError(code, "transient blip: try again")
+        fake_once = TransientA2A(err)
+        direct_ctx = WorkflowStepContext(
+            owner_id=test_owner,
+            workflow_id=uuid.uuid4(),
+            step_id=uuid.uuid4(),
+            step_number=1,
+            purpose="a7_retry_transient",
+            workflow_context={},
+            a2a_service=fake_once,
+        )
+        direct = await handler.execute(
+            direct_ctx,
+            {
+                "recipient_agent_id": "nexus:ed25519:99999999999999999999999999999999",
+                "task_type": "availability_check",
+            },
+        )
+        assert direct.status == StepStatus.FAILED
+        assert direct.is_transient is True
+
+    # End-to-end: flaky transport fails twice, then succeeds.
+    class FlakyTransportThenSuccess:
+        def __init__(self, failures_before_success: int = 2) -> None:
+            self.calls = 0
+            self.failures_before_success = failures_before_success
+
+        async def delegate_task(self, owner_id, **kwargs):
+            self.calls += 1
+            if self.calls <= self.failures_before_success:
+                raise A2AError(
+                    A2AErrorCode.TRANSPORT_ERROR,
+                    f"transport blip #{self.calls}",
+                )
+            return {
+                "task_id": "a7-transient-ok",
+                "status": "completed",
+                "payload": {"available": True},
+            }
+
+    flaky = FlakyTransportThenSuccess(failures_before_success=2)
+    await policy_service.create_policy(
+        test_owner,
+        requester_agent_id="nexus:self",
+        data_category="a2a",
+        action="delegate_task",
+        purpose="a7_retry_transient",
+        decision="ALLOW",
+    )
+    workflow_service_instance._a2a_service = flaky
+    wf = await workflow_service_instance.create_workflow(
+        test_owner,
+        workflow_type="a7_test",
+        purpose="a7_retry_transient",
+        steps=[
+            WorkflowStepSpec(
+                step_type="a2a_task",
+                input_payload={
+                    "recipient_agent_id": "nexus:ed25519:99999999999999999999999999999999",
+                    "task_type": "availability_check",
+                },
+            ),
+        ],
+    )
+    started = await workflow_service_instance.start_workflow(
+        test_owner, wf.workflow_id
+    )
+    assert started.status == WorkflowStatus.RUNNING.value
+    await drain_workflow_jobs(db_session_factory, workflow_service_instance)
+    final = await workflow_service_instance.get_workflow(
+        test_owner, wf.workflow_id
+    )
+    assert final.status == WorkflowStatus.COMPLETED.value
+    assert final.steps[0].status == StepStatus.COMPLETED.value
+    # Two transient failures consumed retries, third attempt succeeded.
+    assert final.steps[0].attempt_count == 2
+    assert flaky.calls == 3
+    assert final.steps[0].output_payload.get("available") is True
+
+
+@pytest.mark.asyncio
+async def test_a7_prior_step_field_resolves_newest_selected_slot(
+    workflow_service_instance: WorkflowService,
+    policy_service: PolicyService,
+    test_owner: uuid.UUID,
+    db_session_factory,
+):
+    """Chained flow: downstream A2A step receives newest prior selected_slot.
+
+    ``test_a7_same_type_steps_retrievable_by_number`` covers numbered
+    ``get_step_output`` reads; this covers ``_prior_step_field`` newest-first
+    forwarding into the A2A handler.
+    """
+    from app.workflows.handlers import A2ATaskStepHandler, _prior_step_field
+
+    # Direct: newest-first wins even when the legacy alias is stale.
+    stale_wc = {
+        "step_1": {"selected_slot": "10:00"},
+        "step_2": {"selected_slot": "14:00"},
+        "candidate_selection": {"selected_slot": "10:00-stale"},
+        "selected_slot": "10:00-stale",
+    }
+    assert _prior_step_field(stale_wc, 3, "selected_slot") == "14:00"
+
+    class CaptureA2A:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.last_payload: dict = {}
+
+        async def delegate_task(self, owner_id, **kwargs):
+            self.calls += 1
+            self.last_payload = dict(kwargs.get("payload") or {})
+            return {
+                "task_id": "a7-slot-ok",
+                "status": "completed",
+                "payload": {"ok": True},
+            }
+
+    capture_direct = CaptureA2A()
+    handler = A2ATaskStepHandler()
+    direct_ctx = WorkflowStepContext(
+        owner_id=test_owner,
+        workflow_id=uuid.uuid4(),
+        step_id=uuid.uuid4(),
+        step_number=3,
+        purpose="a7_slot",
+        workflow_context=dict(stale_wc),
+        a2a_service=capture_direct,
+    )
+    direct = await handler.execute(
+        direct_ctx,
+        {
+            "recipient_agent_id": "nexus:ed25519:99999999999999999999999999999999",
+            "task_type": "meeting_proposal",
+            "payload": {},
+        },
+    )
+    assert direct.status == StepStatus.COMPLETED
+    assert capture_direct.last_payload.get("proposed_time") == "14:00"
+
+    # End-to-end chained flow: two selections, then a proposal without a time.
+    await policy_service.create_policy(
+        test_owner,
+        requester_agent_id="nexus:self",
+        data_category="scheduling",
+        action="compute",
+        purpose="a7_slot",
+        decision="ALLOW",
+    )
+    await policy_service.create_policy(
+        test_owner,
+        requester_agent_id="nexus:self",
+        data_category="a2a",
+        action="delegate_task",
+        purpose="a7_slot",
+        decision="ALLOW",
+    )
+    capture_flow = CaptureA2A()
+    workflow_service_instance._a2a_service = capture_flow
+    wf = await workflow_service_instance.create_workflow(
+        test_owner,
+        workflow_type="a7_test",
+        purpose="a7_slot",
+        steps=[
+            WorkflowStepSpec(
+                step_type="candidate_selection",
+                input_payload={
+                    "user_slots": ["10:00"],
+                    "remote_slots": ["10:00"],
+                },
+            ),
+            WorkflowStepSpec(
+                step_type="candidate_selection",
+                input_payload={
+                    "user_slots": ["14:00"],
+                    "remote_slots": ["14:00"],
+                },
+            ),
+            WorkflowStepSpec(
+                step_type="a2a_task",
+                input_payload={
+                    "recipient_agent_id": "nexus:ed25519:99999999999999999999999999999999",
+                    "task_type": "meeting_proposal",
+                    "payload": {"topic": "sync"},
+                },
+            ),
+        ],
+    )
+    started = await workflow_service_instance.start_workflow(
+        test_owner, wf.workflow_id
+    )
+    assert started.status == WorkflowStatus.RUNNING.value
+    await drain_workflow_jobs(db_session_factory, workflow_service_instance)
+    final = await workflow_service_instance.get_workflow(
+        test_owner, wf.workflow_id
+    )
+    assert final.status == WorkflowStatus.COMPLETED.value
+    assert final.steps[0].output_payload.get("selected_slot") == "10:00"
+    assert final.steps[1].output_payload.get("selected_slot") == "14:00"
+    # Newest prior slot (step_2), not the older step_1 slot.
+    assert capture_flow.last_payload.get("proposed_time") == "14:00"
+
+
+@pytest.mark.asyncio
+async def test_a7_uncoded_tool_error_is_non_transient_no_retry(
+    workflow_service_instance: WorkflowService,
+    policy_service: PolicyService,
+    test_owner: uuid.UUID,
+    db_session_factory,
+):
+    """An uncoded tool crash fails non-transient: no 3x retry.
+
+    Pair to the A2A non-transient test: the uncoded Exception path in
+    ``ToolStepHandler`` (like the advance-loop generic path) sets
+    ``is_transient`` False, so the workflow fails with attempt_count 0.
+    """
+    from app.workflows.handlers import ToolStepHandler
+
+    class ExplodingToolService:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(self, owner_id, invocation):
+            self.calls += 1
+            raise RuntimeError("boom: uncoded tool crash")
+
+    fake = ExplodingToolService()
+    handler = ToolStepHandler()
+    direct_ctx = WorkflowStepContext(
+        owner_id=test_owner,
+        workflow_id=uuid.uuid4(),
+        step_id=uuid.uuid4(),
+        step_number=1,
+        purpose="a7_tool_retry",
+        workflow_context={},
+        tool_service=fake,
+    )
+    direct = await handler.execute(
+        direct_ctx,
+        {
+            "tool_name": "echo",
+            "arguments": {"text": "hi"},
+            "purpose": "a7_tool_retry",
+        },
+    )
+    assert direct.status == StepStatus.FAILED
+    assert direct.is_transient is False
+
+    # End-to-end: the workflow fails immediately without consuming retries.
+    await policy_service.create_policy(
+        test_owner,
+        requester_agent_id="nexus:self",
+        data_category="tools",
+        action="execute",
+        purpose="a7_tool_retry",
+        decision="ALLOW",
+    )
+    workflow_service_instance._tool_service = fake
+    wf = await workflow_service_instance.create_workflow(
+        test_owner,
+        workflow_type="a7_test",
+        purpose="a7_tool_retry",
+        steps=[
+            WorkflowStepSpec(
+                step_type="tool_execution",
+                input_payload={
+                    "tool_name": "echo",
+                    "arguments": {"text": "hi"},
+                    "purpose": "a7_tool_retry",
+                },
+            ),
+        ],
+    )
+    started = await workflow_service_instance.start_workflow(
+        test_owner, wf.workflow_id
+    )
+    assert started.status == WorkflowStatus.RUNNING.value
+    await drain_workflow_jobs(db_session_factory, workflow_service_instance)
+    final = await workflow_service_instance.get_workflow(
+        test_owner, wf.workflow_id
+    )
+    assert final.status == WorkflowStatus.FAILED.value
+    assert final.steps[0].status == StepStatus.FAILED.value
+    assert final.steps[0].attempt_count == 0
+    # 1 direct call above + exactly 1 workflow attempt (no retries).
+    assert fake.calls == 2
