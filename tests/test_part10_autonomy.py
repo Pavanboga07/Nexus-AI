@@ -56,7 +56,7 @@ from app.tools.builtin import BUILTIN_TOOLS
 from app.tools.registry import ToolRegistry
 from app.tools.service import ToolService
 from app.workflows.service import WorkflowService
-from test_workflows import drain_workflow_jobs
+from tests.conftest import drain_workflow_jobs
 
 
 @pytest_asyncio.fixture

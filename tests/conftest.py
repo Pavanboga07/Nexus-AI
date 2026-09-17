@@ -542,10 +542,44 @@ async def db_orchestration_client(
         yield async_client
 
 
+# --- Shared workflow job-drain helper (moved from tests/test_workflows.py) ---
+
+
+async def drain_workflow_jobs(db_session_factory, workflow_service) -> int:
+    """Run pending workflow.advance jobs inline until the queue is empty.
+
+    Advancement no longer runs inside start/approve/resume requests: those
+    calls only enqueue a ``workflow.advance`` job (same kind + payload shape
+    as the handler registered in ``app/main.py``) and return a fresh read.
+    Tests asserting post-advancement states must drain first. A real
+    ``JobWorker`` claims and runs the jobs against the real service — nothing
+    about the service itself is mocked. Returns the number of jobs run.
+    """
+    from app.jobs import JobQueue, JobRegistry, JobWorker
+
+    queue = JobQueue(session_factory=db_session_factory)
+    registry = JobRegistry()
+
+    async def _advance(job) -> None:
+        wid = uuid.UUID(str(job.payload.get("workflow_id")))
+        await workflow_service.advance_workflow(wid)
+
+    registry.register("workflow.advance", _advance)
+    worker = JobWorker(queue=queue, registry=registry, kinds=["workflow.advance"])
+    total = 0
+    for _ in range(100):
+        ran = await worker.run_once()
+        total += ran
+        if ran == 0:
+            break
+    return total
+
+
 __all__ = [
     "FakeProvider",
     "LLMConfigurationError",
     "LLMProviderError",
     "LLMTimeoutError",
     "TEST_DATABASE_URL",
+    "drain_workflow_jobs",
 ]
