@@ -8,7 +8,7 @@
  *   A2A task delegation   -> /a2a/tasks        status pending_approval
  *   proactive workflows   -> /workflows        status waiting_approval
  *   autonomy runs         -> /autonomy/runs    status waiting_approval
- *   orchestration runs    -> /orchestration/runs status waiting_approval
+ *   orchestration runs    -> /orchestration/runs state WAITING_APPROVAL
  *
  * Each has its own approve endpoint and its own field names for the same
  * concept. Rather than make the user visit four pages - or teach the UI four
@@ -164,15 +164,30 @@ async function loadAutonomy(): Promise<ApprovalItem[]> {
     }));
 }
 
+/** Only this orchestration state means "a human must decide".
+ *
+ * OrchestrationRunResponse carries `state`, not `status`, and its values are
+ * the OrchestrationState enum (UPPERCASE: WAITING_APPROVAL, ...), unlike the
+ * lowercase statuses of the other three sources. Compared case-insensitively
+ * so either spelling surfaces instead of silently emptying the source. Every
+ * other state (waiting on a remote peer, executing, terminal) correctly yields
+ * no item: there is nothing for the owner to decide.
+ */
+function isOrchestrationPending(state: unknown): boolean {
+  return (
+    typeof state === "string" && state.toUpperCase() === "WAITING_APPROVAL"
+  );
+}
+
 async function loadOrchestration(): Promise<ApprovalItem[]> {
   const data = await apiFetch<{ runs?: any[] }>("/orchestration/runs");
   const runs = data.runs ?? (Array.isArray(data) ? (data as any[]) : []);
   return runs
-    .filter((r) => isPending(r.status))
+    .filter((r) => isOrchestrationPending(r.state))
     .map((r) => ({
-      id: `orchestration:${r.id ?? r.run_id}`,
+      id: `orchestration:${r.run_id}`,
       source: "orchestration" as const,
-      recordId: String(r.id ?? r.run_id),
+      recordId: String(r.run_id),
       title: r.goal ? short(r.goal, 80) : "Orchestration run",
       summary: short(
         r.approval_prompt ??

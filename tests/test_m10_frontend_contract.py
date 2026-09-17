@@ -64,6 +64,132 @@ async def test_approval_sources_exist_and_are_readable(db_a2a_client) -> None:
 
 
 @pytest.mark.asyncio
+async def test_orchestration_runs_is_a_readable_approval_source(db_a2a_client) -> None:
+    """The fourth approval source must be reachable, like the other three.
+
+    Without the orchestrator attached this 503s with the shared envelope (which
+    the Inbox reports as "not configured"); with it attached it returns the run
+    list. A 404/500 would mean the fan-out points at the wrong route, and the
+    orchestration source would silently show nothing.
+    """
+    response = await db_a2a_client.get("/orchestration/runs")
+    assert response.status_code in (200, 503), (
+        f"/orchestration/runs returned {response.status_code}. A 404/500 here "
+        f"means the Inbox is pointing at a route that does not exist, and it "
+        f"would silently show nothing. {response.text[:200]}"
+    )
+    if response.status_code == 503:
+        # Unavailable is acceptable ONLY because the Inbox reports it.
+        assert response.json()["error"]["code"] == "service_unavailable"
+        return
+    body = response.json()
+    assert isinstance(body, list), (
+        "GET /orchestration/runs returns a bare list "
+        f"(response_model=list[OrchestrationRunResponse]), not an object. Got: "
+        f"{sorted(body) if isinstance(body, dict) else type(body)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_orchestration_pending_run_carries_the_fields_the_inbox_reads(
+    db_orchestration_client, db_session_factory
+) -> None:
+    """A run waiting on the owner must expose run_id/state/goal over HTTP.
+
+    The Inbox previously read `r.status`/`r.id`, neither of which
+    OrchestrationRunResponse returns, so this source was permanently empty
+    while looking implemented.
+    """
+    from app.database.repositories import OwnerRepository
+    from app.orchestration.models import OrchestrationState
+    from app.orchestration.repository import OrchestrationRunRepository
+
+    async with db_session_factory() as session:
+        owner = await OwnerRepository().get_or_create_default(session)
+        run = await OrchestrationRunRepository().create(
+            session,
+            owner_id=owner.id,
+            session_id=f"orch_{uuid.uuid4().hex[:8]}",
+            goal="Ask Maya about Thursday",
+            intent_type="ASK_PERSON",
+            state=OrchestrationState.WAITING_APPROVAL.value,
+            target_person="Maya",
+        )
+        run.approval_prompt = "Contact Maya on your behalf?"
+        await session.commit()
+
+    response = await db_orchestration_client.get("/orchestration/runs")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert isinstance(body, list), (
+        "GET /orchestration/runs must return a bare list "
+        "(response_model=list[OrchestrationRunResponse]); the frontend reads it "
+        f"via its Array.isArray fallback. Got: {type(body)}"
+    )
+    pending = [
+        r
+        for r in body
+        if r.get("state") == OrchestrationState.WAITING_APPROVAL.value
+    ]
+    assert pending, (
+        "the seeded WAITING_APPROVAL run is missing from /orchestration/runs; "
+        "the Inbox would show nothing waiting. "
+        f"Got states: {sorted({r.get('state') for r in body})}"
+    )
+    first = pending[0]
+    for field in ("run_id", "state", "goal", "created_at"):
+        assert field in first, (
+            f"an orchestration run must carry {field!r}; the Inbox reads it. "
+            f"Got: {sorted(first)}"
+        )
+    assert "status" not in first, (
+        "OrchestrationRunResponse carries `state`, not `status`; the Inbox "
+        "must read `state` or this source renders permanently empty."
+    )
+
+
+def test_orchestration_loader_maps_run_id_and_state_to_pending() -> None:
+    """A backend run {run_id, state: WAITING_APPROVAL} must surface as pending.
+
+    Static check (this repo has no frontend unit runner — see the plan): the
+    loader must key items by `run_id` and filter on `state`.
+    OrchestrationRunResponse has no `id`/`status`, which is why this source was
+    permanently empty. The state comparison must be case-insensitive: the
+    orchestration enum is UPPERCASE (`WAITING_APPROVAL`,
+    app/orchestration/models.py) while the other three sources are lowercase.
+    """
+    source = (SRC / "lib" / "api" / "approvals.ts").read_text(encoding="utf-8")
+    anchor = source.find("async function loadOrchestration")
+    assert anchor != -1, "loadOrchestration is gone from approvals.ts"
+    end = source.find("\n}\n", anchor)
+    # Include the loader's dedicated pending predicate, which sits directly
+    # above it: the state vocabulary lives there, not in the fan-out body.
+    helper = source.find("function isOrchestrationPending")
+    start = helper if 0 <= helper < anchor else anchor
+    block = source[start : end if end != -1 else anchor + 2000]
+    assert "run_id" in block, (
+        "loadOrchestration must key items by `run_id`: "
+        "OrchestrationRunResponse has no `id`."
+    )
+    assert ".state" in block, (
+        "loadOrchestration must read `state`: OrchestrationRunResponse has no "
+        "`status`, so filtering on it matches nothing, ever."
+    )
+    assert ".status" not in block, (
+        "loadOrchestration still reads `status`, which OrchestrationRunResponse "
+        "never returns — the orchestration source renders permanently empty."
+    )
+    assert "waiting_approval" in block.lower(), (
+        "loadOrchestration must recognise the waiting-approval state as pending."
+    )
+    assert "toUpperCase" in block or "toLowerCase" in block, (
+        "the orchestration state enum is UPPERCASE (WAITING_APPROVAL) while the "
+        "other sources are lowercase — compare case-insensitively or the real "
+        "backend states never match."
+    )
+
+
+@pytest.mark.asyncio
 async def test_approvals_use_the_statuses_the_inbox_filters_on(
     db_session_factory, db_owner_id
 ) -> None:
