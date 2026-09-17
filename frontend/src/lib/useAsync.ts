@@ -23,20 +23,33 @@ export function useAsync<T>(fetcher: () => Promise<T>): UseAsyncResult<T> {
   const fetcherRef = useRef(fetcher);
   fetcherRef.current = fetcher;
 
+  const mountedRef = useRef(true);
+
   const reload = useCallback(() => {
     setLoading(true);
     setError(null);
     void fetcherRef
       .current()
-      .then((result) => setData(result))
-      .catch((err: unknown) =>
-        setError(err instanceof Error ? err.message : "Something went wrong.")
-      )
-      .finally(() => setLoading(false));
+      .then((result) => {
+        if (!mountedRef.current) return;
+        setData(result);
+      })
+      .catch((err: unknown) => {
+        if (!mountedRef.current) return;
+        setError(err instanceof Error ? err.message : "Something went wrong.");
+      })
+      .finally(() => {
+        if (!mountedRef.current) return;
+        setLoading(false);
+      });
   }, []);
 
   useEffect(() => {
+    mountedRef.current = true;
     reload();
+    return () => {
+      mountedRef.current = false;
+    };
   }, [reload]);
 
   return { data, error, loading, reload };

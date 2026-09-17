@@ -1,6 +1,11 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
 
 import { Button } from "@/components/ui/Button";
 
@@ -26,6 +31,7 @@ export function ConfirmModal({
   onCancel,
 }: ConfirmModalProps) {
   const [reason, setReason] = useState("");
+  const panelRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (open) setReason("");
@@ -33,20 +39,53 @@ export function ConfirmModal({
 
   useEffect(() => {
     if (!open) return;
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    const prevOverflow = document.body.style.overflow;
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") onCancel();
     };
     document.body.style.overflow = "hidden";
     window.addEventListener("keydown", handleKeyDown);
+    const panel = panelRef.current;
+    if (panel && !panel.contains(document.activeElement)) {
+      const first = panel.querySelector<HTMLElement>(
+        'button:not([disabled]), textarea:not([disabled]), input:not([disabled]), [href], [tabindex]:not([tabindex="-1"])'
+      );
+      (first ?? panel).focus();
+    }
     return () => {
-      document.body.style.overflow = "unset";
+      document.body.style.overflow = prevOverflow;
       window.removeEventListener("keydown", handleKeyDown);
+      previouslyFocused?.focus();
     };
   }, [open, onCancel]);
 
   if (!open) return null;
 
   const reasonMissing = requireReason && reason.trim().length === 0;
+
+  const handleTrapKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== "Tab") return;
+    const panel = panelRef.current;
+    if (!panel) return;
+    const focusables = panel.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), textarea:not([disabled]), input:not([disabled]), [href], [tabindex]:not([tabindex="-1"])'
+    );
+    if (focusables.length === 0) {
+      e.preventDefault();
+      panel.focus();
+      return;
+    }
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  };
 
   return (
     <div
@@ -59,7 +98,12 @@ export function ConfirmModal({
         className="fixed inset-0 bg-black/60 backdrop-blur-sm"
         onClick={onCancel}
       />
-      <div className="relative z-10 w-full max-w-md rounded-lg border border-neutral-800 bg-neutral-900 p-5 shadow-xl">
+      <div
+        ref={panelRef}
+        tabIndex={-1}
+        onKeyDown={handleTrapKeyDown}
+        className="relative z-10 w-full max-w-md rounded-lg border border-neutral-800 bg-neutral-900 p-5 shadow-xl focus:outline-none"
+      >
         <h3 className="text-base font-semibold text-neutral-100">{title}</h3>
         <p className="mt-2 text-sm leading-relaxed text-neutral-400">{body}</p>
         {requireReason && (
