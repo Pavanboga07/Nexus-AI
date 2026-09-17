@@ -20,6 +20,7 @@
  */
 
 import { apiFetch, ApiError } from "./client";
+import { shortContactId } from "../useContactNames";
 
 export type ApprovalSource = "task" | "workflow" | "autonomy" | "orchestration";
 
@@ -109,7 +110,10 @@ async function loadTasks(): Promise<ApprovalItem[]> {
       id: `task:${t.task_id}`,
       source: "task" as const,
       recordId: t.task_id,
-      title: `Task from ${t.sender_agent_id?.slice(0, 24) ?? "a remote agent"}`,
+      // The sender is resolved to a display name at render time (the Inbox
+      // holds the contact-names map); here only a short, obviously-truncated
+      // fallback is used — never a raw 24-char ID slice.
+      title: `Task from ${shortContactId(t.sender_agent_id)}`,
       summary: short(
         t.request_payload?.message ??
           t.request_payload?.query ??

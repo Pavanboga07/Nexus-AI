@@ -5,6 +5,7 @@ import { AlertCircle, BadgeCheck, Search, ShieldAlert, UserPlus } from "lucide-r
 
 import { Button } from "@/components/ui/Button";
 import { ApiError } from "@/lib/api/client";
+import { formatDate } from "@/lib/utils";
 import {
   DirectoryAgent,
   TrustedAgent,
@@ -156,8 +157,17 @@ export default function PeoplePage() {
                         </span>
                       )}
                     </div>
+                    {/* TrustedAgentOut returns only these fields — there is no
+                        @handle, verification state, or capability list here, so
+                        none is shown rather than invented. */}
                     <p className="mt-0.5 truncate font-mono text-[11px] text-neutral-500">
                       {agent.agent_id}
+                    </p>
+                    <p className="mt-0.5 truncate text-[11px] text-neutral-500">
+                      {agent.endpoint}
+                      {agent.created_at
+                        ? ` · connected ${formatDate(agent.created_at)}`
+                        : ""}
                     </p>
                   </div>
                   <div className="flex shrink-0 gap-1.5">

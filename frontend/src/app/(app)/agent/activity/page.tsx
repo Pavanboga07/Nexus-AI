@@ -8,7 +8,11 @@ import { Modal } from "@/components/ui/Modal";
 import { getPolicyAudit } from "@/lib/api/policy";
 import { getToolAudit } from "@/lib/api/tools";
 import { getA2AAudit } from "@/lib/api/a2a";
-import { formatDate, truncateId } from "@/lib/utils";
+import { formatDate } from "@/lib/utils";
+import {
+  loadContactNames,
+  resolveContactName,
+} from "@/lib/useContactNames";
 import {
   RefreshCw,
   Search,
@@ -36,6 +40,9 @@ export default function ActivityPage() {
   const fetchAllAuditData = async () => {
     try {
       setLoading(true);
+      // Contact names resolve agent IDs to display names in subtitles; unknown
+      // IDs fall back to a short slice (never a raw ID).
+      const names = await loadContactNames();
       const [polRes, toolRes, a2aRes] = await Promise.allSettled([
         getPolicyAudit(),
         getToolAudit(),
@@ -58,7 +65,7 @@ export default function ActivityPage() {
             category: "policy",
             timestamp: d.created_at ?? null,
             title: `Policy: ${d.data_category}:${d.action}`,
-            subtitle: `Purpose: ${d.purpose} · From: ${d.requester_agent_id} · ${d.reason}`,
+            subtitle: `Purpose: ${d.purpose} · From: ${resolveContactName(names, d.requester_agent_id)} · ${d.reason}`,
             status: d.decision,
             raw: d,
           });
@@ -92,9 +99,9 @@ export default function ActivityPage() {
             category: "a2a",
             timestamp: m.created_at ?? null,
             title: `Agent message: ${m.message_type}`,
-            subtitle: `From: ${truncateId(m.sender_agent_id, 6)} -> To: ${truncateId(
-              m.recipient_agent_id,
-              6
+            subtitle: `From: ${resolveContactName(names, m.sender_agent_id)} -> To: ${resolveContactName(
+              names,
+              m.recipient_agent_id
             )} · ${m.status}${m.policy_decision ? ` · policy ${m.policy_decision}` : ""}`,
             status: m.status,
             raw: m,

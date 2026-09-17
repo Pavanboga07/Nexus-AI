@@ -18,6 +18,8 @@ import { AlertCircle, Check, Clock, X } from "lucide-react";
 
 import { Button } from "@/components/ui/Button";
 import { ApiError } from "@/lib/api/client";
+import { useContactNames } from "@/lib/useContactNames";
+import { formatDate } from "@/lib/utils";
 import {
   ApprovalItem,
   decideApproval,
@@ -36,6 +38,9 @@ export default function InboxPage() {
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [decided, setDecided] = useState<Record<string, "approve" | "deny">>({});
+  // Contact names resolve agent IDs to display names; unknown IDs fall back
+  // to a short slice (never a raw 24-char slice).
+  const { resolve: resolveName } = useContactNames();
 
   const load = useCallback(async () => {
     setState("loading");
@@ -135,6 +140,12 @@ export default function InboxPage() {
           <ul className="space-y-2">
             {items.map((item) => {
               const meta = decided[item.id];
+              // Task titles carry a short-ID fallback from the data layer; with
+              // the names map loaded, show the contact's display name instead.
+              const title =
+                item.source === "task" && item.requestedBy
+                  ? `Task from ${resolveName(item.requestedBy)}`
+                  : item.title;
               return (
                 <li
                   key={item.id}
@@ -153,7 +164,7 @@ export default function InboxPage() {
                           {sourceLabel(item.source)}
                         </span>
                         <h2 className="truncate text-sm font-medium text-neutral-100">
-                          {item.title}
+                          {title}
                         </h2>
                       </div>
                       <p className="mt-1.5 text-xs leading-relaxed text-neutral-400">
@@ -166,7 +177,7 @@ export default function InboxPage() {
                           <div className="flex gap-1">
                             <dt>From</dt>
                             <dd className="truncate text-neutral-400">
-                              {item.requestedBy}
+                              {resolveName(item.requestedBy)}
                             </dd>
                           </div>
                         )}
@@ -193,7 +204,7 @@ export default function InboxPage() {
                         {item.expiresAt && (
                           <div className="flex items-center gap-1">
                             <Clock className="h-3 w-3" aria-hidden />
-                            <dd>expires {item.expiresAt}</dd>
+                            <dd>expires {formatDate(item.expiresAt)}</dd>
                           </div>
                         )}
                       </dl>

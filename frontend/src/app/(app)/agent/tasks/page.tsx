@@ -17,6 +17,7 @@ import {
 import { listTrustedAgents, getA2AAudit, A2AAuditEntry } from "@/lib/api/a2a";
 import { A2ATask, TrustedAgent } from "@/types/api";
 import { formatDate, truncateId } from "@/lib/utils";
+import { useContactNames } from "@/lib/useContactNames";
 import {
   Plus,
   RefreshCw,
@@ -43,6 +44,9 @@ export default function TasksPage() {
   const [negotiateModalOpen, setNegotiateModalOpen] = useState(false);
   const [counterTerms, setCounterTerms] = useState('{"candidate_time": "15:00"}');
   const [negotiating, setNegotiating] = useState(false);
+  // Peer IDs resolve to contact display names; unknown IDs fall back to a
+  // short slice.
+  const { resolve: resolveName } = useContactNames();
 
   const fetchTasks = async (status?: string) => {
     try {
@@ -264,7 +268,7 @@ export default function TasksPage() {
                 </div>
                 <div className="text-xs text-neutral-400 mt-1.5 font-mono flex items-center gap-3">
                   <span>ID: {truncateId(task.task_id, 8)}</span>
-                  <span>Peer: {truncateId(task.recipient_agent_id, 8)}</span>
+                  <span className="font-sans">Peer: {resolveName(task.recipient_agent_id)}</span>
                   <span>{formatDate(task.created_at)}</span>
                 </div>
               </div>
@@ -449,7 +453,7 @@ export default function TasksPage() {
                   Peer
                 </label>
                 <span className="font-mono text-neutral-300 break-all">
-                  {selectedTask.recipient_agent_id}
+                  {resolveName(selectedTask.recipient_agent_id)}
                 </span>
               </div>
               <div>
