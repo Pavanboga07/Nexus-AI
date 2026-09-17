@@ -66,6 +66,24 @@ export async function apiFetch<T>(
         errorMessage = res.statusText || errorMessage;
       }
 
+      if (res.status === 401) {
+        // Expired (or missing) session: the HttpOnly cookie is stale, so any
+        // client-side state derived from it is stale too. Full navigation —
+        // not router-push — because router state may be stale as well. The
+        // login page itself is exempt: a failed sign-in also returns 401 and
+        // must stay on the form instead of reloading it in a loop. Guarded
+        // for SSR/tests where `window` does not exist.
+        // NOTE: there is no local auth token to clear (grep: the only
+        // localStorage key is the chat session id, not auth; the session
+        // lives in an HttpOnly cookie the backend clears on logout/expiry).
+        if (
+          typeof window !== "undefined" &&
+          window.location.pathname !== "/login"
+        ) {
+          window.location.assign("/login");
+        }
+      }
+
       throw new ApiError(errorMessage, res.status, errorData);
     }
 
