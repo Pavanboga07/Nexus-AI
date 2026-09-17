@@ -47,6 +47,10 @@ export type ApprovalsResult = {
   items: ApprovalItem[];
   /** Sources that could not be read, with the reason. */
   unavailable: Array<{ source: ApprovalSource; reason: string }>;
+  /** Orchestration runs waiting on others (WAITING_REMOTE/EXECUTING). */
+  waitingOutbox?: ApprovalItem[];
+  /** Terminal orchestration runs (COMPLETED/FAILED/CANCELLED/EXPIRED). */
+  recentlyDecided?: ApprovalItem[];
 };
 
 const SOURCE_LABELS: Record<ApprovalSource, string> = {
@@ -76,12 +80,12 @@ function short(text: unknown, max = 160): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
-type Fetcher = () => Promise<ApprovalItem[]>;
+type Fetcher<T> = () => Promise<T>;
 
-async function loadSource(
+async function loadSource<T>(
   source: ApprovalSource,
-  fetchItems: Fetcher
-): Promise<{ items: ApprovalItem[] } | { error: string }> {
+  fetchItems: Fetcher<T>
+): Promise<{ items: T } | { error: string }> {
   try {
     return { items: await fetchItems() };
   } catch (err) {
@@ -169,9 +173,8 @@ async function loadAutonomy(): Promise<ApprovalItem[]> {
  * OrchestrationRunResponse carries `state`, not `status`, and its values are
  * the OrchestrationState enum (UPPERCASE: WAITING_APPROVAL, ...), unlike the
  * lowercase statuses of the other three sources. Compared case-insensitively
- * so either spelling surfaces instead of silently emptying the source. Every
- * other state (waiting on a remote peer, executing, terminal) correctly yields
- * no item: there is nothing for the owner to decide.
+ * so either spelling surfaces instead of silently emptying the source. Other
+ * states are bucketed below for the outbox/done panes, not dropped.
  */
 function isOrchestrationPending(state: unknown): boolean {
   return (
@@ -179,27 +182,69 @@ function isOrchestrationPending(state: unknown): boolean {
   );
 }
 
-async function loadOrchestration(): Promise<ApprovalItem[]> {
+/** In-flight states that mean "waiting on others, not on you". */
+const ORCHESTRATION_WAITING_STATES = new Set(["WAITING_REMOTE", "EXECUTING"]);
+
+function isOrchestrationWaiting(state: unknown): boolean {
+  return (
+    typeof state === "string" &&
+    ORCHESTRATION_WAITING_STATES.has(state.toUpperCase())
+  );
+}
+
+/** Terminal states, exactly as in OrchestrationState (models.py). */
+const ORCHESTRATION_TERMINAL_STATES = new Set([
+  "COMPLETED",
+  "FAILED",
+  "CANCELLED",
+  "EXPIRED",
+]);
+
+function isOrchestrationTerminal(state: unknown): boolean {
+  return (
+    typeof state === "string" &&
+    ORCHESTRATION_TERMINAL_STATES.has(state.toUpperCase())
+  );
+}
+
+function toOrchestrationItem(r: any): ApprovalItem {
+  return {
+    id: `orchestration:${r.run_id}`,
+    source: "orchestration" as const,
+    recordId: String(r.run_id),
+    title: r.goal ? short(r.goal, 80) : "Orchestration run",
+    summary: short(
+      r.approval_prompt ??
+        r.approval_reason ??
+        "Your agent wants to contact someone on your behalf."
+    ),
+    requestedAction: r.requested_action ?? null,
+    requestedBy: r.target_person ?? "your agent",
+    category: r.approval_category ?? null,
+    purpose: r.approval_purpose ?? null,
+    createdAt: r.created_at ?? null,
+  };
+}
+
+export type OrchestrationBuckets = {
+  pending: ApprovalItem[];
+  waiting: ApprovalItem[];
+  done: ApprovalItem[];
+};
+
+async function loadOrchestration(): Promise<OrchestrationBuckets> {
   const data = await apiFetch<{ runs?: any[] }>("/orchestration/runs");
   const runs = data.runs ?? (Array.isArray(data) ? (data as any[]) : []);
-  return runs
-    .filter((r) => isOrchestrationPending(r.state))
-    .map((r) => ({
-      id: `orchestration:${r.run_id}`,
-      source: "orchestration" as const,
-      recordId: String(r.run_id),
-      title: r.goal ? short(r.goal, 80) : "Orchestration run",
-      summary: short(
-        r.approval_prompt ??
-          r.approval_reason ??
-          "Your agent wants to contact someone on your behalf."
-      ),
-      requestedAction: r.requested_action ?? null,
-      requestedBy: r.target_person ?? "your agent",
-      category: r.approval_category ?? null,
-      purpose: r.approval_purpose ?? null,
-      createdAt: r.created_at ?? null,
-    }));
+  const pending: ApprovalItem[] = [];
+  const waiting: ApprovalItem[] = [];
+  const done: ApprovalItem[] = [];
+  for (const r of runs) {
+    if (isOrchestrationPending(r.state)) pending.push(toOrchestrationItem(r));
+    else if (isOrchestrationWaiting(r.state))
+      waiting.push(toOrchestrationItem(r));
+    else if (isOrchestrationTerminal(r.state)) done.push(toOrchestrationItem(r));
+  }
+  return { pending, waiting, done };
 }
 
 export async function listApprovals(): Promise<ApprovalsResult> {
@@ -212,20 +257,33 @@ export async function listApprovals(): Promise<ApprovalsResult> {
 
   const items: ApprovalItem[] = [];
   const unavailable: ApprovalsResult["unavailable"] = [];
+  let waitingOutbox: ApprovalItem[] = [];
+  let recentlyDecided: ApprovalItem[] = [];
 
   for (const [source, outcome] of [
     ["task", task],
     ["workflow", workflow],
     ["autonomy", autonomy],
-    ["orchestration", orchestration],
   ] as Array<[ApprovalSource, { items?: ApprovalItem[]; error?: string }]>) {
     if (outcome.items) items.push(...outcome.items);
     else if (outcome.error) unavailable.push({ source, reason: outcome.error });
   }
 
+  if ("items" in orchestration) {
+    items.push(...orchestration.items.pending);
+    waitingOutbox = orchestration.items.waiting;
+    recentlyDecided = orchestration.items.done;
+  } else {
+    unavailable.push({ source: "orchestration", reason: orchestration.error });
+  }
+
   // Oldest first: an approval that has been waiting longest deserves attention.
-  items.sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""));
-  return { items, unavailable };
+  const byAge = (a: ApprovalItem, b: ApprovalItem) =>
+    (a.createdAt ?? "").localeCompare(b.createdAt ?? "");
+  items.sort(byAge);
+  waitingOutbox.sort(byAge);
+  recentlyDecided.sort(byAge);
+  return { items, unavailable, waitingOutbox, recentlyDecided };
 }
 
 const APPROVE_PATHS: Record<ApprovalSource, (id: string) => string> = {

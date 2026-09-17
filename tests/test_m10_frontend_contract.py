@@ -189,6 +189,75 @@ def test_orchestration_loader_maps_run_id_and_state_to_pending() -> None:
     )
 
 
+def test_orchestration_loader_categorizes_waiting_and_done_buckets() -> None:
+    """Non-pending orchestration states must land in waiting/done buckets.
+
+    B1's spec requires mapping non-pending states (waiting_remote/executing
+    -> waiting-on-others; terminal -> done) so B5's outbox/done panes have
+    data to consume, but the loader only filtered pending. Waiting runs must
+    land in the waiting bucket (not pending, not dropped) and terminal runs in
+    the done bucket. State strings are taken from the backend enum, not
+    guessed, and compared case-insensitively like the pending predicate.
+    """
+    from app.orchestration.models import OrchestrationState
+
+    source = (SRC / "lib" / "api" / "approvals.ts").read_text(encoding="utf-8")
+
+    # The extra buckets ride on the result object as optional fields, so the
+    # pending `items` shape Inbox/Chat/AppShell consume today is untouched.
+    anchor = source.find("export type ApprovalsResult")
+    assert anchor != -1, "ApprovalsResult is gone from approvals.ts"
+    result_block = source[anchor : anchor + 800]
+    assert "waitingOutbox?" in result_block, (
+        "ApprovalsResult must expose an optional `waitingOutbox` bucket so B5 "
+        "has waiting-on-others runs without changing what Inbox reads."
+    )
+    assert "recentlyDecided?" in result_block, (
+        "ApprovalsResult must expose an optional `recentlyDecided` bucket so B5 "
+        "has terminal runs without changing what Inbox reads."
+    )
+
+    # Waiting bucket: exactly the non-terminal in-flight states.
+    for state in (
+        OrchestrationState.WAITING_REMOTE.value,
+        OrchestrationState.EXECUTING.value,
+    ):
+        assert state in source, (
+            f"the waiting bucket must recognise {state!r} "
+            "(app/orchestration/models.py OrchestrationState)."
+        )
+
+    # Done bucket: exactly the terminal states, verified against the enum.
+    for state in (
+        OrchestrationState.COMPLETED.value,
+        OrchestrationState.FAILED.value,
+        OrchestrationState.CANCELLED.value,
+        OrchestrationState.EXPIRED.value,
+    ):
+        assert state in source, (
+            f"the done bucket must recognise terminal {state!r} "
+            "(app/orchestration/models.py OrchestrationState)."
+        )
+
+    assert "toUpperCase" in source or "toLowerCase" in source, (
+        "orchestration states are UPPERCASE — bucketing must compare "
+        "case-insensitively like the pending predicate."
+    )
+
+    # listApprovals must actually populate both buckets.
+    fanout = source.find("export async function listApprovals")
+    assert fanout != -1, "listApprovals is gone from approvals.ts"
+    fanout_block = source[fanout : fanout + 4000]
+    assert "waitingOutbox" in fanout_block, (
+        "listApprovals must populate `waitingOutbox`; declaring the field "
+        "without filling it leaves B5 with nothing to consume."
+    )
+    assert "recentlyDecided" in fanout_block, (
+        "listApprovals must populate `recentlyDecided`; declaring the field "
+        "without filling it leaves B5 with nothing to consume."
+    )
+
+
 @pytest.mark.asyncio
 async def test_approvals_use_the_statuses_the_inbox_filters_on(
     db_session_factory, db_owner_id
