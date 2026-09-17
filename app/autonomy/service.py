@@ -343,12 +343,14 @@ class AutonomyService:
                         if wf.status == "completed":
                             r.status = RunStatus.COMPLETED.value
                             r.completed_at = now
-                        elif wf.status in {"failed", "cancelled"}:
+                        elif wf.status in {"failed", "cancelled", "expired"}:
                             r.status = RunStatus.FAILED.value
-                            r.failure_reason = f"Linked workflow {wf.status}"
+                            r.failure_reason = f"Linked workflow {wf.status}"[:250]
                             r.completed_at = now
                         elif wf.status == "waiting_approval":
                             r.status = RunStatus.WAITING_APPROVAL.value
+                        elif wf.status == "waiting_remote":
+                            r.status = RunStatus.WAITING_REMOTE.value
                     except Exception:
                         r.status = RunStatus.STOPPED.value
                         r.stop_reason = "Interrupted by server restart"

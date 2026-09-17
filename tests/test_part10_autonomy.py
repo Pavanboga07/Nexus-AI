@@ -916,7 +916,170 @@ async def test_a2_create_workflow_propagates_waiting_remote(
         # returns in-progress; the workflow parks once its jobs drain.
         assert result.status == RunStatus.RUNNING
         wf_id = run.workflow_id
+        await session.commit()
 
     await drain_workflow_jobs(db_session_factory, wf_service)
     wf = await wf_service.get_workflow(test_owner, wf_id)
     assert wf.status == WorkflowStatus.WAITING_REMOTE.value
+    # A8: linked run must reflect WAITING_REMOTE too (restores A2 intent).
+    run_after = await autonomy_service_instance.get_run(test_owner, shell.id)
+    assert run_after.status == RunStatus.WAITING_REMOTE.value
+
+
+# =============================================================================
+# A8. SINGLE CONSENT + RUN LINKAGE
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_a8_approve_workflow_backed_orchestration_single_consent(
+    db_session_factory,
+    policy_service: PolicyService,
+    memory_manager,
+    test_owner: uuid.UUID,
+):
+    """Workflow-backed orchestration approve must not leave an unconsumed consent (A8)."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from app.orchestration.models import OrchestrationState
+    from app.orchestration.orchestrator import AgentOrchestrator
+    from app.orchestration.repository import OrchestrationRunRepository
+    from app.orchestration.schemas import TargetResolution, TargetResolutionStatus
+    from app.schemas.workflows import WorkflowStepSpec
+    from app.tools.builtin import BUILTIN_TOOLS
+    from app.tools.registry import ToolRegistry
+    from app.tools.service import ToolService
+
+    tool_registry = ToolRegistry()
+    for tool in BUILTIN_TOOLS:
+        tool_registry.register(tool)
+    tool_service = ToolService(
+        registry=tool_registry,
+        policy_service=policy_service,
+        session_factory=db_session_factory,
+        timeout_seconds=2.0,
+        max_result_bytes=4096,
+    )
+    wf_service = WorkflowService(
+        session_factory=db_session_factory,
+        policy_service=policy_service,
+        tool_service=tool_service,
+        memory_manager=memory_manager,
+        default_ttl_seconds=3600,
+        max_step_attempts=3,
+    )
+    wf = await wf_service.create_workflow(
+        test_owner,
+        workflow_type="meeting_coordination",
+        purpose="a8_single_consent",
+        steps=[
+            WorkflowStepSpec(
+                step_type="availability_check",
+                input_payload={"candidate_slots": ["10:00"]},
+            ),
+        ],
+    )
+    started = await wf_service.start_workflow(test_owner, wf.workflow_id)
+    assert started.status == "running"
+    await drain_workflow_jobs(db_session_factory, wf_service)
+    parked = await wf_service.get_workflow(test_owner, wf.workflow_id)
+    assert parked.status == "waiting_approval"
+
+    runs_repo = OrchestrationRunRepository()
+    async with db_session_factory() as session:
+        run = await runs_repo.create(
+            session,
+            owner_id=test_owner,
+            session_id="a8-consent",
+            goal="A8 single consent",
+            intent_type="COORDINATE_MEETING",
+            state=OrchestrationState.WAITING_APPROVAL.value,
+            target_person="Rahul",
+            target_agent_id="nexus:anonymous",
+            plan={"goal": "A8", "intent_type": "COORDINATE_MEETING", "steps": []},
+            workflow_id=wf.workflow_id,
+        )
+        await session.commit()
+        run_id = run.id
+
+    mock_target = AsyncMock()
+    mock_target.resolve.return_value = TargetResolution(
+        target_name="Rahul",
+        status=TargetResolutionStatus.KNOWN_AGENT,
+        agent_id="nexus:anonymous",
+        display_name="Rahul",
+        is_trusted=True,
+    )
+    orchestrator = AgentOrchestrator(
+        session_factory=db_session_factory,
+        a2a_service=MagicMock(),
+        policy_service=policy_service,
+        intent_resolver=MagicMock(),
+        target_resolver=mock_target,
+        workflow_service=wf_service,
+    )
+    await orchestrator.approve_run(test_owner, run_id)
+    await drain_workflow_jobs(db_session_factory, wf_service)
+
+    consents = await policy_service.list_consents(test_owner)
+    lingering = [
+        c
+        for c in consents
+        if c.single_use and c.decision == "ALLOW" and c.used_at is None
+    ]
+    assert lingering == []
+
+
+@pytest.mark.asyncio
+async def test_a8_complete_linked_workflow_syncs_run(
+    autonomy_service_instance: AutonomyService,
+    db_session_factory,
+    policy_service: PolicyService,
+    test_owner: uuid.UUID,
+):
+    """Completing a linked workflow must move the parent run out of waiting (A8)."""
+    from datetime import datetime, timezone
+
+    from app.autonomy.models import AutonomyRun
+    from app.schemas.workflows import WorkflowStepSpec
+    from app.workflows.models import WorkflowStatus
+
+    await policy_service.create_policy(
+        test_owner,
+        requester_agent_id="nexus:self",
+        data_category="calendar",
+        action="read",
+        purpose="a8_link_complete",
+        decision="ALLOW",
+    )
+    wf_service: WorkflowService = autonomy_service_instance._workflows
+    wf = await wf_service.create_workflow(
+        test_owner,
+        workflow_type="meeting_coordination",
+        purpose="a8_link_complete",
+        steps=[
+            WorkflowStepSpec(
+                step_type="availability_check",
+                input_payload={"candidate_slots": ["10:00"]},
+            ),
+        ],
+    )
+    async with db_session_factory() as session:
+        linked = AutonomyRun(
+            owner_id=test_owner,
+            workflow_id=wf.workflow_id,
+            goal="A8 linked completion",
+            status=RunStatus.WAITING_APPROVAL.value,
+            started_at=datetime.now(timezone.utc),
+        )
+        session.add(linked)
+        await session.commit()
+        run_id = linked.id
+
+    await wf_service.start_workflow(test_owner, wf.workflow_id)
+    await drain_workflow_jobs(db_session_factory, wf_service)
+    wf_after = await wf_service.get_workflow(test_owner, wf.workflow_id)
+    assert wf_after.status == WorkflowStatus.COMPLETED.value
+
+    run_after = await autonomy_service_instance.get_run(test_owner, run_id)
+    assert run_after.status == RunStatus.COMPLETED.value

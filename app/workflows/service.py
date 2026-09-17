@@ -294,6 +294,7 @@ class WorkflowService:
 
                 now = _utcnow()
                 if await self._expire_if_overdue(session, wf):
+                    await self._sync_linked_runs(workflow_id)
                     return wf
 
                 if wf.status != WorkflowStatus.RUNNING.value:
@@ -330,6 +331,7 @@ class WorkflowService:
                             status=wf.status,
                             purpose=wf.purpose,
                         )
+                        await self._sync_linked_runs(workflow_id)
                         return wf
 
                     # If some step is failed
@@ -347,6 +349,7 @@ class WorkflowService:
                             status=wf.status,
                             purpose=wf.purpose,
                         )
+                        await self._sync_linked_runs(workflow_id)
                         return wf
 
                     return wf
@@ -402,6 +405,7 @@ class WorkflowService:
                         f"Unsupported step type: {step.step_type}",
                     )
                     await session.commit()
+                await self._sync_linked_runs(workflow_id)
                 return await self._get_wf(workflow_id)
 
             # --- Independent Policy Check ---
@@ -428,6 +432,7 @@ class WorkflowService:
                     policy_decision="DENY",
                     detail=eval_result.reason,
                 )
+                await self._sync_linked_runs(workflow_id)
                 return await self._get_wf(workflow_id)
 
             if eval_result.decision is PolicyDecision.ASK:
@@ -448,6 +453,7 @@ class WorkflowService:
                     policy_decision="ASK",
                     detail="Awaiting owner approval",
                 )
+                await self._sync_linked_runs(workflow_id)
                 return await self._get_wf(workflow_id)
 
             # Policy ALLOW: Execute handler
@@ -518,6 +524,7 @@ class WorkflowService:
                     purpose=wf.purpose,
                     detail="Waiting for remote response",
                 )
+                await self._sync_linked_runs(workflow_id)
                 return await self._get_wf(workflow_id)
 
             else:  # FAILED
@@ -560,6 +567,7 @@ class WorkflowService:
                         purpose=wf.purpose,
                         detail=res.failure_reason,
                     )
+                    await self._sync_linked_runs(workflow_id)
                     return await self._get_wf(workflow_id)
 
     async def _fail_step_and_workflow(
@@ -588,6 +596,57 @@ class WorkflowService:
             assert wf is not None
             return wf
 
+    async def _sync_linked_runs(self, workflow_id: uuid.UUID) -> None:
+        # Local import: autonomy->workflows is the established direction, so keep this workflows->autonomy edge deferred to avoid a top-level cycle.
+        from app.autonomy.models import RunStatus
+        from app.autonomy.repository import AutonomyRunRepository
+
+        async with self._session_factory() as session:
+            wf = await self._repo.get(session, workflow_id)
+            if wf is None:
+                return
+            runs = await AutonomyRunRepository().find_by_workflow_id(
+                session, workflow_id
+            )
+            if not runs:
+                return
+            now = _utcnow()
+            for run in runs:
+                if run.status in {
+                    RunStatus.COMPLETED.value,
+                    RunStatus.FAILED.value,
+                    RunStatus.CANCELLED.value,
+                    RunStatus.STOPPED.value,
+                    RunStatus.EXPIRED.value,
+                }:
+                    continue
+                if wf.status == WorkflowStatus.COMPLETED.value:
+                    run.status = RunStatus.COMPLETED.value
+                    run.completed_at = now
+                elif wf.status in {
+                    WorkflowStatus.FAILED.value,
+                    WorkflowStatus.CANCELLED.value,
+                    WorkflowStatus.EXPIRED.value,
+                }:
+                    run.status = RunStatus.FAILED.value
+                    run.failure_reason = (
+                        wf.failure_reason or f"Linked workflow {wf.status}"
+                    )[:250]
+                    run.completed_at = now
+                elif wf.status == WorkflowStatus.WAITING_APPROVAL.value:
+                    run.status = RunStatus.WAITING_APPROVAL.value
+                elif wf.status == WorkflowStatus.WAITING_REMOTE.value:
+                    run.status = RunStatus.WAITING_REMOTE.value
+                elif wf.status == WorkflowStatus.RUNNING.value:
+                    if run.status in {
+                        RunStatus.WAITING_APPROVAL.value,
+                        RunStatus.WAITING_REMOTE.value,
+                    }:
+                        run.status = RunStatus.RUNNING.value
+                else:
+                    continue
+            await session.commit()
+
     # --- Approval -------------------------------------------------------------
 
     async def approve_workflow(
@@ -602,6 +661,7 @@ class WorkflowService:
                 raise WorkflowNotFoundError(f"Workflow {workflow_id} not found.")
 
             if await self._expire_if_overdue(session, wf):
+                await self._sync_linked_runs(workflow_id)
                 return wf
 
             if wf.status != WorkflowStatus.WAITING_APPROVAL.value:
@@ -665,6 +725,7 @@ class WorkflowService:
             detail="Owner approved step",
         )
 
+        await self._sync_linked_runs(workflow_id)
         await self._enqueue_advance(workflow_id)
         return await self._get_wf(workflow_id)
 
@@ -714,6 +775,7 @@ class WorkflowService:
             detail=reason,
         )
 
+        await self._sync_linked_runs(workflow_id)
         return await self._get_wf(workflow_id)
 
     # --- A2A Resumption -------------------------------------------------------
@@ -773,6 +835,7 @@ class WorkflowService:
                         policy_decision="DENY",
                         detail=resume_eval.reason,
                     )
+                    await self._sync_linked_runs(workflow_id)
                     return await self._get_wf(workflow_id)
                 if resume_eval.decision is PolicyDecision.ASK:
                     step.status = StepStatus.WAITING.value
@@ -789,6 +852,7 @@ class WorkflowService:
                         policy_decision="ASK",
                         detail="Awaiting owner approval",
                     )
+                    await self._sync_linked_runs(workflow_id)
                     return await self._get_wf(workflow_id)
 
             if wf.status in {
@@ -822,6 +886,7 @@ class WorkflowService:
                 status=WorkflowStatus.RUNNING.value,
                 detail="A2A task response arrived",
             )
+            await self._sync_linked_runs(workflow_id)
             await self._enqueue_advance(workflow_id)
             return await self._get_wf(workflow_id)
         return None
@@ -831,6 +896,7 @@ class WorkflowService:
     async def recover_interrupted_workflows(self) -> list[uuid.UUID]:
         """Recovers workflows left in a non-terminal state after a crash."""
         recovered_ids: list[uuid.UUID] = []
+        terminal_ids: list[uuid.UUID] = []
         async with self._session_factory() as session:
             running_wfs = await self._repo.find_interrupted_workflows(session)
             now = _utcnow()
@@ -859,6 +925,7 @@ class WorkflowService:
                         status=wf.status,
                         purpose=wf.purpose,
                     )
+                    terminal_ids.append(wf.workflow_id)
                     continue
 
                 # Find steps left in RUNNING
@@ -885,8 +952,20 @@ class WorkflowService:
                     WorkflowStatus.PENDING.value,
                 }:
                     recovered_ids.append(wf.workflow_id)
+                elif wf.status in {
+                    WorkflowStatus.FAILED.value,
+                    WorkflowStatus.EXPIRED.value,
+                    WorkflowStatus.CANCELLED.value,
+                }:
+                    terminal_ids.append(wf.workflow_id)
 
             await session.commit()
+
+        for tid in terminal_ids:
+            try:
+                await self._sync_linked_runs(tid)
+            except Exception as exc:
+                logger.error("Failed syncing linked runs for %s: %s", tid, exc)
 
         # Resume recovered workflows
         for wid in recovered_ids:

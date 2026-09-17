@@ -133,6 +133,14 @@ class AutonomyRunRepository:
         res = await session.execute(stmt)
         return res.scalars().all()
 
+    async def find_by_workflow_id(
+        self, session: AsyncSession, workflow_id: uuid.UUID
+    ) -> Sequence[AutonomyRun]:
+        """Fetch runs linked to a workflow (A8 run linkage)."""
+        stmt = select(AutonomyRun).where(AutonomyRun.workflow_id == workflow_id)
+        res = await session.execute(stmt)
+        return res.scalars().all()
+
 
 class AutonomyDecisionRepository:
     async def list_by_run(

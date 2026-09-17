@@ -388,21 +388,25 @@ class AgentOrchestrator:
         if run.state != OrchestrationState.WAITING_APPROVAL.value:
             raise OrchestrationError(f"Run {run_id} is not awaiting approval (current state: {run.state})")
 
-        # 1. Authorize exact pending action by creating single-use consent
-        action = run.requested_action or "disclose_information"
-        data_cat = run.approval_category or "availability"
-        purpose = run.approval_purpose or "collaboration"
-        target_agent_id = run.target_agent_id or "nexus:anonymous"
+        # 1. Authorize exact pending action by creating single-use consent.
+        # Skip for workflow-backed runs: the workflow's own approval mints the
+        # exact-scope consent, so minting here would leave an unconsumed duplicate.
+        is_workflow_backed = run.workflow_id is not None and self._workflow is not None
+        if not is_workflow_backed:
+            action = run.requested_action or "disclose_information"
+            data_cat = run.approval_category or "availability"
+            purpose = run.approval_purpose or "collaboration"
+            target_agent_id = run.target_agent_id or "nexus:anonymous"
 
-        await self._policy.create_consent(
-            owner_id,
-            requester_agent_id=target_agent_id,
-            data_category=data_cat,
-            action=action,
-            purpose=purpose,
-            decision="ALLOW",
-            single_use=True,
-        )
+            await self._policy.create_consent(
+                owner_id,
+                requester_agent_id=target_agent_id,
+                data_category=data_cat,
+                action=action,
+                purpose=purpose,
+                decision="ALLOW",
+                single_use=True,
+            )
 
         # 2. Update run record to EXECUTING
         async with self._session_factory() as session:
@@ -439,6 +443,16 @@ class AgentOrchestrator:
                     run_id=str(run.id),
                     status="waiting_remote" if wf.status == "waiting_remote" else "waiting_approval",
                     message="Waiting for remote response.",
+                    intent_type=run.intent_type,
+                    target=run.target_person,
+                )
+            elif wf.status == "running":
+                # A5 timing: advancement is deferred to jobs, so the workflow
+                # is resuming asynchronously; the run is already EXECUTING.
+                return OrchestrationExecuteResponse(
+                    run_id=str(run.id),
+                    status="executing",
+                    message="Workflow resuming.",
                     intent_type=run.intent_type,
                     target=run.target_person,
                 )
