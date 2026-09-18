@@ -42,6 +42,13 @@ export type ApprovalItem = {
   createdAt?: string | null;
   expiresAt?: string | null;
   riskLevel?: string | null;
+  /**
+   * How the item ended, for decided items only (a task status like
+   * "completed", an orchestration state, or "approved"/"declined" for a
+   * decision just made in the UI). Pending and waiting items leave this
+   * unset; the Done pane renders it as the outcome badge.
+   */
+  outcome?: string | null;
 };
 
 export type ApprovalsResult = {
@@ -102,32 +109,106 @@ async function loadSource<T>(
   }
 }
 
-async function loadTasks(): Promise<ApprovalItem[]> {
-  const data = await apiFetch<{ tasks: any[] }>("/a2a/tasks");
-  return (data.tasks ?? [])
-    .filter((t) => isPending(t.status))
-    .map((t) => ({
-      id: `task:${t.task_id}`,
-      source: "task" as const,
-      recordId: t.task_id,
-      // The sender is resolved to a display name at render time (the Inbox
-      // holds the contact-names map); here only a short, obviously-truncated
-      // fallback is used — never a raw 24-char ID slice.
-      title: `Task from ${shortContactId(t.sender_agent_id)}`,
-      summary: short(
-        t.request_payload?.message ??
-          t.request_payload?.query ??
-          t.task_type ??
-          "A remote agent is requesting an action."
-      ),
-      requestedAction: t.task_type ?? t.request_payload?.action ?? null,
-      requestedBy: t.sender_agent_id ?? null,
-      category: t.request_payload?.data_category ?? null,
-      purpose: t.purpose ?? null,
-      createdAt: t.created_at ?? null,
-      expiresAt: t.expires_at ?? null,
-    }));
+async function loadTasks(): Promise<TaskBuckets> {
+  const [data, identity] = await Promise.all([
+    apiFetch<{ tasks: any[] }>("/a2a/tasks"),
+    // Outbound means "sent by me": the delegate path records
+    // sender_agent_id = the local agent id (A2AService.delegate_task in
+    // app/a2a/service.py), so the owner-scoped list is split on /identity.
+    // A failure here must not sink the task list, hence the local catch.
+    apiFetch<{ agent_id: string }>("/identity").catch((): null => null),
+  ]);
+  const ownId = identity?.agent_id ?? null;
+  const pending: ApprovalItem[] = [];
+  const waitingOutbox: ApprovalItem[] = [];
+  const recentlyDecided: ApprovalItem[] = [];
+  for (const t of data.tasks ?? []) {
+    if (isPending(t.status)) pending.push(toTaskPendingItem(t));
+    else if (isTaskWaitingOutbox(t.status)) {
+      // "Waiting on others" is sender-scoped by definition. Without the own
+      // id there is no safe split, so those items stay out of the pane
+      // rather than mislabelled.
+      if (ownId !== null && t.sender_agent_id === ownId)
+        waitingOutbox.push(toTaskOutboxItem(t));
+    } else if (isTaskTerminal(t.status))
+      recentlyDecided.push(toTaskDecidedItem(t, ownId));
+  }
+  return { pending, waitingOutbox, recentlyDecided };
 }
+
+/** Active outbound states: sent, accepted or in flight — none need a decision. */
+const TASK_WAITING_OUTBOX_STATUSES = new Set([
+  "pending",
+  "accepted",
+  "waiting_remote",
+]);
+
+function isTaskWaitingOutbox(status: unknown): boolean {
+  return typeof status === "string" && TASK_WAITING_OUTBOX_STATUSES.has(status);
+}
+
+/** Terminal states, exactly as in TaskStatus (app/a2a/models.py). */
+const TASK_TERMINAL_STATUSES = new Set([
+  "rejected",
+  "completed",
+  "failed",
+  "expired",
+  "cancelled",
+]);
+
+function isTaskTerminal(status: unknown): boolean {
+  return typeof status === "string" && TASK_TERMINAL_STATUSES.has(status);
+}
+
+function toTaskPendingItem(t: any): ApprovalItem {
+  return {
+    id: `task:${t.task_id}`,
+    source: "task" as const,
+    recordId: t.task_id,
+    // The sender is resolved to a display name at render time (the Inbox
+    // holds the contact-names map); here only a short, obviously-truncated
+    // fallback is used — never a raw 24-char ID slice.
+    title: `Task from ${shortContactId(t.sender_agent_id)}`,
+    summary: short(
+      t.request_payload?.message ??
+        t.request_payload?.query ??
+        t.task_type ??
+        "A remote agent is requesting an action."
+    ),
+    requestedAction: t.task_type ?? t.request_payload?.action ?? null,
+    requestedBy: t.sender_agent_id ?? null,
+    category: t.request_payload?.data_category ?? null,
+    purpose: t.purpose ?? null,
+    createdAt: t.created_at ?? null,
+    expiresAt: t.expires_at ?? null,
+  };
+}
+
+function toTaskOutboxItem(t: any): ApprovalItem {
+  return {
+    ...toTaskPendingItem(t),
+    // The peer we are waiting on is the recipient, not the sender.
+    title: `Task to ${shortContactId(t.recipient_agent_id)}`,
+    requestedBy: t.recipient_agent_id ?? null,
+  };
+}
+
+function toTaskDecidedItem(t: any, ownId: string | null): ApprovalItem {
+  const outbound = ownId !== null && t.sender_agent_id === ownId;
+  const peer = outbound ? t.recipient_agent_id : t.sender_agent_id;
+  return {
+    ...toTaskPendingItem(t),
+    title: `Task ${outbound ? "to" : "from"} ${shortContactId(peer)}`,
+    requestedBy: peer ?? null,
+    outcome: typeof t.status === "string" ? t.status : null,
+  };
+}
+
+export type TaskBuckets = {
+  pending: ApprovalItem[];
+  waitingOutbox: ApprovalItem[];
+  recentlyDecided: ApprovalItem[];
+};
 
 async function loadWorkflows(): Promise<ApprovalItem[]> {
   const data = await apiFetch<{ workflows: any[] }>("/workflows");
@@ -228,6 +309,8 @@ function toOrchestrationItem(r: any): ApprovalItem {
     category: r.approval_category ?? null,
     purpose: r.approval_purpose ?? null,
     createdAt: r.created_at ?? null,
+    // The Done pane renders this; the pending pane ignores it.
+    outcome: typeof r.state === "string" ? r.state.toLowerCase() : null,
   };
 }
 
@@ -275,7 +358,6 @@ export async function listApprovals(): Promise<ApprovalsResult> {
   let recentlyDecided: ApprovalItem[] = [];
 
   for (const [source, outcome] of [
-    ["task", task],
     ["workflow", workflow],
     ["autonomy", autonomy],
   ] as Array<[ApprovalSource, { items?: ApprovalItem[]; error?: string }]>) {
@@ -289,6 +371,16 @@ export async function listApprovals(): Promise<ApprovalsResult> {
     recentlyDecided = orchestration.items.recentlyDecided;
   } else {
     unavailable.push({ source: "orchestration", reason: orchestration.error });
+  }
+
+  // B5: the task source fans out the same way — pending joins the inbox,
+  // outbound-active joins waiting-on-others, terminal joins done-today.
+  if ("items" in task) {
+    items.push(...task.items.pending);
+    waitingOutbox.push(...task.items.waitingOutbox);
+    recentlyDecided.push(...task.items.recentlyDecided);
+  } else {
+    unavailable.push({ source: "task", reason: task.error });
   }
 
   // Oldest first: an approval that has been waiting longest deserves attention.
