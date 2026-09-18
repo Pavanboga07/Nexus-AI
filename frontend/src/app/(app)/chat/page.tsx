@@ -12,6 +12,8 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { Send } from "lucide-react";
 
 import { Button } from "@/components/ui/Button";
@@ -217,13 +219,67 @@ export default function ChatPage() {
                 className={message.role === "user" ? "flex justify-end" : "flex"}
               >
                 <div
-                  className={`max-w-[85%] whitespace-pre-wrap rounded-lg px-3.5 py-2 text-sm leading-relaxed ${
+                  className={`max-w-[85%] rounded-lg px-3.5 py-2 text-sm leading-relaxed ${
                     message.role === "user"
-                      ? "bg-neutral-100 text-neutral-900"
-                      : "border border-neutral-800/70 bg-neutral-900/50 text-neutral-200"
+                      ? "whitespace-pre-wrap bg-neutral-100 text-neutral-900"
+                      : "break-words border border-neutral-800/70 bg-neutral-900/50 text-neutral-200"
                   }`}
                 >
-                  {message.content}
+                  {message.role === "user" ? (
+                    message.content
+                  ) : (
+                    // No rehype-raw: raw HTML in model output stays inert text.
+                    <ReactMarkdown
+                      remarkPlugins={[remarkGfm]}
+                      components={{
+                        a: ({ href, children }) => {
+                          // Model text is untrusted: javascript:/data: links
+                          // render as inert text, never as clickable hrefs.
+                          if (!href || !/^(https?:|mailto:)/i.test(href)) {
+                            return <span>{children}</span>;
+                          }
+                          return (
+                            <a
+                              href={href}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="underline underline-offset-2 hover:text-neutral-100"
+                            >
+                              {children}
+                            </a>
+                          );
+                        },
+                        // Tailwind preflight strips list markers; re-add them.
+                        ul: ({ children }) => (
+                          <ul className="my-1.5 list-disc space-y-1 pl-5">
+                            {children}
+                          </ul>
+                        ),
+                        ol: ({ children }) => (
+                          <ol className="my-1.5 list-decimal space-y-1 pl-5">
+                            {children}
+                          </ol>
+                        ),
+                        p: ({ children }) => (
+                          <p className="my-1.5 first:mt-0 last:mb-0">
+                            {children}
+                          </p>
+                        ),
+                        pre: ({ children }) => (
+                          <pre className="my-1.5 overflow-x-auto rounded bg-neutral-950 p-2 font-mono text-xs text-neutral-300">
+                            {children}
+                          </pre>
+                        ),
+                        code: ({ children }) => (
+                          <code className="rounded bg-neutral-950 px-1 py-0.5 font-mono text-xs text-neutral-300 [pre_&]:bg-transparent [pre_&]:p-0">
+                            {children}
+                          </code>
+                        ),
+                      }}
+                    >
+                      {message.content}
+                    </ReactMarkdown>
+                  )}
                 </div>
               </div>
             ))}
