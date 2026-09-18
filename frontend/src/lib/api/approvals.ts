@@ -419,10 +419,17 @@ export async function decideApproval(
     method: "POST",
     // Each endpoint accepts an optional body with the owner's note; sending an
     // empty object keeps one call shape for all four.
+    // Autonomy is the exception: AutonomyApprovalDecisionRequest requires
+    // `approved: bool` (app/autonomy/schemas.py), and carries `notes` but no
+    // `reason` — so the autonomy branch sends the flag plus notes.
     body: JSON.stringify(
-      decision === "approve"
-        ? { notes: "Approved" }
-        : { reason: "Declined by owner" }
+      source === "autonomy"
+        ? decision === "approve"
+          ? { approved: true, notes: "Approved" }
+          : { approved: false, notes: "Declined by owner" }
+        : decision === "approve"
+          ? { notes: "Approved" }
+          : { reason: "Declined by owner" }
     ),
   });
 }

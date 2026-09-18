@@ -1568,44 +1568,49 @@ def test_inbox_decision_bodies_validate_against_backend_schemas() -> None:
     OrchestrationRejectRequest.model_validate(deny_body)
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "decideApproval sends {notes}/{reason} but AutonomyApprovalDecisionRequest "
-        "requires `approved: bool` — both Inbox autonomy decisions 422. Fix the "
-        "source (send {approved, notes}), then drop this marker."
-    ),
-)
+def _inbox_autonomy_decision_bodies() -> tuple[dict, dict]:
+    """The autonomy approve/deny literal bodies `decideApproval` sends.
+
+    Autonomy is the exception in the fan-out: `AutonomyApprovalDecisionRequest`
+    requires `approved: bool` and carries `notes` (no `reason`), so the
+    autonomy branch sends `{approved, notes}` while the other three sources
+    keep `{notes}`/`{reason}` (see `_inbox_decision_bodies`).
+    """
+    source = (SRC / "lib" / "api" / "approvals.ts").read_text(encoding="utf-8")
+    anchor = source.find("export async function decideApproval")
+    assert anchor != -1, "decideApproval is gone from approvals.ts"
+    block = source[anchor : anchor + 1500]
+    approve = re.search(
+        r'\{\s*approved\s*:\s*true\s*,\s*notes\s*:\s*"([^"]*)"\s*\}', block
+    )
+    deny = re.search(
+        r'\{\s*approved\s*:\s*false\s*,\s*notes\s*:\s*"([^"]*)"\s*\}', block
+    )
+    assert approve and deny, (
+        "decideApproval no longer sends {approved, notes} autonomy literals; "
+        "re-read the function and re-pair each body with its route schema."
+    )
+    return {"approved": True, "notes": approve.group(1)}, {
+        "approved": False,
+        "notes": deny.group(1),
+    }
+
+
 def test_inbox_autonomy_decision_bodies_validate_against_backend_schema() -> None:
-    """KNOWN DEFECT — the Inbox autonomy bodies do not validate. Locked here
-    as xfail (strict=False, so the suite stays green and the fix shows up as
-    an XPASS) instead of hidden in a report.
+    """The Inbox autonomy bodies validate against the decision schema.
 
-    Defect class: frontend/backend vocabulary mismatch with no runtime
-    symptom until the button is clicked — the audit's whole family
-    (`entries`-vs-`messages`, B1's `status`/`id`-vs-`state`/`run_id`), and
-    B1's own "verify the bodies against the schema, fix the payload if it
-    disagrees" step, which covered orchestration but never autonomy.
-
-    Established fact (no tree mutation needed for the red proof): with the
-    bodies read live out of `decideApproval` above,
-    `AutonomyApprovalDecisionRequest.model_validate({"notes": "Approved"})`
-    raises `Field required: approved`, and the deny body fails the same way
-    (`reason` is not even a field of the model). Over HTTP that is a 422 on
-    `POST /autonomy/runs/{id}/approve` and `.../reject` — from the Inbox AND
-    from the autonomy page (`approveAutonomyRun`/`rejectAutonomyRun` in
-    autonomy.ts send `{notes}` to the same models). Backend tests never sent
-    these bodies over HTTP (test_part10_autonomy.py exercises the service,
-    not the route payloads), which is how it survived.
-
-    Fix prescription (source change, out of scope for test-only B7): send
-    `{approved: true, notes}` / `{approved: false, notes}` from
-    `decideApproval` and the autonomy.ts wrappers, or give the schema a
-    default for `approved`. Either way this test — which validates the real
-    bodies against the real model — is the acceptance check.
+    B7 locked this as xfail: `decideApproval` sent `{notes}`/`{reason}` but
+    `AutonomyApprovalDecisionRequest` requires `approved: bool`, so both
+    Inbox autonomy decisions 422'd. Fixed by sending
+    `{approved: true, notes}` / `{approved: false, notes}` from the autonomy
+    branch of `decideApproval` (and the same flag from the autonomy.ts
+    wrappers, which hit the same models). The bodies are read live out of
+    `decideApproval`, so a payload change is picked up, not silently skipped.
     """
     from app.autonomy.schemas import AutonomyApprovalDecisionRequest
 
-    approve_body, deny_body = _inbox_decision_bodies()
+    approve_body, deny_body = _inbox_autonomy_decision_bodies()
+    assert approve_body["approved"] is True
+    assert deny_body["approved"] is False
     AutonomyApprovalDecisionRequest.model_validate(approve_body)
     AutonomyApprovalDecisionRequest.model_validate(deny_body)

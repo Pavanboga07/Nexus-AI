@@ -49,7 +49,7 @@ export async function approveAutonomyRun(
 ): Promise<AutonomyRunOut> {
   return apiFetch<AutonomyRunOut>(`/autonomy/runs/${runId}/approve`, {
     method: "POST",
-    body: JSON.stringify({ notes }),
+    body: JSON.stringify({ approved: true, notes }),
   });
 }
 
@@ -59,7 +59,7 @@ export async function rejectAutonomyRun(
 ): Promise<AutonomyRunOut> {
   return apiFetch<AutonomyRunOut>(`/autonomy/runs/${runId}/reject`, {
     method: "POST",
-    body: JSON.stringify({ notes }),
+    body: JSON.stringify({ approved: false, notes }),
   });
 }
 
