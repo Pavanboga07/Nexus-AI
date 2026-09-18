@@ -12,6 +12,7 @@ import { formatDate } from "@/lib/utils";
 import {
   DirectoryAgent,
   TrustedAgent,
+  cardUrlForResult,
   connectByCardUrl,
   listTrusted,
   removeTrust,
@@ -27,6 +28,8 @@ export default function PeoplePage() {
   const [searching, setSearching] = useState(false);
   const [cardUrl, setCardUrl] = useState("");
   const [connecting, setConnecting] = useState(false);
+  /** The directory result with a connect in flight; its button shows busy. */
+  const [connectingId, setConnectingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   /** The trusted row with revoke/remove in flight; its buttons show busy. */
@@ -84,6 +87,37 @@ export default function PeoplePage() {
       setError(err instanceof ApiError ? err.message : "Could not connect.");
     } finally {
       setConnecting(false);
+    }
+  }
+
+  async function onConnectResult(agent: DirectoryAgent) {
+    // Verified-only: the button is disabled otherwise, but guard anyway —
+    // an unverified card must never reach the trust-creating endpoint.
+    if (connectingId !== null || !agent.verified) return;
+    const url = cardUrlForResult(agent);
+    if (!url) {
+      setError("No endpoint to fetch that agent's card from.");
+      return;
+    }
+    setError(null);
+    setNotice(null);
+    setConnectingId(agent.agent_id);
+    try {
+      const connected = await connectByCardUrl(url, agent.display_name);
+      setNotice(`Connected to ${connected.display_name}.`);
+      invalidateContactNames();
+      await loadTrusted();
+      setResults((prev) =>
+        prev === null
+          ? prev
+          : prev.map((r) =>
+              r.agent_id === agent.agent_id ? { ...r, is_trusted: true } : r
+            )
+      );
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not connect.");
+    } finally {
+      setConnectingId(null);
     }
   }
 
@@ -326,10 +360,32 @@ export default function PeoplePage() {
                         </p>
                       )}
                     </div>
-                    {agent.is_trusted && (
+                    {agent.is_trusted ? (
                       <span className="shrink-0 text-[10px] uppercase text-neutral-500">
                         connected
                       </span>
+                    ) : agent.verified ? (
+                      <Button
+                        size="sm"
+                        onClick={() => void onConnectResult(agent)}
+                        isLoading={connectingId === agent.agent_id}
+                        disabled={connectingId !== null}
+                        title="Fetch the signed card and pin its key"
+                      >
+                        Connect
+                      </Button>
+                    ) : (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled
+                        title={
+                          agent.verification_error ??
+                          "Not verified — connect is unavailable"
+                        }
+                      >
+                        Connect
+                      </Button>
                     )}
                   </div>
                 </li>
