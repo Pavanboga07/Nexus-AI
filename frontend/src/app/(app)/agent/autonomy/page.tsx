@@ -100,6 +100,7 @@ export default function AutonomyPage() {
   };
 
   const handleModeChange = async (newMode: AutonomyMode) => {
+    if (updatingConfig) return;
     try {
       setUpdatingConfig(true);
       setActionError(null);
@@ -113,6 +114,7 @@ export default function AutonomyPage() {
   };
 
   const handleToggleSetting = async (key: keyof AutonomyConfigOut, val: boolean) => {
+    if (updatingConfig) return;
     try {
       setUpdatingConfig(true);
       setActionError(null);
@@ -127,6 +129,7 @@ export default function AutonomyPage() {
 
   const handleCreateRun = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (creating) return;
     if (!goal.trim()) return;
 
     try {
@@ -149,6 +152,7 @@ export default function AutonomyPage() {
 
   const handleApproveConfirm = async (notes?: string) => {
     if (!approveTarget) return;
+    if (busyId !== null) return;
     const runId = approveTarget.id;
     setApproveTarget(null);
     setBusyId(runId);
@@ -166,6 +170,7 @@ export default function AutonomyPage() {
 
   const handleRejectConfirm = async (notes?: string) => {
     if (!rejectTarget) return;
+    if (busyId !== null) return;
     const runId = rejectTarget.id;
     setRejectTarget(null);
     setBusyId(runId);
@@ -183,6 +188,7 @@ export default function AutonomyPage() {
 
   const handleStopConfirm = async () => {
     if (!stopTarget) return;
+    if (busyId !== null) return;
     const runId = stopTarget.id;
     setStopTarget(null);
     setBusyId(runId);

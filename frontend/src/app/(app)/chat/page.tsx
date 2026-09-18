@@ -44,6 +44,8 @@ export default function ChatPage() {
   const [startingNew, setStartingNew] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState<ApprovalItem[]>([]);
+  /** The inline approval with a decision in flight; its buttons show busy. */
+  const [decidingId, setDecidingId] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   // Approval evidence resolves agent IDs to display names, as the Inbox does.
   const { resolve: resolveName } = useContactNames();
@@ -164,6 +166,8 @@ export default function ChatPage() {
   }
 
   async function decide(item: ApprovalItem, decision: "approve" | "deny") {
+    if (decidingId !== null) return;
+    setDecidingId(item.id);
     setError(null);
     try {
       await decideApproval(item.source, item.recordId, decision);
@@ -172,6 +176,8 @@ export default function ChatPage() {
       setError(
         err instanceof ApiError ? err.message : "That decision was not recorded."
       );
+    } finally {
+      setDecidingId(null);
     }
   }
 
@@ -301,13 +307,20 @@ export default function ChatPage() {
                         </details>
                       </div>
                       <div className="flex shrink-0 gap-1.5">
-                        <Button size="sm" onClick={() => decide(item, "approve")}>
+                        <Button
+                          size="sm"
+                          onClick={() => decide(item, "approve")}
+                          isLoading={decidingId === item.id}
+                          disabled={decidingId !== null}
+                        >
                           Approve
                         </Button>
                         <Button
                           size="sm"
                           variant="outline"
                           onClick={() => decide(item, "deny")}
+                          isLoading={decidingId === item.id}
+                          disabled={decidingId !== null}
                         >
                           No
                         </Button>

@@ -110,6 +110,7 @@ export default function TasksPage() {
 
   const handleCreateTask = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (creating) return;
     if (!recipientAgentId) {
       setCreateError("Please select a recipient agent.");
       return;
@@ -142,6 +143,7 @@ export default function TasksPage() {
   };
 
   const handleApprove = async (taskId: string) => {
+    if (busyId !== null) return;
     setBusyId(taskId);
     setActionError(null);
     try {
@@ -160,6 +162,7 @@ export default function TasksPage() {
 
   const handleRejectConfirm = async (reason?: string) => {
     if (!rejectTarget) return;
+    if (busyId !== null) return;
     const taskId = rejectTarget.task_id;
     setRejectTarget(null);
     setBusyId(taskId);
@@ -180,6 +183,7 @@ export default function TasksPage() {
 
   const handleCancelConfirm = async () => {
     if (!cancelTarget) return;
+    if (busyId !== null) return;
     const taskId = cancelTarget.task_id;
     setCancelTarget(null);
     setBusyId(taskId);
@@ -200,6 +204,7 @@ export default function TasksPage() {
 
   const handleNegotiateSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (negotiating) return;
     if (!selectedTask) return;
     let termsObj = {};
     try {

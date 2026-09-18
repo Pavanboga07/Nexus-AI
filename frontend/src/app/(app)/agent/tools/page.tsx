@@ -88,6 +88,7 @@ export default function ToolsPage() {
 
   const handleExecute = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (executing) return;
     if (!selectedTool) return;
 
     let parsedArgs = {};

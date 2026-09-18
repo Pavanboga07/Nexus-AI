@@ -68,6 +68,10 @@ export function useContactNames(): {
 
   const reload = useCallback(() => {
     setLoading(true);
+    // Clear the module-level promise cache first: otherwise this re-reads
+    // the stale promise and a connect/revoke/remove never becomes visible
+    // without a full page reload.
+    invalidateContactNames();
     void loadNamesOnce().then((map) => {
       setNames(new Map(map));
       setLoading(false);

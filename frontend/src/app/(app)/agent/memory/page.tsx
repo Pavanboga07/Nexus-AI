@@ -54,6 +54,7 @@ export default function MemoryPage() {
 
   const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (searching) return;
     if (!searchQuery.trim()) {
       setSearchResults(null);
       setSearchError(null);
@@ -85,6 +86,7 @@ export default function MemoryPage() {
 
   const handleDeleteConfirm = async () => {
     if (!deleteTarget) return;
+    if (busyId !== null) return;
     const memoryId = deleteTarget.id;
     setDeleteTarget(null);
     setBusyId(memoryId);

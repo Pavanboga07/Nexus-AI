@@ -63,6 +63,7 @@ export default function InboxPage() {
   }, [load]);
 
   async function decide(item: ApprovalItem, decision: "approve" | "deny") {
+    if (busyId !== null) return;
     setBusyId(item.id);
     setError(null);
     try {

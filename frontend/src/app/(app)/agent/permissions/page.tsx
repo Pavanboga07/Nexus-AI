@@ -66,6 +66,7 @@ export default function PermissionsPage() {
 
   const handleSimulate = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (simulating) return;
     try {
       setSimulating(true);
       setSimResult(null);

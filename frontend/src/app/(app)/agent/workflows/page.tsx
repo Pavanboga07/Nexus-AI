@@ -73,6 +73,7 @@ export default function WorkflowsPage() {
   }, []);
 
   const handleStartWorkflow = async (id: string) => {
+    if (busyId !== null) return;
     setBusyId(id);
     setActionError(null);
     try {
@@ -90,6 +91,7 @@ export default function WorkflowsPage() {
   };
 
   const handleApproveStep = async (id: string, stepId?: string) => {
+    if (busyId !== null) return;
     setBusyId(id);
     setActionError(null);
     try {
@@ -106,6 +108,7 @@ export default function WorkflowsPage() {
 
   const handleCancelConfirm = async () => {
     if (!cancelTarget) return;
+    if (busyId !== null) return;
     const id = cancelTarget.workflow_id;
     setCancelTarget(null);
     setBusyId(id);
@@ -126,6 +129,7 @@ export default function WorkflowsPage() {
 
   const handleCreateMeetingWorkflow = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (creating) return;
     if (!selectedPeerId) {
       setCreateError("Please select a trusted peer agent.");
       return;

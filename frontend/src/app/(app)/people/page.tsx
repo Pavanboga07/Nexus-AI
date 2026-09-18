@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/Button";
 import { ConfirmModal } from "@/components/ui/ConfirmModal";
 import { ErrorState } from "@/components/ui/ErrorState";
 import { ApiError } from "@/lib/api/client";
+import { invalidateContactNames } from "@/lib/useContactNames";
 import { formatDate } from "@/lib/utils";
 import {
   DirectoryAgent,
@@ -51,6 +52,7 @@ export default function PeoplePage() {
 
   async function onSearch(event: React.FormEvent) {
     event.preventDefault();
+    if (searching) return;
     setError(null);
     setNotice(null);
     setSearching(true);
@@ -66,6 +68,7 @@ export default function PeoplePage() {
 
   async function onConnect(event: React.FormEvent) {
     event.preventDefault();
+    if (connecting) return;
     setError(null);
     setNotice(null);
     setConnecting(true);
@@ -73,6 +76,7 @@ export default function PeoplePage() {
       const agent = await connectByCardUrl(cardUrl.trim());
       setNotice(`Connected to ${agent.display_name}.`);
       setCardUrl("");
+      invalidateContactNames();
       await loadTrusted();
     } catch (err) {
       // The backend refuses to register an agent whose card does not verify;
@@ -85,12 +89,14 @@ export default function PeoplePage() {
 
   async function onRevokeConfirm() {
     if (!revokeTarget) return;
+    if (busyAgentId !== null) return;
     const agentId = revokeTarget.agent_id;
     setRevokeTarget(null);
     setError(null);
     setBusyAgentId(agentId);
     try {
       await revokeTrust(agentId);
+      invalidateContactNames();
       await loadTrusted();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not revoke.");
@@ -101,12 +107,14 @@ export default function PeoplePage() {
 
   async function onRemoveConfirm() {
     if (!removeTarget) return;
+    if (busyAgentId !== null) return;
     const agentId = removeTarget.agent_id;
     setRemoveTarget(null);
     setError(null);
     setBusyAgentId(agentId);
     try {
       await removeTrust(agentId);
+      invalidateContactNames();
       await loadTrusted();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not remove.");
