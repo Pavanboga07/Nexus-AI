@@ -14,6 +14,7 @@ import Link from "next/link";
 import { AlertCircle, Copy, Check, Fingerprint } from "lucide-react";
 
 import { Button } from "@/components/ui/Button";
+import { ErrorState } from "@/components/ui/ErrorState";
 import { ApiError, apiFetch } from "@/lib/api/client";
 import { getCapabilities, CapabilityInfo } from "@/lib/api/identity";
 import { getStatus, StatusResponse } from "@/lib/api/status";
@@ -32,23 +33,51 @@ export default function AgentPage() {
   );
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
+  /** Capability fetch failure is distinct from genuinely empty (see below). */
+  const [capError, setCapError] = useState<string | null>(null);
+  /** Status fetch failure must not hide the grid silently. */
+  const [statusError, setStatusError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setError(null);
+    setCapError(null);
+    setStatusError(null);
+    let id: Identity;
     try {
-      const [id, st, capRes] = await Promise.all([
-        apiFetch<Identity>("/identity"),
-        getStatus().catch(() => null),
-        getCapabilities().catch(() => null),
-      ]);
+      id = await apiFetch<Identity>("/identity");
       setIdentity(id);
-      setStatus(st);
-      setCapabilities(capRes ? capRes.capabilities : []);
     } catch (err) {
       setError(
         err instanceof ApiError
           ? err.message
           : "Could not read your agent's identity."
+      );
+      return;
+    }
+    // Status and capabilities are independent: one failing must neither hide
+    // the other nor masquerade as "empty".
+    const [stRes, capRes] = await Promise.allSettled([
+      getStatus(),
+      getCapabilities(),
+    ]);
+    if (stRes.status === "fulfilled") {
+      setStatus(stRes.value);
+    } else {
+      setStatus(null);
+      setStatusError(
+        stRes.reason instanceof ApiError
+          ? stRes.reason.message
+          : "Couldn't reach the server."
+      );
+    }
+    if (capRes.status === "fulfilled") {
+      setCapabilities(capRes.value.capabilities);
+    } else {
+      setCapabilities(null);
+      setCapError(
+        capRes.reason instanceof ApiError
+          ? capRes.reason.message
+          : "Couldn't reach the server."
       );
     }
   }, []);
@@ -128,6 +157,16 @@ export default function AgentPage() {
         </section>
 
         {/* --- Subsystem status --- */}
+        {/* A fetch failure shows an error with Retry in place of the grid —
+            never a silently missing section. */}
+        {!status && statusError && (
+          <section>
+            <h2 className="mb-3 text-xs font-semibold uppercase tracking-wide text-neutral-500">
+              Status
+            </h2>
+            <ErrorState message={statusError} onRetry={() => void load()} />
+          </section>
+        )}
         {status && (
           <section>
             <h2 className="mb-3 text-xs font-semibold uppercase tracking-wide text-neutral-500">
@@ -161,7 +200,9 @@ export default function AgentPage() {
           <h2 className="mb-3 text-xs font-semibold uppercase tracking-wide text-neutral-500">
             What your agent can do
           </h2>
-          {capabilities === null ? (
+          {capError ? (
+            <ErrorState message={capError} onRetry={() => void load()} />
+          ) : capabilities === null ? (
             <div className="h-20 animate-pulse rounded-lg border border-neutral-800/60 bg-neutral-900/40" />
           ) : capabilities.length === 0 ? (
             <p className="rounded-lg border border-neutral-800/60 bg-neutral-900/30 px-4 py-3 text-xs text-neutral-500">
