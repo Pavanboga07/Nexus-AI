@@ -15,10 +15,19 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Send } from "lucide-react";
+import Link from "next/link";
 
 import { Button } from "@/components/ui/Button";
+import { Modal } from "@/components/ui/Modal";
 import { ApiError, apiFetch } from "@/lib/api/client";
 import { useContactNames } from "@/lib/useContactNames";
+import { useCapabilities } from "@/lib/useCapabilities";
+import { listTrustedAgents, TrustedAgent } from "@/lib/api/a2a";
+import {
+  CAPABILITY_TASK_TYPES,
+  delegateTask,
+  payloadForTaskType,
+} from "@/lib/api/tasks";
 import { formatDate } from "@/lib/utils";
 import {
   ApprovalItem,
@@ -51,6 +60,95 @@ export default function ChatPage() {
   const bottomRef = useRef<HTMLDivElement | null>(null);
   // Approval evidence resolves agent IDs to display names, as the Inbox does.
   const { resolve: resolveName } = useContactNames();
+
+  // Ask-a-person: explicit contact → capability → purpose → summary picker
+  // that creates a task through the delegate endpoint. Nothing is inferred
+  // from free text; every dimension is a deliberate selection.
+  const [askOpen, setAskOpen] = useState(false);
+  const [askContact, setAskContact] = useState("");
+  const [askCapability, setAskCapability] = useState("");
+  const [askPurpose, setAskPurpose] = useState("");
+  const [askSummary, setAskSummary] = useState("");
+  const [askSending, setAskSending] = useState(false);
+  const [askError, setAskError] = useState<string | null>(null);
+  const [askSentTo, setAskSentTo] = useState<string | null>(null);
+  const [contacts, setContacts] = useState<TrustedAgent[]>([]);
+  const [contactsError, setContactsError] = useState<string | null>(null);
+  const {
+    capabilities,
+    loading: capsLoading,
+    error: capsError,
+    reload: reloadCaps,
+  } = useCapabilities();
+  const askTaskType = CAPABILITY_TASK_TYPES[askCapability] ?? "";
+
+  useEffect(() => {
+    if (!askOpen) return;
+    let live = true;
+    setContactsError(null);
+    void listTrustedAgents()
+      .then((res) => {
+        if (live) setContacts(res.agents ?? []);
+      })
+      .catch((err: unknown) => {
+        if (live)
+          setContactsError(
+            err instanceof ApiError ? err.message : "Could not load contacts."
+          );
+      });
+    return () => {
+      live = false;
+    };
+  }, [askOpen]);
+
+  function closeAsk() {
+    setAskOpen(false);
+    setAskContact("");
+    setAskCapability("");
+    setAskPurpose("");
+    setAskSummary("");
+    setAskError(null);
+    setAskSentTo(null);
+  }
+
+  async function sendAsk(event: React.FormEvent) {
+    event.preventDefault();
+    if (askSending) return;
+    if (!askContact) {
+      setAskError("Please choose who to ask.");
+      return;
+    }
+    if (!askTaskType) {
+      setAskError(
+        askCapability
+          ? "This capability cannot be sent as a task yet."
+          : "Please choose what to ask for."
+      );
+      return;
+    }
+    const summary = askSummary.trim();
+    if (!summary) {
+      setAskError("Please say what you are asking for.");
+      return;
+    }
+    setAskSending(true);
+    setAskError(null);
+    try {
+      await delegateTask({
+        recipient_agent_id: askContact,
+        task_type: askTaskType,
+        purpose: askPurpose.trim() || `Chat ${askTaskType}`,
+        payload: payloadForTaskType(askTaskType, summary),
+      });
+      setAskSentTo(resolveName(askContact));
+    } catch (err) {
+      setAskError(
+        err instanceof ApiError ? err.message : "That request could not be sent."
+      );
+    } finally {
+      setAskSending(false);
+    }
+  }
 
   const refreshPending = useCallback(async () => {
     try {
@@ -192,15 +290,28 @@ export default function ChatPage() {
             It will ask you here before acting on your behalf.
           </p>
         </div>
-        <Button
-          size="sm"
-          variant="ghost"
-          onClick={startNewSession}
-          isLoading={startingNew}
-          disabled={startingNew}
-        >
-          New chat
-        </Button>
+        <div className="flex gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => {
+              setAskError(null);
+              setAskSentTo(null);
+              setAskOpen(true);
+            }}
+          >
+            Ask a person
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={startNewSession}
+            isLoading={startingNew}
+            disabled={startingNew}
+          >
+            New chat
+          </Button>
+        </div>
       </header>
 
       <div className="flex-1 overflow-y-auto px-6 py-5">
@@ -482,6 +593,170 @@ export default function ChatPage() {
           </form>
         </div>
       </div>
+
+      {/* Ask a person: the same delegate flow as Tasks, reached mid-conversation. */}
+      <Modal
+        isOpen={askOpen}
+        onClose={closeAsk}
+        title="Ask a person"
+        subtitle="Send a task to one of your trusted contacts"
+      >
+        {askSentTo ? (
+          <div className="space-y-4">
+            <p className="text-sm text-neutral-200">
+              Sent to {askSentTo}. It will appear under{" "}
+              <Link href="/inbox" className="underline underline-offset-2 hover:text-neutral-100">
+                Waiting on others
+              </Link>{" "}
+              in your inbox.
+            </p>
+            <div className="flex justify-end">
+              <Button size="sm" onClick={closeAsk}>
+                Done
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <form onSubmit={sendAsk} className="space-y-4">
+            {askError && (
+              <p role="alert" className="text-xs text-red-400">
+                {askError}
+              </p>
+            )}
+            <div>
+              <label className="mb-1 block text-xs font-medium text-neutral-400">
+                Who to ask
+              </label>
+              {contactsError ? (
+                <div className="flex items-center gap-2">
+                  <p role="alert" className="flex-1 text-xs text-red-400">
+                    Couldn&apos;t load contacts: {contactsError}
+                  </p>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setContactsError(null);
+                      void listTrustedAgents()
+                        .then((res) => setContacts(res.agents ?? []))
+                        .catch((err: unknown) =>
+                          setContactsError(
+                            err instanceof ApiError
+                              ? err.message
+                              : "Could not load contacts."
+                          )
+                        );
+                    }}
+                  >
+                    Retry
+                  </Button>
+                </div>
+              ) : contacts.length === 0 ? (
+                <p className="text-xs text-neutral-500">
+                  No trusted contacts yet. Connect with someone from People first.
+                </p>
+              ) : (
+                <select
+                  value={askContact}
+                  onChange={(e) => setAskContact(e.target.value)}
+                  className="w-full rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 font-mono text-sm text-neutral-100 focus:border-blue-500 focus:outline-none"
+                >
+                  <option value="">-- Select a person --</option>
+                  {contacts.map((c) => (
+                    <option key={c.agent_id} value={c.agent_id}>
+                      {c.display_name}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="mb-1 block text-xs font-medium text-neutral-400">
+                  What to ask for
+                </label>
+                {capsLoading ? (
+                  <p className="py-2 text-xs text-neutral-500" aria-busy="true">
+                    Loading capabilities…
+                  </p>
+                ) : capsError ? (
+                  <div className="flex items-center gap-2">
+                    <p role="alert" className="flex-1 text-xs text-red-400">
+                      Couldn&apos;t load capabilities.
+                    </p>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={reloadCaps}
+                    >
+                      Retry
+                    </Button>
+                  </div>
+                ) : (
+                  <select
+                    value={askCapability}
+                    onChange={(e) => setAskCapability(e.target.value)}
+                    className="w-full rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 font-mono text-sm text-neutral-100 focus:border-blue-500 focus:outline-none"
+                  >
+                    <option value="">-- Select --</option>
+                    {capabilities.map((cap) => (
+                      <option key={cap.id} value={cap.id} title={cap.description}>
+                        {cap.id}
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </div>
+              <div>
+                <label className="mb-1 block text-xs font-medium text-neutral-400">
+                  Purpose
+                </label>
+                <input
+                  type="text"
+                  value={askPurpose}
+                  onChange={(e) => setAskPurpose(e.target.value)}
+                  placeholder="e.g. Thursday planning"
+                  maxLength={64}
+                  className="w-full rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 text-sm text-neutral-100 focus:border-blue-500 focus:outline-none"
+                />
+              </div>
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-neutral-400">
+                What should they do?
+              </label>
+              <textarea
+                value={askSummary}
+                onChange={(e) => setAskSummary(e.target.value)}
+                rows={3}
+                placeholder="e.g. Are you free Thursday at 6pm?"
+                className="w-full rounded-md border border-neutral-800 bg-neutral-900 p-3 text-sm text-neutral-100 focus:border-blue-500 focus:outline-none"
+              />
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={closeAsk}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="submit"
+                variant="primary"
+                size="sm"
+                disabled={askSending || !askContact || !askTaskType || !askSummary.trim()}
+                isLoading={askSending}
+              >
+                Send request
+              </Button>
+            </div>
+          </form>
+        )}
+      </Modal>
     </div>
   );
 }
