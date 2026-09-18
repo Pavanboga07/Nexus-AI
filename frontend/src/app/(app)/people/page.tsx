@@ -13,7 +13,7 @@ import { formatDate } from "@/lib/utils";
 import {
   DirectoryAgent,
   TrustedAgent,
-  cardUrlForResult,
+  cardUrlFor,
   connectByCardUrl,
   listTrusted,
   removeTrust,
@@ -95,7 +95,7 @@ export default function PeoplePage() {
     // Verified-only: the button is disabled otherwise, but guard anyway —
     // an unverified card must never reach the trust-creating endpoint.
     if (connectingId !== null || !agent.verified) return;
-    const url = cardUrlForResult(agent);
+    const url = cardUrlFor(agent);
     if (!url) {
       setError("No endpoint to fetch that agent's card from.");
       return;

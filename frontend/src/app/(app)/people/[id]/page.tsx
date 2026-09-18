@@ -32,7 +32,11 @@ type PersonData = {
   directory: DirectoryAgent | null;
   /** True when the directory could not be read at all (e.g. no gateway). */
   directoryFailed: boolean;
+  /** True when the directory read succeeded but had no exact agent_id match. */
+  directoryMiss: boolean;
   lastTask: A2ATask | null;
+  /** True when the task list could not be read; lastTask is unknown, not empty. */
+  tasksFailed: boolean;
 };
 
 function b64ToBytes(b64: string): Uint8Array {
@@ -114,12 +118,15 @@ async function loadPerson(agentId: string): Promise<PersonData> {
   }
   const trusted =
     (trustedRes.value ?? []).find((a) => a.agent_id === agentId) ?? null;
+  // Exact agent_id match ONLY. searchDirectory is a keyword search, so its
+  // result list may contain other agents — falling back to value[0] here
+  // would render another agent's key material and capabilities as this
+  // person's (key-misattribution). A miss is null, never a neighbour's row.
   const directory =
     dirRes.status === "fulfilled"
-      ? (dirRes.value ?? []).find((a) => a.agent_id === agentId) ??
-        (dirRes.value ?? [])[0] ??
-        null
+      ? ((dirRes.value ?? []).find((a) => a.agent_id === agentId) ?? null)
       : null;
+  const directoryMiss = dirRes.status === "fulfilled" && directory === null;
   let lastTask: A2ATask | null = null;
   if (taskRes.status === "fulfilled") {
     const peer = (taskRes.value.tasks ?? []).filter(
@@ -132,11 +139,12 @@ async function loadPerson(agentId: string): Promise<PersonData> {
     );
     lastTask = peer[0] ?? null;
   }
+  const tasksFailed = taskRes.status === "rejected";
   if (!trusted && !directory) {
     throw new Error(
       dirRes.status === "rejected"
         ? "Could not load this person. The directory may be unavailable and they are not a contact."
-        : "No contact or directory entry for this agent."
+        : "This person was not found in the directory and is not one of your contacts."
     );
   }
   return {
@@ -144,7 +152,9 @@ async function loadPerson(agentId: string): Promise<PersonData> {
     trusted,
     directory,
     directoryFailed: dirRes.status === "rejected",
+    directoryMiss,
     lastTask,
+    tasksFailed,
   };
 }
 
@@ -243,6 +253,17 @@ export default function PersonPage({ params }: { params: { id: string } }) {
                     Directory unavailable — showing contact record only.
                   </p>
                 )}
+                {data.directoryMiss && (
+                  <p className="text-[11px] text-neutral-500">
+                    Not found in the directory — showing contact record only.{" "}
+                    <Link
+                      href="/people"
+                      className="underline underline-offset-2 hover:text-neutral-300"
+                    >
+                      Back to People
+                    </Link>
+                  </p>
+                )}
                 <CopyRow
                   label="Fingerprint"
                   value={fingerprint}
@@ -288,7 +309,11 @@ export default function PersonPage({ params }: { params: { id: string } }) {
               <h2 className="mb-3 text-xs font-semibold uppercase tracking-wide text-neutral-500">
                 Last exchange
               </h2>
-              {!data.lastTask ? (
+              {data.tasksFailed ? (
+                <p className="rounded-lg border border-amber-900/50 bg-amber-950/30 px-4 py-3 text-xs text-amber-300">
+                  Could not load tasks — this list may be incomplete.
+                </p>
+              ) : !data.lastTask ? (
                 <p className="rounded-lg border border-neutral-800/60 bg-neutral-900/30 px-4 py-3 text-xs text-neutral-500">
                   No tasks with this person yet.
                 </p>

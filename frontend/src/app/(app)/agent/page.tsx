@@ -22,6 +22,7 @@ import {
   getCapabilities,
   CapabilityInfo,
 } from "@/lib/api/identity";
+import { cardUrlFor } from "@/lib/api/people";
 import { getStatus, StatusResponse } from "@/lib/api/status";
 import { AgentCard } from "@/types/api";
 import { formatDate } from "@/lib/utils";
@@ -485,20 +486,6 @@ export default function AgentPage() {
       </div>
     </div>
   );
-}
-
-/**
- * The shareable URL for this deployment's signed card: the well-known path
- * on the card endpoint's origin, which is where the discovery routes serve
- * it (`/.well-known/nexus-agent.json`). Null when the card has no endpoint.
- */
-function cardUrlFor(card: AgentCard): string | null {
-  if (!card.endpoint) return null;
-  try {
-    return `${new URL(card.endpoint).origin}/.well-known/nexus-agent.json`;
-  } catch {
-    return null;
-  }
 }
 
 function Field({

@@ -55,14 +55,17 @@ export async function searchDirectory(query: string): Promise<DirectoryAgent[]> 
 }
 
 /**
- * Where to fetch a directory result's card for the connect flow.
- *
- * The directory payload carries no card URL — only the endpoint from the
- * (verified) card — so the card is fetched from the well-known path on the
+ * The shareable card URL for an agent: the well-known path on the card
  * endpoint's origin, the same path this deployment serves its own card from.
- * Returns null when there is no endpoint to derive from.
+ *
+ * Takes any value with an endpoint (a directory result or the local agent
+ * card) so both call sites share this one derivation. The directory payload
+ * carries no card URL — only the endpoint from the (verified) card — hence
+ * the origin derivation. Returns null when there is no endpoint.
  */
-export function cardUrlForResult(agent: DirectoryAgent): string | null {
+export function cardUrlFor(
+  agent: { endpoint?: string | null }
+): string | null {
   if (!agent.endpoint) return null;
   try {
     return `${new URL(agent.endpoint).origin}/.well-known/nexus-agent.json`;
