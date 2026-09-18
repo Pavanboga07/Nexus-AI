@@ -1188,3 +1188,424 @@ def test_capability_task_types_match_the_backend_registry() -> None:
         "them in _INTENTIONALLY_UNMAPPED_CAPABILITIES:\n  "
         + "\n  ".join(unmapped)
     )
+
+
+# ---------------------------------------------------------------------------
+# B7 Step 1: destructured reads of the approvals fan-out
+# ---------------------------------------------------------------------------
+#
+# Inbox, Chat and the AppShell badge all consume `listApprovals()`, but two of
+# the three do it destructured (`const { items } = await listApprovals()` in
+# AppShell.tsx and chat/page.tsx; `const result = await listApprovals()` +
+# `result.items` in inbox/page.tsx). The read-check above
+# (`test_api_wrappers_declare_the_fields_pages_read`) cannot see any of these:
+# its alias pattern requires a bare identifier (`const (\w+) = await ...`, so
+# `const { items }` never binds), its read pattern requires `.value.` (the
+# fan-out pages read `result.items`, not `result.value.items`), and
+# `listApprovals` returns the NAMED type `ApprovalsResult`, so
+# `_declared_return_fields` (which only reads inline `Promise<{...}>`
+# literals) never yields its real fields. A rename of
+# `ApprovalsResult.items` would therefore break CI nowhere while blanking
+# three pages — the same defect class as the audit's `entries`-vs-`messages`
+# finding and B1's `r.status`/`r.id`-vs-`state`/`run_id` (a source
+# permanently empty while looking implemented).
+
+
+def _approvals_result_fields() -> set[str]:
+    """Field names of the `ApprovalsResult` type literal in approvals.ts."""
+    source = (SRC / "lib" / "api" / "approvals.ts").read_text(encoding="utf-8")
+    match = re.search(
+        r"export\s+type\s+ApprovalsResult\s*=\s*\{(.*?)\n\};", source, re.S
+    )
+    assert match, "ApprovalsResult is gone from approvals.ts"
+    return set(re.findall(r"^\s*([A-Za-z_]\w*)\s*[?]?\s*:", match.group(1), re.M))
+
+
+_FANOUT_PAGES = (
+    APP_DIR / "(app)" / "inbox" / "page.tsx",
+    APP_DIR / "(app)" / "chat" / "page.tsx",
+    SRC / "components" / "layout" / "AppShell.tsx",
+)
+
+
+def test_fanout_pages_read_declared_approvals_result_fields() -> None:
+    """Every `listApprovals()` read on the three fan-out pages is declared.
+
+    Destructured names (`const { items } = await listApprovals()`) and alias
+    reads (`result.items`) must both be fields of `ApprovalsResult`. Static
+    check (this repo has no frontend unit runner): names are resolved from
+    the await call sites, never guessed.
+    """
+    declared = _approvals_result_fields()
+    assert "items" in declared, (
+        "ApprovalsResult lost its `items` field; Inbox, Chat and the AppShell "
+        "badge all read it."
+    )
+
+    offenders: list[str] = []
+    for page in _FANOUT_PAGES:
+        assert page.exists(), f"fan-out page moved: {page}"
+        code = _code_only(page)
+
+        for fields, fn in re.findall(
+            r"const\s*\{([^}]*)\}\s*=\s*await\s+(\w+)\s*\(", code
+        ):
+            if fn != "listApprovals":
+                continue
+            for name in re.findall(r"[A-Za-z_]\w*", fields):
+                if name not in declared:
+                    offenders.append(
+                        f"{page.relative_to(FRONTEND)}: destructured "
+                        f"`{name}` is not an ApprovalsResult field "
+                        f"(declares {sorted(declared)})"
+                    )
+
+        for alias, fn in re.findall(
+            r"const\s+([A-Za-z_]\w*)\s*=\s*await\s+(\w+)\s*\(", code
+        ):
+            if fn != "listApprovals":
+                continue
+            for field in re.findall(rf"\b{re.escape(alias)}\.([A-Za-z_]\w*)", code):
+                if field not in declared:
+                    offenders.append(
+                        f"{page.relative_to(FRONTEND)}: {alias}.{field} is not "
+                        f"an ApprovalsResult field (declares {sorted(declared)})"
+                    )
+
+    assert not offenders, (
+        "these fan-out reads are not in the shape listApprovals declares, so "
+        "they silently produce undefined:\n  " + "\n  ".join(sorted(set(offenders)))
+    )
+
+
+# ---------------------------------------------------------------------------
+# B7 Step 2: envelope strictness for the approval sources
+# ---------------------------------------------------------------------------
+#
+# `test_approval_sources_exist_and_are_readable` proves the documented key
+# (`tasks`/`workflows`/`runs`) is PRESENT, but an empty list passes it while
+# the page silently takes its `?? []` fallback path. These three tests seed
+# one genuinely pending item per source and assert the first pending item
+# carries every field the Inbox loader reads (`loadTasks`/`loadWorkflows`/
+# `loadAutonomy` in approvals.ts), so a backend rename that drops one blanks
+# the Inbox loudly instead of silently. The fourth source, orchestration, is
+# NOT repeated here: `test_orchestration_pending_run_carries_the_fields_the_
+# inbox_reads` already asserts exactly this (B1 follow-up) — a duplicate
+# would only slow the suite.
+
+
+@pytest.mark.asyncio
+async def test_task_envelope_item_carries_the_fields_the_inbox_reads(
+    db_a2a_client, db_session_factory
+) -> None:
+    """A pending task must expose the fields `toTaskPendingItem` reads.
+
+    The Inbox keys the item by `task_id`, filters on `status`, titles it from
+    the sender/payload and ages it from `created_at`/`expires_at`. Any of
+    those missing and the item either vanishes or renders nameless.
+    """
+    from app.a2a.models import A2ATask, TaskStatus
+    from app.database.repositories import OwnerRepository
+
+    async with db_session_factory() as session:
+        owner = await OwnerRepository().get_or_create_default(session)
+        session.add(
+            A2ATask(
+                owner_id=owner.id,
+                task_id=f"task_{uuid.uuid4().hex[:8]}",
+                sender_agent_id="nexus:ed25519:" + "a" * 32,
+                recipient_agent_id="nexus:ed25519:" + "b" * 32,
+                status=TaskStatus.PENDING_APPROVAL.value,
+                task_type="availability_check",
+                purpose="scheduling",
+                request_payload={
+                    "data_category": "availability",
+                    "message": "Can you meet Thursday?",
+                },
+            )
+        )
+        await session.commit()
+
+    response = await db_a2a_client.get("/a2a/tasks")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert "tasks" in body, (
+        f"GET /a2a/tasks lost its documented 'tasks' key; got {sorted(body)}"
+    )
+    pending = [
+        t for t in body["tasks"] if t.get("status") == TaskStatus.PENDING_APPROVAL.value
+    ]
+    assert pending, (
+        "the seeded pending_approval task is missing from /a2a/tasks; the "
+        "Inbox would show nothing waiting."
+    )
+    first = pending[0]
+    for field in (
+        "task_id",
+        "status",
+        "sender_agent_id",
+        "recipient_agent_id",
+        "task_type",
+        "purpose",
+        "request_payload",
+        "created_at",
+        "expires_at",
+    ):
+        assert field in first, (
+            f"a pending task must carry {field!r}; toTaskPendingItem reads it. "
+            f"Got: {sorted(first)}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_workflow_envelope_item_carries_the_fields_the_inbox_reads(
+    db_workflow_client, db_session_factory
+) -> None:
+    """A waiting workflow must expose the fields `loadWorkflows` reads.
+
+    Created over HTTP (proving the create shape), then parked in
+    `waiting_approval` directly: reaching that state through the policy ASK
+    machinery is a backend-integration concern, while this test is about the
+    envelope the Inbox consumes. The Inbox keys by `workflow_id`, filters on
+    `status`, and titles/ages from `workflow_type`/`purpose`/`current_step_
+    number`/`created_at`/`expires_at`.
+    """
+    from app.workflows.models import Workflow, WorkflowStatus
+
+    created = await db_workflow_client.post(
+        "/workflows",
+        json={
+            "workflow_type": "meeting_coordination",
+            "purpose": "scheduling",
+            "steps": [
+                {
+                    "step_type": "availability_check",
+                    "input_payload": {"candidate_slots": ["10:00"]},
+                }
+            ],
+            "ttl_seconds": 3600,
+        },
+    )
+    assert created.status_code == 201, created.text
+    workflow_id = created.json()["workflow_id"]
+
+    async with db_session_factory() as session:
+        from sqlalchemy import select
+
+        wf = (
+            await session.execute(
+                select(Workflow).where(Workflow.workflow_id == workflow_id)
+            )
+        ).scalar_one()
+        wf.status = WorkflowStatus.WAITING_APPROVAL.value
+        wf.current_step_number = 1
+        await session.commit()
+
+    response = await db_workflow_client.get("/workflows")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert "workflows" in body, (
+        f"GET /workflows lost its documented 'workflows' key; got {sorted(body)}"
+    )
+    pending = [
+        w
+        for w in body["workflows"]
+        if w.get("status") == WorkflowStatus.WAITING_APPROVAL.value
+    ]
+    assert pending, (
+        "the parked waiting_approval workflow is missing from /workflows; the "
+        "Inbox would show nothing waiting."
+    )
+    first = pending[0]
+    for field in (
+        "workflow_id",
+        "status",
+        "workflow_type",
+        "purpose",
+        "current_step_number",
+        "failure_reason",
+        "created_at",
+        "expires_at",
+    ):
+        assert field in first, (
+            f"a waiting workflow must carry {field!r}; loadWorkflows reads it. "
+            f"Got: {sorted(first)}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_autonomy_envelope_item_carries_the_fields_the_inbox_reads(
+    db_autonomy_client, db_session_factory
+) -> None:
+    """A waiting run must expose the fields `loadAutonomy` relies on.
+
+    The Inbox keys the item by `id`, filters on `status`, titles from `goal`
+    and summarises from `stop_reason` (the `approval_prompt` fallback the
+    page prefers is NOT on `AutonomyRunOut`, so `stop_reason` is what the
+    page actually gets — asserted here, not wished for). Deliberately NOT
+    asserted: `approval_prompt`/`requested_action`/`risk_level`/`mode`/
+    `run_id`, none of which `AutonomyRunOut` returns; `loadAutonomy` reads
+    them only through `??` fallbacks to null, so their absence is tolerated
+    by design rather than a blanking risk.
+    """
+    from datetime import datetime, timezone
+
+    from app.autonomy.models import AutonomyRun, RunStatus
+    from app.database.repositories import OwnerRepository
+
+    async with db_session_factory() as session:
+        owner = await OwnerRepository().get_or_create_default(session)
+        session.add(
+            AutonomyRun(
+                owner_id=owner.id,
+                goal="Book the Thursday room",
+                status=RunStatus.WAITING_APPROVAL.value,
+                stop_reason="Needs owner decision",
+                started_at=datetime.now(timezone.utc),
+            )
+        )
+        await session.commit()
+
+    response = await db_autonomy_client.get("/autonomy/runs")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert "runs" in body, (
+        f"GET /autonomy/runs lost its documented 'runs' key; got {sorted(body)}"
+    )
+    pending = [
+        r for r in body["runs"] if r.get("status") == RunStatus.WAITING_APPROVAL.value
+    ]
+    assert pending, (
+        "the seeded waiting_approval run is missing from /autonomy/runs; the "
+        "Inbox would show nothing waiting."
+    )
+    first = pending[0]
+    for field in ("id", "status", "goal", "stop_reason", "created_at"):
+        assert field in first, (
+            f"a waiting autonomy run must carry {field!r}; loadAutonomy reads "
+            f"it. Got: {sorted(first)}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# B7 Step 3: deny/approve bodies vs. backend request schemas
+# ---------------------------------------------------------------------------
+#
+# The Inbox (and Chat's inline approvals) decide through ONE function,
+# `decideApproval` in approvals.ts, which sends `{ notes: "Approved" }` on
+# approve and `{ reason: "Declined by owner" }` on deny to four different
+# endpoints — each with its own request schema (`{reason}` vs `{notes}` is
+# exactly the kind of per-subsystem vocabulary split the audit found). A body
+# the schema rejects is a 422 the page surfaces as "That decision could not
+# be recorded", with no hint that the payload was doomed before it was sent.
+# These tests read the literal bodies out of `decideApproval` (so a payload
+# change is picked up, not silently skipped) and validate each against the
+# real Pydantic model the route parses — schemas read from the route files
+# first, never guessed (B1's precedent: the orchestration bodies were
+# verified against `OrchestrationApproveRequest` and fixed where they
+# disagreed).
+
+
+def _inbox_decision_bodies() -> tuple[dict, dict]:
+    """The approve/deny literal bodies `decideApproval` actually sends."""
+    source = (SRC / "lib" / "api" / "approvals.ts").read_text(encoding="utf-8")
+    anchor = source.find("export async function decideApproval")
+    assert anchor != -1, "decideApproval is gone from approvals.ts"
+    block = source[anchor : anchor + 1500]
+    approve = re.search(r'\?\s*\{\s*notes\s*:\s*"([^"]*)"\s*\}', block)
+    deny = re.search(r':\s*\{\s*reason\s*:\s*"([^"]*)"\s*\}', block)
+    assert approve and deny, (
+        "decideApproval no longer sends {notes}/{reason} literals; re-read "
+        "the function and re-pair each body with its route schema."
+    )
+    return {"notes": approve.group(1)}, {"reason": deny.group(1)}
+
+
+def test_inbox_decision_bodies_validate_against_backend_schemas() -> None:
+    """Each Inbox body must parse as the request model of the route it hits.
+
+    Pairings (route file read first, not guessed): task approve/reject take
+    `notes`/`reason` (`TaskApproveRequest`/`TaskRejectRequest`,
+    app/schemas/tasks.py); the workflow DENY path is `/cancel`, so its body
+    validates against `WorkflowCancelRequest` (app/api/routes/workflows.py);
+    orchestration approve/reject are strict (`extra="forbid"`) against
+    `OrchestrationApproveRequest`/`OrchestrationRejectRequest`
+    (app/orchestration/schemas.py). The path-map assertions pin the pairing:
+    if the deny path ever moves off `/cancel`, the schema pairing must move
+    with it instead of validating against the wrong model.
+    """
+    from app.orchestration.schemas import (
+        OrchestrationApproveRequest,
+        OrchestrationRejectRequest,
+    )
+    from app.schemas.tasks import TaskApproveRequest, TaskRejectRequest
+
+    from app.api.routes.workflows import WorkflowApproveRequest, WorkflowCancelRequest
+
+    source = (SRC / "lib" / "api" / "approvals.ts").read_text(encoding="utf-8")
+    assert "/workflows/${id}/cancel" in source, (
+        "the workflow deny path moved off /cancel; re-pair the deny body "
+        "with the schema of wherever it points now."
+    )
+    assert "/orchestration/runs/${id}/approve" in source
+    assert "/orchestration/runs/${id}/reject" in source
+
+    approve_body, deny_body = _inbox_decision_bodies()
+    assert set(approve_body) == {"notes"}, (
+        f"the Inbox approve body gained fields; re-pair it: {approve_body}"
+    )
+    assert set(deny_body) == {"reason"}, (
+        f"the Inbox deny body gained fields; re-pair it: {deny_body}"
+    )
+
+    # A body that parses is a body the route accepts; a body that raises is
+    # a decision button doomed to 422 (see the autonomy xfail below).
+    TaskApproveRequest.model_validate(approve_body)
+    TaskRejectRequest.model_validate(deny_body)
+    WorkflowApproveRequest.model_validate(approve_body)
+    WorkflowCancelRequest.model_validate(deny_body)
+    OrchestrationApproveRequest.model_validate(approve_body)
+    OrchestrationRejectRequest.model_validate(deny_body)
+
+
+@pytest.mark.xfail(
+    strict=False,
+    reason=(
+        "decideApproval sends {notes}/{reason} but AutonomyApprovalDecisionRequest "
+        "requires `approved: bool` — both Inbox autonomy decisions 422. Fix the "
+        "source (send {approved, notes}), then drop this marker."
+    ),
+)
+def test_inbox_autonomy_decision_bodies_validate_against_backend_schema() -> None:
+    """KNOWN DEFECT — the Inbox autonomy bodies do not validate. Locked here
+    as xfail (strict=False, so the suite stays green and the fix shows up as
+    an XPASS) instead of hidden in a report.
+
+    Defect class: frontend/backend vocabulary mismatch with no runtime
+    symptom until the button is clicked — the audit's whole family
+    (`entries`-vs-`messages`, B1's `status`/`id`-vs-`state`/`run_id`), and
+    B1's own "verify the bodies against the schema, fix the payload if it
+    disagrees" step, which covered orchestration but never autonomy.
+
+    Established fact (no tree mutation needed for the red proof): with the
+    bodies read live out of `decideApproval` above,
+    `AutonomyApprovalDecisionRequest.model_validate({"notes": "Approved"})`
+    raises `Field required: approved`, and the deny body fails the same way
+    (`reason` is not even a field of the model). Over HTTP that is a 422 on
+    `POST /autonomy/runs/{id}/approve` and `.../reject` — from the Inbox AND
+    from the autonomy page (`approveAutonomyRun`/`rejectAutonomyRun` in
+    autonomy.ts send `{notes}` to the same models). Backend tests never sent
+    these bodies over HTTP (test_part10_autonomy.py exercises the service,
+    not the route payloads), which is how it survived.
+
+    Fix prescription (source change, out of scope for test-only B7): send
+    `{approved: true, notes}` / `{approved: false, notes}` from
+    `decideApproval` and the autonomy.ts wrappers, or give the schema a
+    default for `approved`. Either way this test — which validates the real
+    bodies against the real model — is the acceptance check.
+    """
+    from app.autonomy.schemas import AutonomyApprovalDecisionRequest
+
+    approve_body, deny_body = _inbox_decision_bodies()
+    AutonomyApprovalDecisionRequest.model_validate(approve_body)
+    AutonomyApprovalDecisionRequest.model_validate(deny_body)
