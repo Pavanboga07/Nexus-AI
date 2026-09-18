@@ -16,6 +16,8 @@ import { Send } from "lucide-react";
 
 import { Button } from "@/components/ui/Button";
 import { ApiError, apiFetch } from "@/lib/api/client";
+import { useContactNames } from "@/lib/useContactNames";
+import { formatDate } from "@/lib/utils";
 import {
   ApprovalItem,
   decideApproval,
@@ -39,9 +41,12 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
+  const [startingNew, setStartingNew] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState<ApprovalItem[]>([]);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  // Approval evidence resolves agent IDs to display names, as the Inbox does.
+  const { resolve: resolveName } = useContactNames();
 
   const refreshPending = useCallback(async () => {
     try {
@@ -112,7 +117,8 @@ export default function ChatPage() {
 
     setSending(true);
     setError(null);
-    setMessages((prev) => [...prev, { role: "user", content: text }]);
+    const optimistic: Message = { role: "user", content: text };
+    setMessages((prev) => [...prev, optimistic]);
     setDraft("");
     try {
       const reply = await apiFetch<{ response: string }>("/chat", {
@@ -126,6 +132,9 @@ export default function ChatPage() {
       // The agent may have paused for approval while answering.
       await refreshPending();
     } catch (err) {
+      // Roll the optimistic message back: a message the server never saw must
+      // not sit in the thread as if it were sent.
+      setMessages((prev) => prev.filter((m) => m !== optimistic));
       setError(
         err instanceof ApiError ? err.message : "That message could not be sent."
       );
@@ -135,6 +144,8 @@ export default function ChatPage() {
   }
 
   async function startNewSession() {
+    if (startingNew) return;
+    setStartingNew(true);
     setError(null);
     try {
       const created = await apiFetch<{ session_id: string }>("/sessions", {
@@ -147,6 +158,8 @@ export default function ChatPage() {
       setError(
         err instanceof ApiError ? err.message : "Could not start a new chat."
       );
+    } finally {
+      setStartingNew(false);
     }
   }
 
@@ -171,7 +184,13 @@ export default function ChatPage() {
             It will ask you here before acting on your behalf.
           </p>
         </div>
-        <Button size="sm" variant="ghost" onClick={startNewSession}>
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={startNewSession}
+          isLoading={startingNew}
+          disabled={startingNew}
+        >
           New chat
         </Button>
       </header>
@@ -221,27 +240,78 @@ export default function ChatPage() {
                 {pending.slice(0, 3).map((item) => (
                   <li
                     key={item.id}
-                    className="flex items-start justify-between gap-3 rounded border border-neutral-800/60 bg-neutral-900/40 px-3 py-2"
+                    className="rounded border border-neutral-800/60 bg-neutral-900/40 px-3 py-2"
                   >
-                    <div className="min-w-0">
-                      <p className="text-xs text-neutral-200">
-                        <span className="mr-1.5 text-[10px] uppercase text-neutral-500">
-                          {sourceLabel(item.source)}
-                        </span>
-                        {item.summary || item.title}
-                      </p>
-                    </div>
-                    <div className="flex shrink-0 gap-1.5">
-                      <Button size="sm" onClick={() => decide(item, "approve")}>
-                        Approve
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => decide(item, "deny")}
-                      >
-                        No
-                      </Button>
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="text-xs text-neutral-200">
+                          <span className="mr-1.5 text-[10px] uppercase text-neutral-500">
+                            {sourceLabel(item.source)}
+                          </span>
+                          {item.summary || item.title}
+                        </p>
+                        {/* The evidence: the same fields the Inbox shows, so the
+                            decision is made with context, not blindly. */}
+                        <details className="mt-1.5">
+                          <summary className="cursor-pointer text-[11px] text-neutral-500 hover:text-neutral-300">
+                            Why this needs you
+                          </summary>
+                          <dl className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-neutral-500">
+                            {item.requestedBy && (
+                              <div className="flex gap-1">
+                                <dt>From</dt>
+                                <dd className="truncate text-neutral-400">
+                                  {resolveName(item.requestedBy)}
+                                </dd>
+                              </div>
+                            )}
+                            {item.category && (
+                              <div className="flex gap-1">
+                                <dt>Data</dt>
+                                <dd className="text-neutral-400">
+                                  {item.category}
+                                </dd>
+                              </div>
+                            )}
+                            {item.purpose && (
+                              <div className="flex gap-1">
+                                <dt>Purpose</dt>
+                                <dd className="text-neutral-400">
+                                  {item.purpose}
+                                </dd>
+                              </div>
+                            )}
+                            {item.requestedAction && (
+                              <div className="flex gap-1">
+                                <dt>Action</dt>
+                                <dd className="text-neutral-400">
+                                  {item.requestedAction}
+                                </dd>
+                              </div>
+                            )}
+                            {item.expiresAt && (
+                              <div className="flex gap-1">
+                                <dt>Expires</dt>
+                                <dd className="text-neutral-400">
+                                  {formatDate(item.expiresAt)}
+                                </dd>
+                              </div>
+                            )}
+                          </dl>
+                        </details>
+                      </div>
+                      <div className="flex shrink-0 gap-1.5">
+                        <Button size="sm" onClick={() => decide(item, "approve")}>
+                          Approve
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => decide(item, "deny")}
+                        >
+                          No
+                        </Button>
+                      </div>
                     </div>
                   </li>
                 ))}
