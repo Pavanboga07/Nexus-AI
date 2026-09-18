@@ -1,10 +1,13 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useState } from "react";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
 import { PageShell } from "@/components/ui/PageShell";
+import { ConfirmModal } from "@/components/ui/ConfirmModal";
+import { ErrorState } from "@/components/ui/ErrorState";
+import { useAsync } from "@/lib/useAsync";
 import { listMemories, searchMemories, deleteMemory } from "@/lib/api/memory";
 import { Memory } from "@/types/api";
 import { formatDate, truncateId } from "@/lib/utils";
@@ -17,44 +20,48 @@ type DisplayMemory = {
 };
 
 export default function MemoryPage() {
-  const [memories, setMemories] = useState<DisplayMemory[]>([]);
+  // The list loads through useAsync so a fetch failure renders an error with
+  // Retry instead of a false "No memories found".
+  const {
+    data: memoriesData,
+    error: loadError,
+    loading,
+    reload: reloadMemories,
+  } = useAsync(() =>
+    listMemories().then((res) =>
+      (res.memories || []).map((memory) => ({ memory, similarity: null }))
+    )
+  );
+  const memories = memoriesData ?? [];
   const [searchResults, setSearchResults] = useState<DisplayMemory[] | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
-  const [loading, setLoading] = useState(false);
   const [searching, setSearching] = useState(false);
+  /** Search failures render inline; they never use a native dialog. */
+  const [searchError, setSearchError] = useState<string | null>(null);
   const [selectedMemory, setSelectedMemory] = useState<Memory | null>(null);
+  /** Mutation failures render inline; they never use a native dialog. */
+  const [actionError, setActionError] = useState<string | null>(null);
+  /** The row with a delete in flight; its button shows busy. */
+  const [busyId, setBusyId] = useState<string | null>(null);
+  /** Pending delete, confirmed through ConfirmModal. */
+  const [deleteTarget, setDeleteTarget] = useState<Memory | null>(null);
 
-  const fetchMemories = async () => {
-    try {
-      setLoading(true);
-      const res = await listMemories();
-      // Unwrapped here rather than at render time: the list and the search
-      // return different envelopes (a bare memory vs `{memory, similarity}`),
-      // and reconciling them in the view produced a row of `any` casts that hid
-      // the fact that `category` and `source_type` were never in the response.
-      setMemories(
-        (res.memories || []).map((memory) => ({ memory, similarity: null }))
-      );
-      setSearchResults(null);
-    } catch (err) {
-      console.error("Failed to load memories", err);
-    } finally {
-      setLoading(false);
-    }
+  const fetchMemories = () => {
+    setActionError(null);
+    setSearchResults(null);
+    reloadMemories();
   };
-
-  useEffect(() => {
-    fetchMemories();
-  }, []);
 
   const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!searchQuery.trim()) {
       setSearchResults(null);
+      setSearchError(null);
       return;
     }
     try {
       setSearching(true);
+      setSearchError(null);
       const res = await searchMemories(searchQuery.trim(), 20);
       setSearchResults(
         (res.results || []).map((result) => ({
@@ -63,28 +70,38 @@ export default function MemoryPage() {
         }))
       );
     } catch (err) {
-      console.error("Search failed", err);
       // An empty result and a failed search look identical otherwise, and the
       // page would then suggest "try a different query" for a broken request.
-      alert("Search failed. The memory subsystem may be unavailable.");
+      setSearchError(
+        err instanceof Error
+          ? `Search failed: ${err.message}`
+          : "Search failed. The memory subsystem may be unavailable."
+      );
       setSearchResults(null);
     } finally {
       setSearching(false);
     }
   };
 
-  const handleDelete = async (memoryId: string) => {
-    if (!confirm("Delete this memory permanently?")) return;
+  const handleDeleteConfirm = async () => {
+    if (!deleteTarget) return;
+    const memoryId = deleteTarget.id;
+    setDeleteTarget(null);
+    setBusyId(memoryId);
+    setActionError(null);
     try {
       await deleteMemory(memoryId);
-      setMemories((prev) => prev.filter((m) => m.memory.id !== memoryId));
+      if (selectedMemory?.id === memoryId) setSelectedMemory(null);
+      reloadMemories();
       setSearchResults((prev) =>
         prev ? prev.filter((r) => r.memory.id !== memoryId) : null
       );
-      setSelectedMemory(null);
     } catch (err) {
-      console.error("Failed to delete memory", err);
-      alert("Failed to delete memory.");
+      setActionError(
+        err instanceof Error ? `Failed to delete memory: ${err.message}` : "Failed to delete memory."
+      );
+    } finally {
+      setBusyId(null);
     }
   };
 
@@ -94,11 +111,20 @@ export default function MemoryPage() {
     <PageShell
       title="Memory"
       action={
-        <Button variant="outline" size="sm" onClick={fetchMemories}>
+        <Button variant="outline" size="sm" onClick={fetchMemories} disabled={loading}>
           Refresh
         </Button>
       }
     >
+      {loadError && <ErrorState message={loadError} onRetry={fetchMemories} />}
+      {actionError && (
+        <div
+          role="alert"
+          className="mb-4 rounded-md border border-red-900/50 bg-red-950/40 px-3 py-2 text-xs text-red-300"
+        >
+          {actionError}
+        </div>
+      )}
       <div className="space-y-6">
         <form onSubmit={handleSearch} className="flex items-center gap-2 max-w-md w-full">
           <div className="relative flex-1">
@@ -122,6 +148,7 @@ export default function MemoryPage() {
               onClick={() => {
                 setSearchQuery("");
                 setSearchResults(null);
+                setSearchError(null);
               }}
             >
               Clear
@@ -129,11 +156,17 @@ export default function MemoryPage() {
           )}
         </form>
 
+        {searchError && (
+          <p role="alert" className="text-xs text-red-400">
+            {searchError}
+          </p>
+        )}
+
         {loading ? (
           <div className="py-16 text-center">
             <p className="text-sm text-neutral-400">Loading memories...</p>
           </div>
-        ) : displayItems.length === 0 ? (
+        ) : loadError && displayItems.length === 0 ? null : displayItems.length === 0 ? (
           <div className="py-16 text-center">
             <p className="text-sm text-neutral-400">No memories found.</p>
             <p className="text-xs text-neutral-500 mt-1">
@@ -165,9 +198,11 @@ export default function MemoryPage() {
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        handleDelete(mem.id);
+                        setDeleteTarget(mem);
                       }}
-                      className="p-1.5 rounded text-neutral-500 hover:text-rose-500 hover:bg-neutral-800 opacity-0 group-hover:opacity-100 transition-all"
+                      disabled={busyId !== null}
+                      aria-label="Delete memory"
+                      className="p-1.5 rounded text-neutral-500 hover:text-rose-500 hover:bg-neutral-800 opacity-0 group-hover:opacity-100 transition-all disabled:opacity-40"
                       title="Delete memory"
                     >
                       <Trash2 className="w-4 h-4" />
@@ -226,7 +261,9 @@ export default function MemoryPage() {
               <Button
                 variant="danger"
                 size="sm"
-                onClick={() => handleDelete(selectedMemory.id)}
+                onClick={() => setDeleteTarget(selectedMemory)}
+                isLoading={busyId === selectedMemory.id}
+                disabled={busyId !== null && busyId !== selectedMemory.id}
               >
                 Delete Memory
               </Button>
@@ -234,6 +271,17 @@ export default function MemoryPage() {
           </div>
         </Modal>
       )}
+
+      {/* Delete confirmation via modal, no native dialogs. */}
+      <ConfirmModal
+        open={deleteTarget !== null}
+        title="Delete memory"
+        body="Delete this memory permanently? Your agent will no longer remember it."
+        confirmLabel="Delete memory"
+        danger
+        onConfirm={() => void handleDeleteConfirm()}
+        onCancel={() => setDeleteTarget(null)}
+      />
     </PageShell>
   );
 }

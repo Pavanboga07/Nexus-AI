@@ -5,6 +5,9 @@ import { PageShell } from "@/components/ui/PageShell";
 import { StatusBadge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
+import { ConfirmModal } from "@/components/ui/ConfirmModal";
+import { ErrorState } from "@/components/ui/ErrorState";
+import { useAsync } from "@/lib/useAsync";
 import {
   getAutonomyConfig,
   updateAutonomyConfig,
@@ -34,47 +37,53 @@ import {
 } from "lucide-react";
 
 export default function AutonomyPage() {
-  const [config, setConfig] = useState<AutonomyConfigOut | null>(null);
-  const [runs, setRuns] = useState<AutonomyRunOut[]>([]);
+  const [statusFilter, setStatusFilter] = useState("all");
+  // Config and runs load independently so one failing subsystem does not hide
+  // the other; each failure renders an error with Retry, never a false empty.
+  const {
+    data: config,
+    error: configError,
+    loading: configLoading,
+    reload: reloadConfig,
+  } = useAsync(() => getAutonomyConfig());
+  const {
+    data: runsData,
+    error: runsError,
+    loading,
+    reload: reloadRuns,
+  } = useAsync(() =>
+    listAutonomyRuns(statusFilter === "all" ? undefined : statusFilter).then(
+      (res) => res.runs ?? []
+    )
+  );
+  const runs = runsData ?? [];
+  useEffect(() => {
+    reloadRuns();
+  }, [statusFilter, reloadRuns]);
+
   const [selectedRun, setSelectedRun] = useState<AutonomyRunOut | null>(null);
   const [decisions, setDecisions] = useState<AutonomyDecisionOut[]>([]);
-  const [statusFilter, setStatusFilter] = useState("all");
-  const [loading, setLoading] = useState(false);
   const [updatingConfig, setUpdatingConfig] = useState(false);
+  /** Config/mutation failures render inline; never in a native dialog. */
+  const [actionError, setActionError] = useState<string | null>(null);
+  /** The run with approve/reject/stop in flight; its buttons show busy. */
+  const [busyId, setBusyId] = useState<string | null>(null);
+  /** Pending approval decisions, confirmed through ConfirmModal with notes. */
+  const [approveTarget, setApproveTarget] = useState<AutonomyRunOut | null>(null);
+  const [rejectTarget, setRejectTarget] = useState<AutonomyRunOut | null>(null);
+  const [stopTarget, setStopTarget] = useState<AutonomyRunOut | null>(null);
 
   // New Goal Modal
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [goal, setGoal] = useState("");
   const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
 
-  const fetchConfig = async () => {
-    try {
-      const cfg = await getAutonomyConfig();
-      setConfig(cfg);
-    } catch (err) {
-      console.error("Failed to fetch autonomy config", err);
-    }
+  const refreshAll = () => {
+    setActionError(null);
+    reloadConfig();
+    reloadRuns();
   };
-
-  const fetchRuns = async (status?: string) => {
-    try {
-      setLoading(true);
-      const res = await listAutonomyRuns(status);
-      setRuns(res.runs || []);
-    } catch (err) {
-      console.error("Failed to load autonomy runs", err);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    fetchConfig();
-  }, []);
-
-  useEffect(() => {
-    fetchRuns(statusFilter);
-  }, [statusFilter]);
 
   const handleSelectRun = async (run: AutonomyRunOut) => {
     try {
@@ -93,10 +102,11 @@ export default function AutonomyPage() {
   const handleModeChange = async (newMode: AutonomyMode) => {
     try {
       setUpdatingConfig(true);
-      const updated = await updateAutonomyConfig({ mode: newMode });
-      setConfig(updated);
+      setActionError(null);
+      await updateAutonomyConfig({ mode: newMode });
+      reloadConfig();
     } catch (err: any) {
-      alert(`Failed to update mode: ${err.message}`);
+      setActionError(`Failed to update mode: ${err.message}`);
     } finally {
       setUpdatingConfig(false);
     }
@@ -105,10 +115,11 @@ export default function AutonomyPage() {
   const handleToggleSetting = async (key: keyof AutonomyConfigOut, val: boolean) => {
     try {
       setUpdatingConfig(true);
-      const updated = await updateAutonomyConfig({ [key]: val });
-      setConfig(updated);
+      setActionError(null);
+      await updateAutonomyConfig({ [key]: val });
+      reloadConfig();
     } catch (err: any) {
-      alert(`Failed to update setting: ${err.message}`);
+      setActionError(`Failed to update setting: ${err.message}`);
     } finally {
       setUpdatingConfig(false);
     }
@@ -120,51 +131,70 @@ export default function AutonomyPage() {
 
     try {
       setCreating(true);
+      setCreateError(null);
       const newRun = await createAutonomyRun({
         goal: goal.trim(),
         execute_immediately: true,
       });
       setGoal("");
       setCreateModalOpen(false);
-      await fetchRuns(statusFilter);
+      reloadRuns();
       handleSelectRun(newRun);
     } catch (err: any) {
-      alert(`Failed to trigger autonomous run: ${err.message}`);
+      setCreateError(`Failed to trigger autonomous run: ${err.message}`);
     } finally {
       setCreating(false);
     }
   };
 
-  const handleApprove = async (runId: string) => {
-    const notes = prompt("Approval notes (optional):", "Approved by owner") ?? undefined;
+  const handleApproveConfirm = async (notes?: string) => {
+    if (!approveTarget) return;
+    const runId = approveTarget.id;
+    setApproveTarget(null);
+    setBusyId(runId);
+    setActionError(null);
     try {
       const res = await approveAutonomyRun(runId, notes);
-      await fetchRuns(statusFilter);
+      reloadRuns();
       handleSelectRun(res);
     } catch (err: any) {
-      alert(`Failed to approve run: ${err.message}`);
+      setActionError(`Failed to approve run: ${err.message}`);
+    } finally {
+      setBusyId(null);
     }
   };
 
-  const handleReject = async (runId: string) => {
-    const notes = prompt("Rejection reason (optional):", "Rejected by owner") ?? undefined;
+  const handleRejectConfirm = async (notes?: string) => {
+    if (!rejectTarget) return;
+    const runId = rejectTarget.id;
+    setRejectTarget(null);
+    setBusyId(runId);
+    setActionError(null);
     try {
       const res = await rejectAutonomyRun(runId, notes);
-      await fetchRuns(statusFilter);
+      reloadRuns();
       handleSelectRun(res);
     } catch (err: any) {
-      alert(`Failed to reject run: ${err.message}`);
+      setActionError(`Failed to reject run: ${err.message}`);
+    } finally {
+      setBusyId(null);
     }
   };
 
-  const handleCancel = async (runId: string) => {
-    if (!confirm("Are you sure you want to stop this autonomous run?")) return;
+  const handleStopConfirm = async () => {
+    if (!stopTarget) return;
+    const runId = stopTarget.id;
+    setStopTarget(null);
+    setBusyId(runId);
+    setActionError(null);
     try {
       const res = await cancelAutonomyRun(runId, "Stopped by owner");
-      await fetchRuns(statusFilter);
+      reloadRuns();
       handleSelectRun(res);
     } catch (err: any) {
-      alert(`Failed to stop run: ${err.message}`);
+      setActionError(`Failed to stop run: ${err.message}`);
+    } finally {
+      setBusyId(null);
     }
   };
 
@@ -192,10 +222,7 @@ export default function AutonomyPage() {
           <Button
             variant="secondary"
             size="sm"
-            onClick={() => {
-              fetchConfig();
-              fetchRuns(statusFilter);
-            }}
+            onClick={refreshAll}
             disabled={loading}
           >
             <RefreshCw className={`w-3.5 h-3.5 mr-1.5 ${loading ? "animate-spin" : ""}`} />
@@ -204,7 +231,10 @@ export default function AutonomyPage() {
           <Button
             variant="primary"
             size="sm"
-            onClick={() => setCreateModalOpen(true)}
+            onClick={() => {
+              setCreateError(null);
+              setCreateModalOpen(true);
+            }}
           >
             <Plus className="w-3.5 h-3.5 mr-1.5" />
             New Goal
@@ -213,6 +243,14 @@ export default function AutonomyPage() {
       }
     >
       <div className="space-y-6">
+        {actionError && (
+          <div
+            role="alert"
+            className="rounded-md border border-red-900/50 bg-red-950/40 px-3 py-2 text-xs text-red-300"
+          >
+            {actionError}
+          </div>
+        )}
         {/* Top Section: Autonomy Configuration Card */}
         <div className="bg-neutral-900/60 border border-neutral-800 rounded-lg p-5">
           <div className="flex items-center justify-between mb-4">
@@ -253,6 +291,16 @@ export default function AutonomyPage() {
           </div>
 
           {/* Hard safety toggles */}
+          {configError && (
+            <div className="pt-4 border-t border-neutral-800/60">
+              <ErrorState message={configError} onRetry={reloadConfig} />
+            </div>
+          )}
+          {configLoading && !config && !configError && (
+            <p className="pt-4 text-xs text-neutral-500">
+              Loading autonomy configuration…
+            </p>
+          )}
           {config && (
             <div className="pt-4 border-t border-neutral-800/60 flex flex-wrap items-center justify-between gap-4 text-xs text-neutral-400">
               <label className="flex items-center gap-2 cursor-pointer">
@@ -308,8 +356,17 @@ export default function AutonomyPage() {
               </select>
             </div>
 
+            {runsError && runs.length > 0 && (
+              <ErrorState message={runsError} onRetry={reloadRuns} />
+            )}
             <div className="space-y-2">
-              {runs.length === 0 ? (
+              {loading ? (
+                <div className="p-8 text-center text-xs text-neutral-500 border border-dashed border-neutral-800 rounded-lg">
+                  Loading autonomous runs…
+                </div>
+              ) : runsError && runs.length === 0 ? (
+                <ErrorState message={runsError} onRetry={reloadRuns} />
+              ) : runs.length === 0 ? (
                 <div className="p-8 text-center text-xs text-neutral-500 border border-dashed border-neutral-800 rounded-lg">
                   No autonomous runs found. Click "New Goal" to trigger an autonomous task.
                 </div>
@@ -367,7 +424,9 @@ export default function AutonomyPage() {
                       <Button
                         variant="danger"
                         size="sm"
-                        onClick={() => handleCancel(selectedRun.id)}
+                        onClick={() => setStopTarget(selectedRun)}
+                        isLoading={busyId === selectedRun.id}
+                        disabled={busyId !== null && busyId !== selectedRun.id}
                       >
                         <StopCircle className="w-3.5 h-3.5 mr-1" />
                         Stop
@@ -402,7 +461,9 @@ export default function AutonomyPage() {
                       <Button
                         variant="primary"
                         size="sm"
-                        onClick={() => handleApprove(selectedRun.id)}
+                        onClick={() => setApproveTarget(selectedRun)}
+                        isLoading={busyId === selectedRun.id}
+                        disabled={busyId !== null && busyId !== selectedRun.id}
                       >
                         <CheckCircle2 className="w-3.5 h-3.5 mr-1.5" />
                         Approve & Resume
@@ -410,7 +471,8 @@ export default function AutonomyPage() {
                       <Button
                         variant="danger"
                         size="sm"
-                        onClick={() => handleReject(selectedRun.id)}
+                        onClick={() => setRejectTarget(selectedRun)}
+                        disabled={busyId !== null}
                       >
                         <XCircle className="w-3.5 h-3.5 mr-1.5" />
                         Reject & Abort
@@ -484,6 +546,11 @@ export default function AutonomyPage() {
         title="Trigger Autonomous Goal"
       >
         <form onSubmit={handleCreateRun} className="space-y-4">
+          {createError && (
+            <p role="alert" className="text-xs text-red-400">
+              {createError}
+            </p>
+          )}
           <div>
             <label className="block text-xs font-medium text-neutral-300 mb-1">
               Goal Description
@@ -521,6 +588,36 @@ export default function AutonomyPage() {
           </div>
         </form>
       </Modal>
+
+      {/* Approve/reject notes and stop confirmation via modal, no native dialogs. */}
+      <ConfirmModal
+        open={approveTarget !== null}
+        title="Approve run"
+        body={`Resume "${approveTarget?.goal ?? "this run"}"? The requested action executes next.`}
+        confirmLabel="Approve & resume"
+        requireReason
+        onConfirm={(notes) => void handleApproveConfirm(notes)}
+        onCancel={() => setApproveTarget(null)}
+      />
+      <ConfirmModal
+        open={rejectTarget !== null}
+        title="Reject run"
+        body={`Abort "${rejectTarget?.goal ?? "this run"}"? It will not execute the requested action.`}
+        confirmLabel="Reject & abort"
+        danger
+        requireReason
+        onConfirm={(notes) => void handleRejectConfirm(notes)}
+        onCancel={() => setRejectTarget(null)}
+      />
+      <ConfirmModal
+        open={stopTarget !== null}
+        title="Stop run"
+        body={`Stop "${stopTarget?.goal ?? "this run"}" now? Steps already executed are kept.`}
+        confirmLabel="Stop run"
+        danger
+        onConfirm={() => void handleStopConfirm()}
+        onCancel={() => setStopTarget(null)}
+      />
     </PageShell>
   );
 }

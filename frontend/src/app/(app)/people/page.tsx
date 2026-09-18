@@ -1,9 +1,11 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { AlertCircle, BadgeCheck, Search, ShieldAlert, UserPlus } from "lucide-react";
+import { BadgeCheck, Search, ShieldAlert, UserPlus } from "lucide-react";
 
 import { Button } from "@/components/ui/Button";
+import { ConfirmModal } from "@/components/ui/ConfirmModal";
+import { ErrorState } from "@/components/ui/ErrorState";
 import { ApiError } from "@/lib/api/client";
 import { formatDate } from "@/lib/utils";
 import {
@@ -26,6 +28,11 @@ export default function PeoplePage() {
   const [connecting, setConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  /** The trusted row with revoke/remove in flight; its buttons show busy. */
+  const [busyAgentId, setBusyAgentId] = useState<string | null>(null);
+  /** Pending destructive actions, confirmed through ConfirmModal. */
+  const [revokeTarget, setRevokeTarget] = useState<TrustedAgent | null>(null);
+  const [removeTarget, setRemoveTarget] = useState<TrustedAgent | null>(null);
 
   const loadTrusted = useCallback(async () => {
     setLoadingTrusted(true);
@@ -76,23 +83,35 @@ export default function PeoplePage() {
     }
   }
 
-  async function onRevoke(agentId: string) {
+  async function onRevokeConfirm() {
+    if (!revokeTarget) return;
+    const agentId = revokeTarget.agent_id;
+    setRevokeTarget(null);
     setError(null);
+    setBusyAgentId(agentId);
     try {
       await revokeTrust(agentId);
       await loadTrusted();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not revoke.");
+    } finally {
+      setBusyAgentId(null);
     }
   }
 
-  async function onRemove(agentId: string) {
+  async function onRemoveConfirm() {
+    if (!removeTarget) return;
+    const agentId = removeTarget.agent_id;
+    setRemoveTarget(null);
     setError(null);
+    setBusyAgentId(agentId);
     try {
       await removeTrust(agentId);
       await loadTrusted();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not remove.");
+    } finally {
+      setBusyAgentId(null);
     }
   }
 
@@ -108,13 +127,13 @@ export default function PeoplePage() {
 
       <div className="mx-auto w-full max-w-3xl space-y-8 px-6 py-6">
         {error && (
-          <div
-            role="alert"
-            className="flex items-start gap-2 rounded-md border border-red-900/50 bg-red-950/40 px-3 py-2 text-xs text-red-300"
-          >
-            <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
-            <span>{error}</span>
-          </div>
+          <ErrorState
+            message={error}
+            onRetry={() => {
+              setError(null);
+              void loadTrusted();
+            }}
+          />
         )}
         {notice && (
           <div className="rounded-md border border-emerald-900/50 bg-emerald-950/30 px-3 py-2 text-xs text-emerald-300">
@@ -175,7 +194,9 @@ export default function PeoplePage() {
                       <Button
                         size="sm"
                         variant="outline"
-                        onClick={() => onRevoke(agent.agent_id)}
+                        onClick={() => setRevokeTarget(agent)}
+                        isLoading={busyAgentId === agent.agent_id}
+                        disabled={busyAgentId !== null && busyAgentId !== agent.agent_id}
                       >
                         Revoke
                       </Button>
@@ -183,7 +204,8 @@ export default function PeoplePage() {
                     <Button
                       size="sm"
                       variant="ghost"
-                      onClick={() => onRemove(agent.agent_id)}
+                      onClick={() => setRemoveTarget(agent)}
+                      disabled={busyAgentId !== null}
                     >
                       Remove
                     </Button>
@@ -308,6 +330,26 @@ export default function PeoplePage() {
           )}
         </section>
       </div>
+
+      {/* Revoke/remove confirmations via modal, no native dialogs. */}
+      <ConfirmModal
+        open={revokeTarget !== null}
+        title="Revoke trust"
+        body={`Revoke the pinned key for "${revokeTarget?.display_name ?? "this agent"}"? They will no longer be able to reach you until you reconnect.`}
+        confirmLabel="Revoke trust"
+        danger
+        onConfirm={() => void onRevokeConfirm()}
+        onCancel={() => setRevokeTarget(null)}
+      />
+      <ConfirmModal
+        open={removeTarget !== null}
+        title="Remove contact"
+        body={`Remove "${removeTarget?.display_name ?? "this agent"}" from your contacts entirely?`}
+        confirmLabel="Remove contact"
+        danger
+        onConfirm={() => void onRemoveConfirm()}
+        onCancel={() => setRemoveTarget(null)}
+      />
     </div>
   );
 }

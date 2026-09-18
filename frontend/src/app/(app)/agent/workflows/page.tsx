@@ -5,6 +5,9 @@ import { PageShell } from "@/components/ui/PageShell";
 import { StatusBadge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
+import { ConfirmModal } from "@/components/ui/ConfirmModal";
+import { ErrorState } from "@/components/ui/ErrorState";
+import { useAsync } from "@/lib/useAsync";
 import {
   listWorkflows,
   getWorkflow,
@@ -24,11 +27,30 @@ import {
 } from "lucide-react";
 
 export default function WorkflowsPage() {
-  const [workflows, setWorkflows] = useState<WorkflowOut[]>([]);
+  const [statusFilter, setStatusFilter] = useState("all");
+  // A fetch failure renders an error with Retry instead of a false empty view.
+  const {
+    data: workflowsData,
+    error: loadError,
+    loading,
+    reload: reloadWorkflows,
+  } = useAsync(() =>
+    listWorkflows(statusFilter === "all" ? undefined : statusFilter).then(
+      (res) => res.workflows ?? []
+    )
+  );
+  const workflows = workflowsData ?? [];
+  useEffect(() => {
+    reloadWorkflows();
+  }, [statusFilter, reloadWorkflows]);
+
   const [trustedAgents, setTrustedAgents] = useState<TrustedAgent[]>([]);
   const [selectedWorkflow, setSelectedWorkflow] = useState<WorkflowOut | null>(null);
-  const [statusFilter, setStatusFilter] = useState("all");
-  const [loading, setLoading] = useState(false);
+  /** Mutation failures render inline; never in a native dialog. */
+  const [actionError, setActionError] = useState<string | null>(null);
+  /** The row with a mutation in flight; its buttons show busy. */
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [cancelTarget, setCancelTarget] = useState<WorkflowOut | null>(null);
 
   // Create workflow modal
   const [createModalOpen, setCreateModalOpen] = useState(false);
@@ -36,74 +58,82 @@ export default function WorkflowsPage() {
   const [purpose, setPurpose] = useState("Coordinate calendar sync with peer");
   const [selectedPeerId, setSelectedPeerId] = useState("");
   const [creating, setCreating] = useState(false);
+  /** Form validation/creation errors render inside the modal. */
+  const [createError, setCreateError] = useState<string | null>(null);
 
-  const fetchWorkflows = async (status?: string) => {
-    try {
-      setLoading(true);
-      const s = status === "all" ? undefined : status;
-      const res = await listWorkflows(s);
-      setWorkflows(res.workflows || []);
-    } catch (err) {
-      console.error("Failed to load workflows", err);
-    } finally {
-      setLoading(false);
-    }
+  const refreshWorkflows = () => {
+    setActionError(null);
+    reloadWorkflows();
   };
 
   useEffect(() => {
-    fetchWorkflows(statusFilter);
     listTrustedAgents()
       .then((res) => setTrustedAgents(res.agents || []))
       .catch(() => {});
-  }, [statusFilter]);
+  }, []);
 
   const handleStartWorkflow = async (id: string) => {
+    setBusyId(id);
+    setActionError(null);
     try {
       await startWorkflow(id);
-      await fetchWorkflows(statusFilter);
+      refreshWorkflows();
       if (selectedWorkflow?.workflow_id === id) {
         const updated = await getWorkflow(id);
         setSelectedWorkflow(updated);
       }
     } catch (err: any) {
-      alert(`Failed to start workflow: ${err.message}`);
+      setActionError(`Failed to start workflow: ${err.message}`);
+    } finally {
+      setBusyId(null);
     }
   };
 
   const handleApproveStep = async (id: string, stepId?: string) => {
+    setBusyId(id);
+    setActionError(null);
     try {
       await approveWorkflow(id, stepId);
-      await fetchWorkflows(statusFilter);
+      refreshWorkflows();
       const updated = await getWorkflow(id);
       setSelectedWorkflow(updated);
     } catch (err: any) {
-      alert(`Failed to approve workflow step: ${err.message}`);
+      setActionError(`Failed to approve workflow step: ${err.message}`);
+    } finally {
+      setBusyId(null);
     }
   };
 
-  const handleCancelWorkflow = async (id: string) => {
-    if (!confirm("Are you sure you want to cancel this workflow?")) return;
+  const handleCancelConfirm = async () => {
+    if (!cancelTarget) return;
+    const id = cancelTarget.workflow_id;
+    setCancelTarget(null);
+    setBusyId(id);
+    setActionError(null);
     try {
       await cancelWorkflow(id);
-      await fetchWorkflows(statusFilter);
+      refreshWorkflows();
       if (selectedWorkflow?.workflow_id === id) {
         const updated = await getWorkflow(id);
         setSelectedWorkflow(updated);
       }
     } catch (err: any) {
-      alert(`Failed to cancel workflow: ${err.message}`);
+      setActionError(`Failed to cancel workflow: ${err.message}`);
+    } finally {
+      setBusyId(null);
     }
   };
 
   const handleCreateMeetingWorkflow = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedPeerId) {
-      alert("Please select a trusted peer agent.");
+      setCreateError("Please select a trusted peer agent.");
       return;
     }
 
     try {
       setCreating(true);
+      setCreateError(null);
       const created = await createWorkflow({
         workflow_type: "meeting_coordination",
         purpose: purpose || "Coordinate meeting with peer agent",
@@ -129,10 +159,10 @@ export default function WorkflowsPage() {
       });
 
       setCreateModalOpen(false);
-      await fetchWorkflows(statusFilter);
+      refreshWorkflows();
       setSelectedWorkflow(created);
     } catch (err: any) {
-      alert(`Failed to create workflow: ${err.message}`);
+      setCreateError(`Failed to create workflow: ${err.message}`);
     } finally {
       setCreating(false);
     }
@@ -154,7 +184,10 @@ export default function WorkflowsPage() {
         <Button
           size="sm"
           leftIcon={<Plus className="w-3.5 h-3.5" />}
-          onClick={() => setCreateModalOpen(true)}
+          onClick={() => {
+            setCreateError(null);
+            setCreateModalOpen(true);
+          }}
         >
           New Workflow
         </Button>
@@ -180,17 +213,28 @@ export default function WorkflowsPage() {
           variant="outline"
           size="sm"
           leftIcon={<RefreshCw className="w-3.5 h-3.5" />}
-          onClick={() => fetchWorkflows(statusFilter)}
+          onClick={refreshWorkflows}
+          disabled={loading}
         >
           Refresh
         </Button>
       </div>
 
+      {loadError && <ErrorState message={loadError} onRetry={refreshWorkflows} />}
+      {actionError && (
+        <div
+          role="alert"
+          className="mb-4 rounded-md border border-red-900/50 bg-red-950/40 px-3 py-2 text-xs text-red-300"
+        >
+          {actionError}
+        </div>
+      )}
+
       {loading ? (
         <div className="py-16 text-center">
           <p className="text-sm text-neutral-400">Loading workflows...</p>
         </div>
-      ) : workflows.length === 0 ? (
+      ) : loadError && workflows.length === 0 ? null : workflows.length === 0 ? (
         <div className="py-16 text-center">
           <p className="text-sm text-neutral-400">No workflows found in this view.</p>
           <div className="mt-4">
@@ -198,7 +242,10 @@ export default function WorkflowsPage() {
               size="sm"
               variant="outline"
               leftIcon={<Plus className="w-3.5 h-3.5" />}
-              onClick={() => setCreateModalOpen(true)}
+              onClick={() => {
+                setCreateError(null);
+                setCreateModalOpen(true);
+              }}
             >
               Create Meeting Coordination Flow
             </Button>
@@ -257,6 +304,8 @@ export default function WorkflowsPage() {
                     variant="primary"
                     leftIcon={<Play className="w-3.5 h-3.5" />}
                     onClick={() => handleStartWorkflow(wf.workflow_id)}
+                    isLoading={busyId === wf.workflow_id}
+                    disabled={busyId !== null && busyId !== wf.workflow_id}
                   >
                     Start
                   </Button>
@@ -267,6 +316,8 @@ export default function WorkflowsPage() {
                     className="bg-amber-500 hover:bg-amber-400 text-neutral-950"
                     leftIcon={<ShieldAlert className="w-3.5 h-3.5" />}
                     onClick={() => handleApproveStep(wf.workflow_id)}
+                    isLoading={busyId === wf.workflow_id}
+                    disabled={busyId !== null && busyId !== wf.workflow_id}
                   >
                     Approve Step
                   </Button>
@@ -277,7 +328,8 @@ export default function WorkflowsPage() {
                   <Button
                     size="sm"
                     variant="outline"
-                    onClick={() => handleCancelWorkflow(wf.workflow_id)}
+                    onClick={() => setCancelTarget(wf)}
+                    disabled={busyId !== null}
                   >
                     Cancel
                   </Button>
@@ -303,6 +355,11 @@ export default function WorkflowsPage() {
         subtitle="Orchestrate multi-step tasks across tools and remote agents"
       >
         <form onSubmit={handleCreateMeetingWorkflow} className="space-y-4">
+          {createError && (
+            <p role="alert" className="text-xs text-red-400">
+              {createError}
+            </p>
+          )}
           <div>
             <label className="text-xs text-neutral-400 font-medium block mb-1">
               Workflow Template
@@ -425,6 +482,8 @@ export default function WorkflowsPage() {
                   size="sm"
                   className="bg-amber-500 hover:bg-amber-400 text-neutral-950 shrink-0"
                   onClick={() => handleApproveStep(selectedWorkflow.workflow_id)}
+                  isLoading={busyId === selectedWorkflow.workflow_id}
+                  disabled={busyId !== null && busyId !== selectedWorkflow.workflow_id}
                 >
                   Approve Step
                 </Button>
@@ -499,6 +558,8 @@ export default function WorkflowsPage() {
                   size="sm"
                   variant="primary"
                   onClick={() => handleStartWorkflow(selectedWorkflow.workflow_id)}
+                  isLoading={busyId === selectedWorkflow.workflow_id}
+                  disabled={busyId !== null && busyId !== selectedWorkflow.workflow_id}
                 >
                   Start Execution
                 </Button>
@@ -514,6 +575,17 @@ export default function WorkflowsPage() {
           </div>
         </Modal>
       )}
+
+      {/* Cancel confirmation via modal, no native dialogs. */}
+      <ConfirmModal
+        open={cancelTarget !== null}
+        title="Cancel workflow"
+        body={`Stop "${cancelTarget?.workflow_type ?? "this workflow"}"? Steps that already ran are kept; nothing further executes.`}
+        confirmLabel="Cancel workflow"
+        danger
+        onConfirm={() => void handleCancelConfirm()}
+        onCancel={() => setCancelTarget(null)}
+      />
     </PageShell>
   );
 }

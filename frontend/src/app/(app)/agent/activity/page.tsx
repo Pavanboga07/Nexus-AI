@@ -5,6 +5,8 @@ import { PageShell } from "@/components/ui/PageShell";
 import { Badge, StatusBadge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
+import { ErrorState } from "@/components/ui/ErrorState";
+import { useAsync } from "@/lib/useAsync";
 import { getPolicyAudit } from "@/lib/api/policy";
 import { getToolAudit } from "@/lib/api/tools";
 import { getA2AAudit } from "@/lib/api/a2a";
@@ -29,110 +31,105 @@ type UnifiedEvent = {
 };
 
 export default function ActivityPage() {
-  const [events, setEvents] = useState<UnifiedEvent[]>([]);
+  // The three audit sources load together through useAsync so `loading` starts
+  // true (first paint never flashes a false empty state) and a total failure
+  // renders an error with Retry instead of "No entries found".
+  const { data, error: loadError, loading, reload } = useAsync(async () => {
+    // Contact names resolve agent IDs to display names in subtitles; unknown
+    // IDs fall back to a short slice (never a raw ID).
+    const names = await loadContactNames();
+    const [polRes, toolRes, a2aRes] = await Promise.allSettled([
+      getPolicyAudit(),
+      getToolAudit(),
+      getA2AAudit(),
+    ]);
+
+    const unified: UnifiedEvent[] = [];
+    // An audit source that failed is reported, not silently omitted: a trail
+    // with a hole in it looks identical to a trail with nothing in it, and
+    // only one of those is safe to conclude from.
+    const failures: string[] = [];
+
+    // Every field name here is the wire name. The previous version read
+    // `audits`, `timestamp`, `resource`, `entries`, `caller`, `duration_ms`
+    // and `success` - none of which any of these endpoints returns.
+    if (polRes.status === "fulfilled") {
+      polRes.value.decisions.forEach((d) => {
+        unified.push({
+          id: d.id,
+          category: "policy",
+          timestamp: d.created_at ?? null,
+          title: `Policy: ${d.data_category}:${d.action}`,
+          subtitle: `Purpose: ${d.purpose} · From: ${resolveContactName(names, d.requester_agent_id)} · ${d.reason}`,
+          status: d.decision,
+          raw: d,
+        });
+      });
+    } else {
+      failures.push("policy decisions");
+    }
+
+    if (toolRes.status === "fulfilled") {
+      toolRes.value.executions.forEach((t) => {
+        unified.push({
+          id: t.id,
+          category: "tool",
+          timestamp: t.created_at ?? null,
+          title: `Tool: ${t.tool_name}`,
+          subtitle: `Purpose: ${t.purpose} · Policy: ${t.policy_decision}${
+            t.error_code ? ` · ${t.error_code}` : ""
+          }`,
+          status: t.status,
+          raw: t,
+        });
+      });
+    } else {
+      failures.push("tool executions");
+    }
+
+    if (a2aRes.status === "fulfilled") {
+      a2aRes.value.messages.forEach((m) => {
+        unified.push({
+          id: m.id,
+          category: "a2a",
+          timestamp: m.created_at ?? null,
+          title: `Agent message: ${m.message_type}`,
+          subtitle: `From: ${resolveContactName(names, m.sender_agent_id)} -> To: ${resolveContactName(
+            names,
+            m.recipient_agent_id
+          )} · ${m.status}${m.policy_decision ? ` · policy ${m.policy_decision}` : ""}`,
+          status: m.status,
+          raw: m,
+        });
+      });
+    } else {
+      failures.push("agent messages");
+    }
+
+    if (failures.length === 3) {
+      throw new Error(
+        "Could not load activity. The audit subsystems may be unavailable."
+      );
+    }
+
+    // Sort by timestamp descending. Records without one are kept, at the end,
+    // rather than collapsing to 1970 and being buried.
+    unified.sort((a, b) => {
+      if (!a.timestamp && !b.timestamp) return 0;
+      if (!a.timestamp) return 1;
+      if (!b.timestamp) return -1;
+      return new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime();
+    });
+
+    return { events: unified, unavailable: failures };
+  });
+  const events = data?.events ?? [];
+  const unavailable = data?.unavailable ?? [];
+
   const [filteredEvents, setFilteredEvents] = useState<UnifiedEvent[]>([]);
   const [activeCategory, setActiveCategory] = useState("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedEvent, setSelectedEvent] = useState<UnifiedEvent | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [unavailable, setUnavailable] = useState<string[]>([]);
-
-  const fetchAllAuditData = async () => {
-    try {
-      setLoading(true);
-      // Contact names resolve agent IDs to display names in subtitles; unknown
-      // IDs fall back to a short slice (never a raw ID).
-      const names = await loadContactNames();
-      const [polRes, toolRes, a2aRes] = await Promise.allSettled([
-        getPolicyAudit(),
-        getToolAudit(),
-        getA2AAudit(),
-      ]);
-
-      const unified: UnifiedEvent[] = [];
-      // An audit source that failed is reported, not silently omitted: a trail
-      // with a hole in it looks identical to a trail with nothing in it, and
-      // only one of those is safe to conclude from.
-      const failures: string[] = [];
-
-      // Every field name here is the wire name. The previous version read
-      // `audits`, `timestamp`, `resource`, `entries`, `caller`, `duration_ms`
-      // and `success` - none of which any of these endpoints returns.
-      if (polRes.status === "fulfilled") {
-        polRes.value.decisions.forEach((d) => {
-          unified.push({
-            id: d.id,
-            category: "policy",
-            timestamp: d.created_at ?? null,
-            title: `Policy: ${d.data_category}:${d.action}`,
-            subtitle: `Purpose: ${d.purpose} · From: ${resolveContactName(names, d.requester_agent_id)} · ${d.reason}`,
-            status: d.decision,
-            raw: d,
-          });
-        });
-      } else {
-        failures.push("policy decisions");
-      }
-
-      if (toolRes.status === "fulfilled") {
-        toolRes.value.executions.forEach((t) => {
-          unified.push({
-            id: t.id,
-            category: "tool",
-            timestamp: t.created_at ?? null,
-            title: `Tool: ${t.tool_name}`,
-            subtitle: `Purpose: ${t.purpose} · Policy: ${t.policy_decision}${
-              t.error_code ? ` · ${t.error_code}` : ""
-            }`,
-            status: t.status,
-            raw: t,
-          });
-        });
-      } else {
-        failures.push("tool executions");
-      }
-
-      if (a2aRes.status === "fulfilled") {
-        a2aRes.value.messages.forEach((m) => {
-          unified.push({
-            id: m.id,
-            category: "a2a",
-            timestamp: m.created_at ?? null,
-            title: `Agent message: ${m.message_type}`,
-            subtitle: `From: ${resolveContactName(names, m.sender_agent_id)} -> To: ${resolveContactName(
-              names,
-              m.recipient_agent_id
-            )} · ${m.status}${m.policy_decision ? ` · policy ${m.policy_decision}` : ""}`,
-            status: m.status,
-            raw: m,
-          });
-        });
-      } else {
-        failures.push("agent messages");
-      }
-
-      setUnavailable(failures);
-
-      // Sort by timestamp descending. Records without one are kept, at the end,
-      // rather than collapsing to 1970 and being buried.
-      unified.sort((a, b) => {
-        if (!a.timestamp && !b.timestamp) return 0;
-        if (!a.timestamp) return 1;
-        if (!b.timestamp) return -1;
-        return new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime();
-      });
-
-      setEvents(unified);
-    } catch (err) {
-      console.error("Failed to load audit logs", err);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    fetchAllAuditData();
-  }, []);
 
   // Filter events
   useEffect(() => {
@@ -185,12 +182,14 @@ export default function ActivityPage() {
           variant="outline"
           size="sm"
           leftIcon={<RefreshCw className="w-3.5 h-3.5" />}
-          onClick={fetchAllAuditData}
+          onClick={reload}
+          disabled={loading}
         >
           Refresh
         </Button>
       }
     >
+      {loadError && <ErrorState message={loadError} onRetry={reload} />}
       {unavailable.length > 0 && (
         <div className="mb-4 rounded-md border border-amber-900/50 bg-amber-950/30 px-3 py-2 text-xs text-amber-300">
           Some sources could not be read, so this trail is incomplete:{" "}
@@ -230,7 +229,7 @@ export default function ActivityPage() {
         <div className="py-16 text-center">
           <p className="text-sm text-neutral-400">Loading audit feed...</p>
         </div>
-      ) : filteredEvents.length === 0 ? (
+      ) : loadError && filteredEvents.length === 0 ? null : filteredEvents.length === 0 ? (
         <div className="py-16 text-center">
           <p className="text-sm text-neutral-400">No entries found matching filter.</p>
         </div>

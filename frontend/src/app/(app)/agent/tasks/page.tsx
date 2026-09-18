@@ -5,6 +5,9 @@ import { PageShell } from "@/components/ui/PageShell";
 import { Badge, StatusBadge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
+import { ConfirmModal } from "@/components/ui/ConfirmModal";
+import { ErrorState } from "@/components/ui/ErrorState";
+import { useAsync } from "@/lib/useAsync";
 import {
   listTasks,
   getTask,
@@ -24,13 +27,37 @@ import {
 } from "lucide-react";
 
 export default function TasksPage() {
-  const [tasks, setTasks] = useState<A2ATask[]>([]);
+  const [statusFilter, setStatusFilter] = useState("all");
+  // The list loads through useAsync so a fetch failure renders an error with
+  // Retry instead of a false "No tasks found".
+  const {
+    data: tasksData,
+    error: loadError,
+    loading,
+    reload: reloadTasks,
+  } = useAsync(() =>
+    listTasks(statusFilter === "all" ? undefined : statusFilter).then(
+      (res) => res.tasks ?? []
+    )
+  );
+  const tasks = tasksData ?? [];
+  // The fetcher reads the filter through a ref, so a filter change needs an
+  // explicit reload (this also fires once on mount — a harmless duplicate GET).
+  useEffect(() => {
+    reloadTasks();
+  }, [statusFilter, reloadTasks]);
+
   const [trustedAgents, setTrustedAgents] = useState<TrustedAgent[]>([]);
   const [selectedTask, setSelectedTask] = useState<A2ATask | null>(null);
   /** Signed messages exchanged for the selected task, filtered from the audit. */
   const [timeline, setTimeline] = useState<A2AAuditEntry[]>([]);
-  const [statusFilter, setStatusFilter] = useState("all");
-  const [loading, setLoading] = useState(false);
+  /** Mutation failures render inline; they never use a native dialog. */
+  const [actionError, setActionError] = useState<string | null>(null);
+  /** The row (or modal) with a mutation in flight; its buttons show busy. */
+  const [busyId, setBusyId] = useState<string | null>(null);
+  /** Pending destructive actions, confirmed through ConfirmModal. */
+  const [rejectTarget, setRejectTarget] = useState<A2ATask | null>(null);
+  const [cancelTarget, setCancelTarget] = useState<A2ATask | null>(null);
 
   // New task modal
   const [createModalOpen, setCreateModalOpen] = useState(false);
@@ -39,34 +66,28 @@ export default function TasksPage() {
   const [purpose, setPurpose] = useState("");
   const [payloadText, setPayloadText] = useState('{"date": "2026-09-15"}');
   const [creating, setCreating] = useState(false);
+  /** Form validation errors render inside the modal, not in a native dialog. */
+  const [createError, setCreateError] = useState<string | null>(null);
 
   // Negotiation modal
   const [negotiateModalOpen, setNegotiateModalOpen] = useState(false);
   const [counterTerms, setCounterTerms] = useState('{"candidate_time": "15:00"}');
   const [negotiating, setNegotiating] = useState(false);
+  const [negotiateError, setNegotiateError] = useState<string | null>(null);
   // Peer IDs resolve to contact display names; unknown IDs fall back to a
   // short slice.
   const { resolve: resolveName } = useContactNames();
 
-  const fetchTasks = async (status?: string) => {
-    try {
-      setLoading(true);
-      const s = status === "all" ? undefined : status;
-      const res = await listTasks(s);
-      setTasks(res.tasks || []);
-    } catch (err) {
-      console.error("Failed to load tasks", err);
-    } finally {
-      setLoading(false);
-    }
+  const refreshTasks = () => {
+    setActionError(null);
+    reloadTasks();
   };
 
   useEffect(() => {
-    fetchTasks(statusFilter);
     listTrustedAgents()
       .then((res) => setTrustedAgents(res.agents || []))
       .catch(() => {});
-  }, [statusFilter]);
+  }, []);
 
   /**
    * Open a task, and load the signed messages behind it.
@@ -90,19 +111,20 @@ export default function TasksPage() {
   const handleCreateTask = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!recipientAgentId) {
-      alert("Please select a recipient agent.");
+      setCreateError("Please select a recipient agent.");
       return;
     }
     let payloadObj = {};
     try {
       payloadObj = JSON.parse(payloadText);
     } catch {
-      alert("Payload must be valid JSON.");
+      setCreateError("Payload must be valid JSON.");
       return;
     }
 
     try {
       setCreating(true);
+      setCreateError(null);
       await delegateTask({
         recipient_agent_id: recipientAgentId,
         task_type: taskType,
@@ -111,53 +133,68 @@ export default function TasksPage() {
       });
       setCreateModalOpen(false);
       setPurpose("");
-      await fetchTasks(statusFilter);
+      refreshTasks();
     } catch (err: any) {
-      alert(`Failed to delegate task: ${err.message}`);
+      setCreateError(`Failed to delegate task: ${err.message}`);
     } finally {
       setCreating(false);
     }
   };
 
   const handleApprove = async (taskId: string) => {
+    setBusyId(taskId);
+    setActionError(null);
     try {
       await approveTask(taskId);
-      await fetchTasks(statusFilter);
+      refreshTasks();
       if (selectedTask?.task_id === taskId) {
         const updated = await getTask(taskId);
         await openTask(updated);
       }
     } catch (err: any) {
-      alert(`Failed to approve task: ${err.message}`);
+      setActionError(`Failed to approve task: ${err.message}`);
+    } finally {
+      setBusyId(null);
     }
   };
 
-  const handleReject = async (taskId: string) => {
-    const reason = prompt("Enter reason for rejection:", "Declined by owner");
-    if (!reason) return;
+  const handleRejectConfirm = async (reason?: string) => {
+    if (!rejectTarget) return;
+    const taskId = rejectTarget.task_id;
+    setRejectTarget(null);
+    setBusyId(taskId);
+    setActionError(null);
     try {
-      await rejectTask(taskId, reason);
-      await fetchTasks(statusFilter);
+      await rejectTask(taskId, reason ?? "Declined by owner");
+      refreshTasks();
       if (selectedTask?.task_id === taskId) {
         const updated = await getTask(taskId);
         await openTask(updated);
       }
     } catch (err: any) {
-      alert(`Failed to reject task: ${err.message}`);
+      setActionError(`Failed to reject task: ${err.message}`);
+    } finally {
+      setBusyId(null);
     }
   };
 
-  const handleCancel = async (taskId: string) => {
-    if (!confirm("Are you sure you want to cancel this task?")) return;
+  const handleCancelConfirm = async () => {
+    if (!cancelTarget) return;
+    const taskId = cancelTarget.task_id;
+    setCancelTarget(null);
+    setBusyId(taskId);
+    setActionError(null);
     try {
       await cancelTask(taskId);
-      await fetchTasks(statusFilter);
+      refreshTasks();
       if (selectedTask?.task_id === taskId) {
         const updated = await getTask(taskId);
         await openTask(updated);
       }
     } catch (err: any) {
-      alert(`Failed to cancel task: ${err.message}`);
+      setActionError(`Failed to cancel task: ${err.message}`);
+    } finally {
+      setBusyId(null);
     }
   };
 
@@ -168,22 +205,23 @@ export default function TasksPage() {
     try {
       termsObj = JSON.parse(counterTerms);
     } catch {
-      alert("Counter terms must be valid JSON.");
+      setNegotiateError("Counter terms must be valid JSON.");
       return;
     }
 
     try {
       setNegotiating(true);
+      setNegotiateError(null);
       await negotiateTask(selectedTask.task_id, {
         proposal_payload: termsObj,
         purpose: "negotiate-terms",
       });
       setNegotiateModalOpen(false);
-      await fetchTasks(statusFilter);
+      refreshTasks();
       const updated = await getTask(selectedTask.task_id);
       await openTask(updated);
     } catch (err: any) {
-      alert(`Failed to submit counter-offer: ${err.message}`);
+      setNegotiateError(`Failed to submit counter-offer: ${err.message}`);
     } finally {
       setNegotiating(false);
     }
@@ -209,7 +247,10 @@ export default function TasksPage() {
         <Button
           size="sm"
           leftIcon={<Plus className="w-3.5 h-3.5" />}
-          onClick={() => setCreateModalOpen(true)}
+          onClick={() => {
+            setCreateError(null);
+            setCreateModalOpen(true);
+          }}
         >
           Delegate Task
         </Button>
@@ -235,17 +276,28 @@ export default function TasksPage() {
           variant="outline"
           size="sm"
           leftIcon={<RefreshCw className="w-3.5 h-3.5" />}
-          onClick={() => fetchTasks(statusFilter)}
+          onClick={refreshTasks}
+          disabled={loading}
         >
           Refresh
         </Button>
       </div>
 
+      {loadError && <ErrorState message={loadError} onRetry={refreshTasks} />}
+      {actionError && (
+        <div
+          role="alert"
+          className="mb-4 rounded-md border border-red-900/50 bg-red-950/40 px-3 py-2 text-xs text-red-300"
+        >
+          {actionError}
+        </div>
+      )}
+
       {loading ? (
         <div className="py-16 text-center">
           <p className="text-sm text-neutral-400">Loading tasks...</p>
         </div>
-      ) : tasks.length === 0 ? (
+      ) : loadError && tasks.length === 0 ? null : tasks.length === 0 ? (
         <div className="py-16 text-center">
           <p className="text-sm text-neutral-400">No tasks found in this view.</p>
           <p className="text-xs text-neutral-500 mt-1">
@@ -280,13 +332,16 @@ export default function TasksPage() {
                       size="sm"
                       variant="primary"
                       onClick={() => handleApprove(task.task_id)}
+                      isLoading={busyId === task.task_id}
+                      disabled={busyId !== null && busyId !== task.task_id}
                     >
                       Approve
                     </Button>
                     <Button
                       size="sm"
                       variant="ghost"
-                      onClick={() => handleReject(task.task_id)}
+                      onClick={() => setRejectTarget(task)}
+                      disabled={busyId !== null}
                     >
                       Reject
                     </Button>
@@ -311,7 +366,9 @@ export default function TasksPage() {
                   <Button
                     size="sm"
                     variant="outline"
-                    onClick={() => handleCancel(task.task_id)}
+                    onClick={() => setCancelTarget(task)}
+                    isLoading={busyId === task.task_id}
+                    disabled={busyId !== null && busyId !== task.task_id}
                   >
                     Cancel
                   </Button>
@@ -337,6 +394,11 @@ export default function TasksPage() {
         subtitle="Initiate a secure task to a trusted peer"
       >
         <form onSubmit={handleCreateTask} className="space-y-4">
+          {createError && (
+            <p role="alert" className="text-xs text-red-400">
+              {createError}
+            </p>
+          )}
           <div>
             <label className="text-xs text-neutral-400 font-medium block mb-1">
               Recipient Agent
@@ -533,7 +595,10 @@ export default function TasksPage() {
                 <Button
                   size="sm"
                   variant="primary"
-                  onClick={() => setNegotiateModalOpen(true)}
+                  onClick={() => {
+                    setNegotiateError(null);
+                    setNegotiateModalOpen(true);
+                  }}
                 >
                   Counter-Offer
                 </Button>
@@ -544,13 +609,16 @@ export default function TasksPage() {
                     size="sm"
                     variant="primary"
                     onClick={() => handleApprove(selectedTask.task_id)}
+                    isLoading={busyId === selectedTask.task_id}
+                    disabled={busyId !== null && busyId !== selectedTask.task_id}
                   >
                     Approve
                   </Button>
                   <Button
                     size="sm"
                     variant="danger"
-                    onClick={() => handleReject(selectedTask.task_id)}
+                    onClick={() => setRejectTarget(selectedTask)}
+                    disabled={busyId !== null}
                   >
                     Reject
                   </Button>
@@ -576,6 +644,11 @@ export default function TasksPage() {
         subtitle="Propose adjusted parameters to peer agent"
       >
         <form onSubmit={handleNegotiateSubmit} className="space-y-4">
+          {negotiateError && (
+            <p role="alert" className="text-xs text-red-400">
+              {negotiateError}
+            </p>
+          )}
           <div>
             <label className="text-xs text-neutral-400 font-medium block mb-1">
               Counter Terms (JSON)
@@ -608,6 +681,27 @@ export default function TasksPage() {
           </div>
         </form>
       </Modal>
+
+      {/* Reject reason and cancel confirmation via modal, no native dialogs. */}
+      <ConfirmModal
+        open={rejectTarget !== null}
+        title="Reject task"
+        body={`Tell ${rejectTarget ? resolveName(rejectTarget.recipient_agent_id) : "the peer"} why this task is declined.`}
+        confirmLabel="Reject task"
+        danger
+        requireReason
+        onConfirm={(reason) => void handleRejectConfirm(reason)}
+        onCancel={() => setRejectTarget(null)}
+      />
+      <ConfirmModal
+        open={cancelTarget !== null}
+        title="Cancel task"
+        body="The task stops here. The peer is notified of the cancellation."
+        confirmLabel="Cancel task"
+        danger
+        onConfirm={() => void handleCancelConfirm()}
+        onCancel={() => setCancelTarget(null)}
+      />
     </PageShell>
   );
 }

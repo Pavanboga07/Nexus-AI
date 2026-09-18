@@ -1,10 +1,12 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useState } from "react";
 import { PageShell } from "@/components/ui/PageShell";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
+import { ErrorState } from "@/components/ui/ErrorState";
+import { useAsync } from "@/lib/useAsync";
 import {
   listTools,
   executeTool,
@@ -21,40 +23,49 @@ import {
 } from "lucide-react";
 
 export default function ToolsPage() {
-  const [tools, setTools] = useState<ToolInfo[]>([]);
-  const [auditEntries, setAuditEntries] = useState<ToolAuditEntry[]>([]);
-  const [loading, setLoading] = useState(false);
+  // The two sources load together; a total failure throws so the page shows
+  // an error with Retry, while a partial failure lists what is missing.
+  const { data, error: loadError, loading, reload } = useAsync(async () => {
+    const [toolRes, auditRes] = await Promise.allSettled([
+      listTools(),
+      getToolAudit(),
+    ]);
+    const failed: string[] = [];
+    let tools: ToolInfo[] = [];
+    let auditEntries: ToolAuditEntry[] = [];
+    if (toolRes.status === "fulfilled") tools = toolRes.value.tools || [];
+    else failed.push("registered tools");
+    if (auditRes.status === "fulfilled")
+      auditEntries = auditRes.value.executions || [];
+    else failed.push("execution audit");
+    if (failed.length === 2) {
+      throw new Error(
+        "Could not load tools. The tool subsystem may be unavailable."
+      );
+    }
+    return { tools, auditEntries, failed };
+  });
+  const tools = data?.tools ?? [];
+  const auditEntries = data?.auditEntries ?? [];
+  const failedSources = data?.failed ?? [];
+
+  const refreshTools = () => {
+    setExecResult(null);
+    reload();
+  };
 
   // Tool execution modal
   const [selectedTool, setSelectedTool] = useState<ToolInfo | null>(null);
   const [paramInput, setParamInput] = useState("{}");
   const [executing, setExecuting] = useState(false);
   const [execResult, setExecResult] = useState<any>(null);
-
-  const fetchTools = async () => {
-    try {
-      setLoading(true);
-      const [toolRes, auditRes] = await Promise.allSettled([
-        listTools(),
-        getToolAudit(),
-      ]);
-      if (toolRes.status === "fulfilled") setTools(toolRes.value.tools || []);
-      if (auditRes.status === "fulfilled")
-        setAuditEntries(auditRes.value.executions || []);
-    } catch (err) {
-      console.error("Failed to load tools data", err);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    fetchTools();
-  }, []);
+  /** JSON/validation failures render inside the modal, not in a native dialog. */
+  const [execError, setExecError] = useState<string | null>(null);
 
   const handleOpenRunner = (tool: ToolInfo) => {
     setSelectedTool(tool);
     setExecResult(null);
+    setExecError(null);
 
     // Generate sample arguments based on parameters schema
     let initialParams: Record<string, any> = {};
@@ -83,18 +94,18 @@ export default function ToolsPage() {
     try {
       parsedArgs = JSON.parse(paramInput);
     } catch {
-      alert("Parameters must be valid JSON.");
+      setExecError("Parameters must be valid JSON.");
       return;
     }
 
     try {
       setExecuting(true);
       setExecResult(null);
+      setExecError(null);
       const res = await executeTool(selectedTool.name, parsedArgs);
       setExecResult(res);
-      // Refresh audit logs
-      const auditRes = await getToolAudit();
-      setAuditEntries(auditRes.executions || []);
+      // Refresh the audit trail behind the modal.
+      reload();
     } catch (err: any) {
       setExecResult({
         success: false,
@@ -113,13 +124,21 @@ export default function ToolsPage() {
         <Button
           variant="outline"
           size="sm"
-          onClick={fetchTools}
+          onClick={refreshTools}
+          disabled={loading}
         >
           <RefreshCw className="w-4 h-4 mr-2" />
           Refresh
         </Button>
       }
     >
+      {loadError && <ErrorState message={loadError} onRetry={refreshTools} />}
+      {failedSources.length > 0 && (
+        <div className="mb-6 rounded-md border border-amber-900/50 bg-amber-950/30 px-3 py-2 text-xs text-amber-300">
+          Some sources could not be read, so this view is incomplete:{" "}
+          {failedSources.join(", ")}.
+        </div>
+      )}
       <div className="space-y-12">
         {/* Tools Section */}
         <div>
@@ -134,7 +153,7 @@ export default function ToolsPage() {
             <div className="py-16 text-center">
               <p className="text-sm text-neutral-400">Loading...</p>
             </div>
-          ) : tools.length === 0 ? (
+          ) : loadError && tools.length === 0 ? null : tools.length === 0 ? (
             <div className="py-16 text-center border border-neutral-800 rounded-lg">
               <p className="text-sm text-neutral-400">No tools registered in current process.</p>
             </div>
@@ -159,6 +178,7 @@ export default function ToolsPage() {
                       size="sm"
                       variant="ghost"
                       onClick={() => handleOpenRunner(tool)}
+                      disabled={executing}
                     >
                       <Play className="w-4 h-4 mr-2" />
                       Execute
@@ -225,6 +245,11 @@ export default function ToolsPage() {
           subtitle="Directly test MCP tool invocation against policy authorization"
         >
           <form onSubmit={handleExecute} className="space-y-4">
+            {execError && (
+              <p role="alert" className="text-xs text-red-400">
+                {execError}
+              </p>
+            )}
             <div>
               <div className="flex items-center justify-between mb-1">
                 <label className="text-xs text-neutral-400 block">

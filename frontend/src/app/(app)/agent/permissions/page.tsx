@@ -1,10 +1,12 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useState } from "react";
 import { PageShell } from "@/components/ui/PageShell";
 import { Badge, DecisionBadge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
+import { ErrorState } from "@/components/ui/ErrorState";
+import { useAsync } from "@/lib/useAsync";
 import {
   listPolicies,
   listConsents,
@@ -23,10 +25,35 @@ import {
 } from "lucide-react";
 
 export default function PermissionsPage() {
-  const [policies, setPolicies] = useState<PolicyRule[]>([]);
-  const [consents, setConsents] = useState<Consent[]>([]);
-  const [audits, setAudits] = useState<PolicyAuditEntry[]>([]);
-  const [loading, setLoading] = useState(false);
+  // The three sources load together; a total failure throws so the page shows
+  // an error with Retry, while a partial failure lists what is missing.
+  const { data, error: loadError, loading, reload } = useAsync(async () => {
+    const [polRes, conRes, audRes] = await Promise.allSettled([
+      listPolicies(),
+      listConsents(),
+      getPolicyAudit(),
+    ]);
+    const failed: string[] = [];
+    let policies: PolicyRule[] = [];
+    let consents: Consent[] = [];
+    let audits: PolicyAuditEntry[] = [];
+    if (polRes.status === "fulfilled") policies = polRes.value.policies ?? [];
+    else failed.push("policy rules");
+    if (conRes.status === "fulfilled") consents = conRes.value.consents ?? [];
+    else failed.push("consents");
+    if (audRes.status === "fulfilled") audits = audRes.value.decisions ?? [];
+    else failed.push("decision audit");
+    if (failed.length === 3) {
+      throw new Error(
+        "Could not load permissions. The policy subsystem may be unavailable."
+      );
+    }
+    return { policies, consents, audits, failed };
+  });
+  const policies = data?.policies ?? [];
+  const consents = data?.consents ?? [];
+  const audits = data?.audits ?? [];
+  const failedSources = data?.failed ?? [];
 
   // Simulator state
   const [isSimulatorOpen, setIsSimulatorOpen] = useState(false);
@@ -35,35 +62,14 @@ export default function PermissionsPage() {
   const [simPeerId, setSimPeerId] = useState("");
   const [simResult, setSimResult] = useState<PolicyEvaluateResponse | null>(null);
   const [simulating, setSimulating] = useState(false);
-
-  const fetchData = async () => {
-    try {
-      setLoading(true);
-      const [polRes, conRes, audRes] = await Promise.allSettled([
-        listPolicies(),
-        listConsents(),
-        getPolicyAudit(),
-      ]);
-
-      if (polRes.status === "fulfilled") setPolicies(polRes.value.policies || []);
-      if (conRes.status === "fulfilled") setConsents(conRes.value.consents || []);
-      if (audRes.status === "fulfilled") setAudits(audRes.value.decisions || []);
-    } catch (err) {
-      console.error("Failed to load policy data", err);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    fetchData();
-  }, []);
+  const [simError, setSimError] = useState<string | null>(null);
 
   const handleSimulate = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
       setSimulating(true);
       setSimResult(null);
+      setSimError(null);
       const res = await evaluatePolicy({
         action: simAction,
         resource: simResource,
@@ -71,7 +77,7 @@ export default function PermissionsPage() {
       });
       setSimResult(res);
     } catch (err: any) {
-      alert(`Policy evaluation failed: ${err.message}`);
+      setSimError(`Policy evaluation failed: ${err.message}`);
     } finally {
       setSimulating(false);
     }
@@ -94,7 +100,8 @@ export default function PermissionsPage() {
           <Button
             variant="outline"
             size="sm"
-            onClick={fetchData}
+            onClick={reload}
+            disabled={loading}
           >
             <RefreshCw className="w-4 h-4 mr-2" />
             Refresh
@@ -103,6 +110,13 @@ export default function PermissionsPage() {
       }
     >
       <div className="space-y-12">
+        {loadError && <ErrorState message={loadError} onRetry={reload} />}
+        {failedSources.length > 0 && (
+          <div className="rounded-md border border-amber-900/50 bg-amber-950/30 px-3 py-2 text-xs text-amber-300">
+            Some sources could not be read, so this view is incomplete:{" "}
+            {failedSources.join(", ")}.
+          </div>
+        )}
         {/* Policies Section */}
         <div>
           <div className="mb-4">
@@ -116,7 +130,7 @@ export default function PermissionsPage() {
             <div className="py-16 text-center">
               <p className="text-sm text-neutral-400">Loading...</p>
             </div>
-          ) : policies.length === 0 ? (
+          ) : loadError && policies.length === 0 ? null : policies.length === 0 ? (
             <div className="py-16 text-center border border-neutral-800 rounded-lg">
               <p className="text-sm text-neutral-400">No custom policy rules configured.</p>
               <p className="text-xs text-neutral-500 mt-1">
