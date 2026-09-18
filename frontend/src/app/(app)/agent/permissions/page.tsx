@@ -118,8 +118,8 @@ export default function PermissionsPage() {
             {failedSources.join(", ")}.
           </div>
         )}
-        {/* Policies Section */}
-        <div>
+        {/* Policies Section — per-person rules; linked from people/[id]. */}
+        <div id="per-person">
           <div className="mb-4">
             <h2 className="text-sm font-medium text-neutral-100 flex items-center gap-2">
               <Shield className="w-4 h-4 text-neutral-400" />

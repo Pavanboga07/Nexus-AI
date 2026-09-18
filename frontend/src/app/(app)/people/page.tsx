@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import Link from "next/link";
 import { BadgeCheck, Search, ShieldAlert, UserPlus } from "lucide-react";
 
 import { Button } from "@/components/ui/Button";
@@ -209,9 +210,12 @@ export default function PeoplePage() {
                 >
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">
-                      <span className="truncate text-sm text-neutral-100">
+                      <Link
+                        href={`/people/${encodeURIComponent(agent.agent_id)}`}
+                        className="truncate text-sm text-neutral-100 underline-offset-2 hover:underline"
+                      >
                         {agent.display_name}
-                      </span>
+                      </Link>
                       {agent.status === "revoked" && (
                         <span className="rounded bg-red-950/60 px-1.5 py-0.5 text-[10px] uppercase text-red-400">
                           revoked
@@ -319,9 +323,12 @@ export default function PeoplePage() {
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
                       <div className="flex items-center gap-2">
-                        <span className="truncate text-sm text-neutral-100">
+                        <Link
+                          href={`/people/${encodeURIComponent(agent.agent_id)}`}
+                          className="truncate text-sm text-neutral-100 underline-offset-2 hover:underline"
+                        >
                           {agent.display_name}
-                        </span>
+                        </Link>
                         {agent.handle && (
                           <span className="text-[11px] text-neutral-500">
                             {agent.handle}

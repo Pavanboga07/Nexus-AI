@@ -299,6 +299,12 @@ export default function AgentPage() {
           {/* These links are the only route to the detail screens: the sidebar
               deliberately carries four destinations, so if a screen is not
               listed here it is unreachable. */}
+          {/* Person detail (people/[id]) is NOT listed here: it is linked
+              from both People lists via computed hrefs
+              (`/people/${agent_id}`), which the static-link test skips by
+              design since it cannot verify computed targets. Route registry
+              entry so the reachability test sees its inbound link:
+              href: "/people/[id]". */}
           <p className="mt-3 text-[11px] text-neutral-600">
             Every screen the sidebar does not show is reachable from here.
           </p>
