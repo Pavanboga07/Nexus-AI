@@ -275,6 +275,74 @@ export default function ChatPage() {
                             {children}
                           </code>
                         ),
+                        table: ({ children }) => (
+                          <div className="my-1.5 overflow-x-auto">
+                            <table className="w-full border-collapse text-xs">
+                              {children}
+                            </table>
+                          </div>
+                        ),
+                        th: ({ children }) => (
+                          <th className="border border-neutral-700 bg-neutral-950 px-2 py-1 text-left font-semibold">
+                            {children}
+                          </th>
+                        ),
+                        td: ({ children }) => (
+                          <td className="border border-neutral-800/70 px-2 py-1">
+                            {children}
+                          </td>
+                        ),
+                        blockquote: ({ children }) => (
+                          <blockquote className="my-1.5 border-l-2 border-neutral-700 pl-3 text-neutral-400">
+                            {children}
+                          </blockquote>
+                        ),
+                        h1: ({ children }) => (
+                          <h1 className="mb-1 mt-2 text-base font-semibold first:mt-0">
+                            {children}
+                          </h1>
+                        ),
+                        h2: ({ children }) => (
+                          <h2 className="mb-1 mt-2 text-sm font-semibold first:mt-0">
+                            {children}
+                          </h2>
+                        ),
+                        h3: ({ children }) => (
+                          <h3 className="mb-1 mt-2 text-[13px] font-semibold first:mt-0">
+                            {children}
+                          </h3>
+                        ),
+                        h4: ({ children }) => (
+                          <h4 className="mb-1 mt-2 text-xs font-semibold first:mt-0">
+                            {children}
+                          </h4>
+                        ),
+                        h5: ({ children }) => (
+                          <h5 className="mb-1 mt-2 text-xs font-semibold first:mt-0">
+                            {children}
+                          </h5>
+                        ),
+                        h6: ({ children }) => (
+                          <h6 className="mb-1 mt-2 text-xs font-semibold first:mt-0">
+                            {children}
+                          </h6>
+                        ),
+                        hr: () => <hr className="my-2 border-neutral-800/70" />,
+                        img: ({ src, alt }) => {
+                          // Model text is untrusted: only http(s) images render,
+                          // constrained to the bubble; anything else shows alt
+                          // text (or nothing) rather than a broken/chrome URL.
+                          if (!src || !/^https?:/i.test(src)) {
+                            return alt ? <span>{alt}</span> : null;
+                          }
+                          return (
+                            <img
+                              src={src}
+                              alt={alt ?? ""}
+                              className="my-1.5 max-w-full rounded"
+                            />
+                          );
+                        },
                       }}
                     >
                       {message.content}
