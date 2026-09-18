@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { PageShell } from "@/components/ui/PageShell";
 import { Badge, StatusBadge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
@@ -8,6 +8,7 @@ import { Modal } from "@/components/ui/Modal";
 import { ConfirmModal } from "@/components/ui/ConfirmModal";
 import { ErrorState } from "@/components/ui/ErrorState";
 import { useAsync } from "@/lib/useAsync";
+import { useCapabilities } from "@/lib/useCapabilities";
 import {
   listTasks,
   getTask,
@@ -16,6 +17,8 @@ import {
   rejectTask,
   cancelTask,
   negotiateTask,
+  CAPABILITY_TASK_TYPES,
+  payloadTemplateForTaskType,
 } from "@/lib/api/tasks";
 import { listTrustedAgents, getA2AAudit, A2AAuditEntry } from "@/lib/api/a2a";
 import { A2ATask, TrustedAgent } from "@/types/api";
@@ -62,12 +65,39 @@ export default function TasksPage() {
   // New task modal
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [recipientAgentId, setRecipientAgentId] = useState("");
-  const [taskType, setTaskType] = useState("availability_query");
+  // The capability is picked from the live registry; the task_type the
+  // delegate endpoint accepts is derived from it (see CAPABILITY_TASK_TYPES).
+  const [capabilityId, setCapabilityId] = useState("");
   const [purpose, setPurpose] = useState("");
-  const [payloadText, setPayloadText] = useState('{"date": "2026-09-15"}');
+  const [payloadText, setPayloadText] = useState("");
   const [creating, setCreating] = useState(false);
   /** Form validation errors render inside the modal, not in a native dialog. */
   const [createError, setCreateError] = useState<string | null>(null);
+  const { capabilities, loading: capsLoading, error: capsError, reload: reloadCaps } =
+    useCapabilities();
+  const taskType = CAPABILITY_TASK_TYPES[capabilityId] ?? "";
+  // The last auto-filled payload, so picking another capability only
+  // overwrites JSON the user has not edited themselves.
+  const lastTemplate = useRef<string | null>(null);
+
+  function pickCapability(id: string) {
+    setCapabilityId(id);
+    const mapped = CAPABILITY_TASK_TYPES[id];
+    if (mapped && (payloadText.trim() === "" || payloadText === lastTemplate.current)) {
+      const template = payloadTemplateForTaskType(mapped);
+      lastTemplate.current = template;
+      setPayloadText(template);
+    }
+  }
+
+  // Preselect the first registry entry so the modal opens ready to send;
+  // the user can still pick explicitly before dispatching.
+  useEffect(() => {
+    if (createModalOpen && capabilityId === "" && capabilities.length > 0) {
+      pickCapability(capabilities[0].id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [createModalOpen, capabilities]);
 
   // Negotiation modal
   const [negotiateModalOpen, setNegotiateModalOpen] = useState(false);
@@ -115,9 +145,17 @@ export default function TasksPage() {
       setCreateError("Please select a recipient agent.");
       return;
     }
+    if (!taskType) {
+      setCreateError(
+        capabilityId
+          ? "This capability cannot be sent as a task yet."
+          : "Please select a capability."
+      );
+      return;
+    }
     let payloadObj = {};
     try {
-      payloadObj = JSON.parse(payloadText);
+      payloadObj = JSON.parse(payloadText || "{}");
     } catch {
       setCreateError("Payload must be valid JSON.");
       return;
@@ -134,6 +172,11 @@ export default function TasksPage() {
       });
       setCreateModalOpen(false);
       setPurpose("");
+      if (taskType) {
+        const template = payloadTemplateForTaskType(taskType);
+        lastTemplate.current = template;
+        setPayloadText(template);
+      }
       refreshTasks();
     } catch (err: any) {
       setCreateError(`Failed to delegate task: ${err.message}`);
@@ -433,16 +476,62 @@ export default function TasksPage() {
               <label className="text-xs text-neutral-400 font-medium block mb-1">
                 Capability
               </label>
-              <select
-                value={taskType}
-                onChange={(e) => setTaskType(e.target.value)}
-                className="w-full bg-neutral-900 border border-neutral-800 rounded-md px-3 py-2 text-sm text-neutral-100 focus:outline-none focus:border-blue-500 font-mono"
-              >
-                <option value="availability_query">availability_query</option>
-                <option value="meeting_proposal">meeting_proposal</option>
-                <option value="calculator">calculator</option>
-                <option value="custom">custom</option>
-              </select>
+              {capsLoading ? (
+                <p className="text-xs text-neutral-500 py-2" aria-busy="true">
+                  Loading capabilities…
+                </p>
+              ) : capsError ? (
+                <div className="flex items-center gap-2">
+                  <p role="alert" className="text-xs text-red-400 flex-1">
+                    Couldn&apos;t load capabilities: {capsError}
+                  </p>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={reloadCaps}
+                  >
+                    Retry
+                  </Button>
+                </div>
+              ) : capabilities.length === 0 ? (
+                <p className="text-xs text-neutral-500 py-2">
+                  No capabilities registered on this agent.
+                </p>
+              ) : (
+                <>
+                  <select
+                    value={capabilityId}
+                    onChange={(e) => pickCapability(e.target.value)}
+                    className="w-full bg-neutral-900 border border-neutral-800 rounded-md px-3 py-2 text-sm text-neutral-100 focus:outline-none focus:border-blue-500 font-mono"
+                  >
+                    <option value="">-- Select capability --</option>
+                    {capabilities.map((cap) => (
+                      <option key={cap.id} value={cap.id} title={cap.description}>
+                        {cap.id}
+                      </option>
+                    ))}
+                  </select>
+                  {capabilityId !== "" && (
+                    <p className="mt-1 text-[11px] text-neutral-500">
+                      {taskType ? (
+                        <>
+                          Sends as task type{" "}
+                          <span className="font-mono text-neutral-400">{taskType}</span>
+                          {capabilities.find((c) => c.id === capabilityId)?.description
+                            ? ` — ${capabilities.find((c) => c.id === capabilityId)?.description}`
+                            : ""}
+                        </>
+                      ) : (
+                        <span className="text-amber-500">
+                          This capability has no task handler yet, so it cannot
+                          be sent as a task.
+                        </span>
+                      )}
+                    </p>
+                  )}
+                </>
+              )}
             </div>
             <div>
               <label className="text-xs text-neutral-400 font-medium block mb-1">
@@ -453,6 +542,7 @@ export default function TasksPage() {
                 value={purpose}
                 onChange={(e) => setPurpose(e.target.value)}
                 placeholder="e.g. Sync availability"
+                maxLength={64}
                 className="w-full bg-neutral-900 border border-neutral-800 rounded-md px-3 py-2 text-sm text-neutral-100 focus:outline-none focus:border-blue-500"
               />
             </div>
@@ -483,7 +573,7 @@ export default function TasksPage() {
               type="submit"
               variant="primary"
               size="sm"
-              disabled={creating || !recipientAgentId}
+              disabled={creating || !recipientAgentId || !taskType}
               isLoading={creating}
             >
               Dispatch Task
