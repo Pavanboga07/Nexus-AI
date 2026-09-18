@@ -1,8 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
-
 import { CapabilityInfo, getCapabilities } from "./api/identity";
+import { useAsync } from "./useAsync";
 
 /**
  * The live capability registry as picker options.
@@ -17,27 +16,7 @@ export function useCapabilities(): {
   error: string | null;
   reload: () => void;
 } {
-  const [capabilities, setCapabilities] = useState<CapabilityInfo[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const { data, loading, error, reload } = useAsync(getCapabilities);
 
-  const reload = useCallback(() => {
-    setLoading(true);
-    setError(null);
-    void getCapabilities()
-      .then((res) => {
-        setCapabilities(res.capabilities ?? []);
-        setLoading(false);
-      })
-      .catch((err: unknown) => {
-        setError(err instanceof Error ? err.message : "Could not load capabilities.");
-        setLoading(false);
-      });
-  }, []);
-
-  useEffect(() => {
-    reload();
-  }, [reload]);
-
-  return { capabilities, loading, error, reload };
+  return { capabilities: data?.capabilities ?? [], loading, error, reload };
 }

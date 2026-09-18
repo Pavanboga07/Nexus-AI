@@ -13,7 +13,7 @@
  * the user to approve something opaque.
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertCircle, Check, Clock, X } from "lucide-react";
 
 import { Button } from "@/components/ui/Button";
@@ -161,6 +161,8 @@ export default function InboxPage() {
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [decided, setDecided] = useState<Record<string, "approve" | "deny">>({});
+  /** The move-to-Done delay, cleared on unmount so it never fires post-unmount. */
+  const decideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Contact names resolve agent IDs to display names; unknown IDs fall back
   // to a short slice (never a raw 24-char slice).
   const { resolve: resolveName } = useContactNames();
@@ -187,6 +189,14 @@ export default function InboxPage() {
     void load();
   }, [load]);
 
+  useEffect(() => {
+    return () => {
+      if (decideTimerRef.current !== null) {
+        clearTimeout(decideTimerRef.current);
+      }
+    };
+  }, []);
+
   async function decide(item: ApprovalItem, decision: "approve" | "deny") {
     if (busyId !== null) return;
     setBusyId(item.id);
@@ -196,7 +206,7 @@ export default function InboxPage() {
       setDecided((prev) => ({ ...prev, [item.id]: decision }));
       // Move it to Done after a beat so the user sees what happened —
       // decided cards keep their outcome visible instead of vanishing.
-      setTimeout(() => {
+      decideTimerRef.current = setTimeout(() => {
         setItems((prev) => prev.filter((i) => i.id !== item.id));
         setDecided((prev) => {
           const next = { ...prev };

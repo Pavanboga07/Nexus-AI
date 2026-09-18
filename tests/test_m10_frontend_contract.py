@@ -1112,3 +1112,79 @@ def test_shared_types_agree_with_the_backend_schema() -> None:
         "these frontend types describe fields the API never sends, so every read "
         "of them yields undefined:\n  " + "\n  ".join(offenders)
     )
+
+
+# ---------------------------------------------------------------------------
+# Capability map: the pickers' delegate vocabulary vs the backend registry
+# ---------------------------------------------------------------------------
+#
+# The Tasks delegate modal and the Chat ask modal offer the live capability
+# registry, but the delegate endpoint only accepts registered task-handler
+# names — two separate backend vocabularies paired by
+# A2AService._register_default_capabilities, mirrored on the frontend by
+# CAPABILITY_TASK_TYPES. A capability id renamed on the backend without
+# updating the map sends a request the backend 400s; a registry id missing
+# from the map renders with submit disabled forever.
+
+#: Registry ids that deliberately have no delegate task_type. Kept explicit
+#: and empty: every entry is a decision that a human made, not a place to
+#: silence the check.
+_INTENTIONALLY_UNMAPPED_CAPABILITIES: frozenset[str] = frozenset()
+
+
+def _frontend_capability_task_types() -> dict[str, str]:
+    """The CAPABILITY_TASK_TYPES literal in tasks.ts, keyed by capability id."""
+    source = (SRC / "lib" / "api" / "tasks.ts").read_text(encoding="utf-8")
+    match = re.search(r"CAPABILITY_TASK_TYPES[^=]*=\s*\{(.*?)\};", source, re.S)
+    assert match, "CAPABILITY_TASK_TYPES is gone from tasks.ts"
+    return dict(re.findall(r'"([^"]+)"\s*:\s*"([^"]+)"', match.group(1)))
+
+
+def _backend_capability_ids() -> set[str]:
+    """The ids A2AService._register_default_capabilities actually declares.
+
+    Built by running the real registration on a bare instance: the method
+    only touches `self._capabilities`, so no service collaborators are needed
+    and a backend rename shows up here rather than as a doomed request.
+    """
+    from app.a2a.service import A2AService
+
+    service = A2AService.__new__(A2AService)
+    service._capabilities = {}
+    service._register_default_capabilities()
+    return set(service._capabilities)
+
+
+def test_capability_task_types_match_the_backend_registry() -> None:
+    """Every frontend map key must be a real registry id, and vice versa.
+
+    Static check (this repo has no frontend unit runner — see the plan): the
+    map literal is read with a regex over its braces, so a key moved into a
+    comment does not count as mapped.
+    """
+    frontend = _frontend_capability_task_types()
+    assert frontend, (
+        "CAPABILITY_TASK_TYPES has no entries; the pickers cannot send anything"
+    )
+    registry = _backend_capability_ids()
+    assert registry, "the backend registers no capabilities"
+
+    unknown = sorted(set(frontend) - registry)
+    assert not unknown, (
+        "these CAPABILITY_TASK_TYPES keys are not in the backend capability "
+        "registry (A2AService._register_default_capabilities), so picking them "
+        "sends a task_type the backend never paired:\n  " + "\n  ".join(unknown)
+    )
+
+    unmapped = sorted(
+        cid
+        for cid in registry
+        if cid not in frontend
+        and cid not in _INTENTIONALLY_UNMAPPED_CAPABILITIES
+    )
+    assert not unmapped, (
+        "these registry ids have no task_type in CAPABILITY_TASK_TYPES, so the "
+        "pickers offer them with submit disabled forever. Map them, or list "
+        "them in _INTENTIONALLY_UNMAPPED_CAPABILITIES:\n  "
+        + "\n  ".join(unmapped)
+    )
