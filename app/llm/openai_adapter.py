@@ -391,7 +391,10 @@ class OpenAICompatibleProvider(LLMProvider):
                     {
                         "role": "tool",
                         "tool_call_id": call_id,
-                        "content": text,
+                        # Quarantine (Phase D): retrieved content is
+                        # untrusted data — delimit it so the model treats
+                        # it as data, never as instructions.
+                        "content": f"<retrieved>\n{text}\n</retrieved>",
                     }
                 )
                 if stop:
