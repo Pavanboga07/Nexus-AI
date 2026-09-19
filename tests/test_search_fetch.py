@@ -9,6 +9,7 @@ private-range URL raises via ``validate_endpoint`` BEFORE any socket opens
 from __future__ import annotations
 
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -45,9 +46,30 @@ class _FetchHandler(BaseHTTPRequestHandler):
     pages: dict[str, bytes] = {}
     redirects: dict[str, str] = {}
     hits: list[str] = []
+    precheck_writes: list[int] = []
 
     def do_GET(self) -> None:
         type(self).hits.append(self.path)
+        if self.path == "/precheck":
+            # Lying header: declares 100 KB but the real body is small and
+            # delayed. With the pre-check the client returns after headers
+            # and closes, so the delayed write fails (zero bytes
+            # delivered). Without it the client waits and reads the marker.
+            body = (
+                b"<html><head><title>Precheck</title></head>"
+                b"<body><p>SHOULD_NOT_BE_READ</p></body></html>"
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", "100000")
+            self.end_headers()
+            try:
+                time.sleep(0.5)
+                self.wfile.write(body)
+                type(self).precheck_writes.append(len(body))
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
         if self.path in type(self).redirects:
             target = type(self).redirects[self.path]
             body = b"redirect"
@@ -94,6 +116,7 @@ def fetch_server():
         "/short": "/page",
     }
     _FetchHandler.hits = []
+    _FetchHandler.precheck_writes = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), _FetchHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -102,6 +125,7 @@ def fetch_server():
     _FetchHandler.pages = {}
     _FetchHandler.redirects = {}
     _FetchHandler.hits = []
+    _FetchHandler.precheck_writes = []
 
 
 def _base_url(server: ThreadingHTTPServer) -> str:
@@ -140,10 +164,12 @@ async def test_private_url_blocked_before_any_socket(fetch_server) -> None:
 
 
 async def test_oversized_body_truncates_at_cap(fetch_server) -> None:
+    # /big declares ~200 KB, so the Content-Length pre-check trips and the
+    # body is skipped: capped (empty) outcome, same contract as truncation.
     page = await fetch_url(f"{_base_url(fetch_server)}/big", allow_local=True)
 
     assert len(page.text.encode("utf-8")) <= 8 * 1024
-    assert page.text.startswith("x")
+    assert page.text == ""
 
 
 async def test_redirect_chain_stops_after_three(fetch_server) -> None:
@@ -156,3 +182,15 @@ async def test_short_redirect_chain_is_followed(fetch_server) -> None:
 
     assert page.title == "Known Page"
     assert "The quick brown fox" in page.text
+
+
+async def test_content_length_precheck_skips_body_download(fetch_server) -> None:
+    # Same zero-hits pattern as the SSRF test, but for the body: the server
+    # counts delivered body bytes; the pre-check closes after headers, so
+    # the delayed body write fails and zero bytes are delivered.
+    _FetchHandler.precheck_writes = []
+    page = await fetch_url(f"{_base_url(fetch_server)}/precheck", allow_local=True)
+
+    assert page.text == ""
+    assert "SHOULD_NOT_BE_READ" not in page.text
+    assert _FetchHandler.precheck_writes == []

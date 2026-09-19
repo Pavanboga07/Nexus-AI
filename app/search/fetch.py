@@ -103,8 +103,16 @@ async def fetch_url(url: str, *, allow_local: bool = False) -> FetchedPage:
                 raise FetchError(
                     f"Fetch failed with HTTP {response.status_code} for {url!r}."
                 )
-            # Content-Length pre-check: a huge (or lying) header never
-            # changes the outcome — the streaming loop below caps anyway.
+            # Content-Length pre-check: refuse the body up front when the
+            # response declares more than the cap (saves bandwidth/time
+            # on huge pages). Malformed/missing header falls through to
+            # the streaming cap below.
+            try:
+                declared = response.headers.get("content-length")
+                if declared is not None and int(declared) > MAX_BYTES:
+                    return FetchedPage(url=str(response.url), title="", text="")
+            except (TypeError, ValueError):
+                pass
             raw = bytearray()
             async for chunk in response.aiter_bytes():
                 remaining = MAX_BYTES - len(raw)
