@@ -143,6 +143,13 @@ def _normalize_executor_result(
     return str(result), False
 
 
+def _escape_retrieved(text: str) -> str:
+    """Neutralise literal quarantine delimiters inside untrusted text."""
+    return text.replace("<retrieved>", "[retrieved]").replace(
+        "</retrieved>", "[/retrieved]"
+    )
+
+
 class OpenAICompatibleProvider(LLMProvider):
     """Reasoning backend for any OpenAI-compatible chat-completions API."""
 
@@ -394,7 +401,13 @@ class OpenAICompatibleProvider(LLMProvider):
                         # Quarantine (Phase D): retrieved content is
                         # untrusted data — delimit it so the model treats
                         # it as data, never as instructions.
-                        "content": f"<retrieved>\n{text}\n</retrieved>",
+                        # Escape: a page containing the literal delimiters
+                        # would break out of the wrapper, so neutralise
+                        # them first with bracketed forms ([retrieved] /
+                        # [/retrieved]) — inert (no angle brackets) and
+                        # still readable. Done here so search, fetch, and
+                        # policy-stop messages are all covered.
+                        "content": f"<retrieved>\n{_escape_retrieved(text)}\n</retrieved>",
                     }
                 )
                 if stop:
