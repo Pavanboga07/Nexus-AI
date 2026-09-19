@@ -14,7 +14,12 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.search import SearchError, SearchProvider, SearchTimeoutError, get_provider
+from app.search import (
+    SearchError,
+    SearchProvider,
+    SearchTimeoutError,
+    get_provider_from_settings,
+)
 from app.search.fetch import FetchedPage, fetch_url
 from app.tools.errors import ToolError, ToolErrorCode
 from app.tools.registry import BaseTool
@@ -50,7 +55,14 @@ class WebSearchTool(BaseTool):
     args_model = WebSearchArgs
 
     def __init__(self, provider: SearchProvider | None = None) -> None:
-        self._provider = provider if provider is not None else get_provider()
+        if provider is not None:
+            self._provider = provider
+        else:
+            # No-arg default stays intact for BUILTIN_TOOLS: the provider
+            # comes from settings (default: keyless DuckDuckGo).
+            from app.config.settings import get_settings
+
+            self._provider = get_provider_from_settings(get_settings())
 
     async def execute(
         self, arguments: WebSearchArgs, context: ToolContext

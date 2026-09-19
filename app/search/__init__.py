@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass
@@ -56,10 +57,23 @@ def get_provider(
     )
 
 
+def get_provider_from_settings(settings: Any) -> SearchProvider:
+    """Return the search provider selected in app settings.
+
+    Default is keyless DuckDuckGo. Selecting ``tavily`` without
+    ``NEXUS_TAVILY_API_KEY`` raises the same clear error as
+    :func:`get_provider`.
+    """
+    name = getattr(settings, "nexus_search_provider", "duckduckgo")
+    key = getattr(settings, "nexus_tavily_api_key", None)
+    return get_provider(name, tavily_key=key)
+
+
 __all__ = [
     "SearchError",
     "SearchProvider",
     "SearchResult",
     "SearchTimeoutError",
     "get_provider",
+    "get_provider_from_settings",
 ]

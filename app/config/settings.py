@@ -98,6 +98,11 @@ class Settings(BaseSettings):
     nexus_embedding_model: str = "text-embedding-3-small"
     nexus_embedding_dimensions: int = Field(default=1536, ge=2)
 
+    # --- Web search (Phase D) -------------------------------------------------
+    # "duckduckgo" is keyless; "tavily" requires NEXUS_TAVILY_API_KEY.
+    nexus_search_provider: Literal["duckduckgo", "tavily"] = "duckduckgo"
+    nexus_tavily_api_key: str | None = Field(default=None)
+
     # --- Memory (Part 2) ---------------------------------------------------
     nexus_memory_top_k: int = Field(default=5, ge=1)
     nexus_memory_enabled: bool = True
@@ -264,6 +269,7 @@ class Settings(BaseSettings):
         "nexus_llm_api_key",
         "nexus_llm_base_url",
         "nexus_llm_model",
+        "nexus_tavily_api_key",
         "openai_api_key",
         "openai_base_url",
         "openai_model",

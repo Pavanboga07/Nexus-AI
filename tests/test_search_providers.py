@@ -125,3 +125,55 @@ def test_factory_defaults_to_duckduckgo() -> None:
 def test_factory_tavily_without_key_raises() -> None:
     with pytest.raises(ValueError, match="[Aa][Pp][Ii] key"):
         get_provider("tavily")
+
+
+# --- Task D7: settings wiring -------------------------------------------------
+
+
+def test_settings_search_provider_defaults_to_duckduckgo(monkeypatch) -> None:
+    from app.config.settings import Settings
+
+    monkeypatch.delenv("NEXUS_SEARCH_PROVIDER", raising=False)
+    monkeypatch.delenv("NEXUS_TAVILY_API_KEY", raising=False)
+    settings = Settings(_env_file=None)
+
+    assert settings.nexus_search_provider == "duckduckgo"
+    assert settings.nexus_tavily_api_key is None
+
+
+def test_provider_from_settings_uses_configured_default(monkeypatch) -> None:
+    from app.config.settings import Settings
+    from app.search import get_provider_from_settings
+
+    monkeypatch.delenv("NEXUS_SEARCH_PROVIDER", raising=False)
+    monkeypatch.delenv("NEXUS_TAVILY_API_KEY", raising=False)
+
+    provider = get_provider_from_settings(Settings(_env_file=None))
+
+    assert isinstance(provider, DuckDuckGoProvider)
+
+
+def test_provider_from_settings_tavily_without_key_raises() -> None:
+    from app.config.settings import Settings
+    from app.search import get_provider_from_settings
+
+    settings = Settings(
+        _env_file=None,
+        nexus_search_provider="tavily",
+        nexus_tavily_api_key=None,
+    )
+    with pytest.raises(ValueError, match="[Aa][Pp][Ii] key"):
+        get_provider_from_settings(settings)
+
+
+def test_web_search_tool_default_comes_from_settings(monkeypatch) -> None:
+    from app.config.settings import get_settings
+    from app.tools.builtin_search import WebSearchTool
+
+    monkeypatch.delenv("NEXUS_SEARCH_PROVIDER", raising=False)
+    monkeypatch.delenv("NEXUS_TAVILY_API_KEY", raising=False)
+    get_settings.cache_clear()
+    try:
+        assert isinstance(WebSearchTool()._provider, DuckDuckGoProvider)
+    finally:
+        get_settings.cache_clear()
