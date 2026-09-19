@@ -14,7 +14,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.search import SearchError, SearchProvider, get_provider
+from app.search import SearchError, SearchProvider, SearchTimeoutError, get_provider
 from app.search.fetch import FetchedPage, fetch_url
 from app.tools.errors import ToolError, ToolErrorCode
 from app.tools.registry import BaseTool
@@ -42,7 +42,10 @@ class WebFetchArgs(_StrictModel):
 
 class WebSearchTool(BaseTool):
     name = "web_search"
-    description = "Search the public web and return titles, URLs, and snippets."
+    description = (
+        "Discover current or external information to answer a question; "
+        "use before answering from memory. Returns titles, URLs, and snippets."
+    )
     data_category = "public-web"
     args_model = WebSearchArgs
 
@@ -54,6 +57,10 @@ class WebSearchTool(BaseTool):
     ) -> dict[str, Any]:
         try:
             results = await self._provider.search(arguments.query, arguments.count)
+        except SearchTimeoutError as exc:
+            raise ToolError(
+                ToolErrorCode.TIMEOUT, str(exc) or "Web search timed out."
+            ) from exc
         except SearchError as exc:
             raise ToolError(
                 ToolErrorCode.EXECUTION_ERROR, str(exc) or "Web search failed."
@@ -68,7 +75,10 @@ class WebSearchTool(BaseTool):
 
 class WebFetchTool(BaseTool):
     name = "web_fetch"
-    description = "Fetch a public web page and return its extracted text."
+    description = (
+        "Read the full content of a URL from search results. "
+        "Call only with URLs returned by web_search or supplied by the user."
+    )
     data_category = "public-web"
     args_model = WebFetchArgs
 
@@ -83,6 +93,10 @@ class WebFetchTool(BaseTool):
     ) -> dict[str, Any]:
         try:
             page = await self._fetch(arguments.url)
+        except SearchTimeoutError as exc:
+            raise ToolError(
+                ToolErrorCode.TIMEOUT, str(exc) or "Web fetch timed out."
+            ) from exc
         except SearchError as exc:
             raise ToolError(
                 ToolErrorCode.EXECUTION_ERROR, str(exc) or "Web fetch failed."
