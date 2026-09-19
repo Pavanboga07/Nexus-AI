@@ -39,9 +39,9 @@ async def test_list_tools(db_tools_client) -> None:
     response = await db_tools_client.get("/tools")
     assert response.status_code == 200
     body = response.json()
-    assert body["total"] == 2
+    assert body["total"] == 4
     names = {t["name"] for t in body["tools"]}
-    assert names == {"echo", "get_current_time"}
+    assert names == {"echo", "get_current_time", "web_fetch", "web_search"}
     # MCP-style metadata, no implementation details.
     for tool in body["tools"]:
         assert set(tool) == {"name", "description", "inputSchema"}

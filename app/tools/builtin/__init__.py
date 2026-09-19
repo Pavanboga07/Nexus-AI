@@ -7,6 +7,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.tools.builtin_search import WebFetchTool, WebSearchTool
 from app.tools.registry import BaseTool
 from app.tools.schemas import ToolContext
 
@@ -59,6 +60,17 @@ class EchoTool(BaseTool):
         return {"text": arguments.text}
 
 
-BUILTIN_TOOLS = (CurrentTimeTool(), EchoTool())
+BUILTIN_TOOLS = (
+    CurrentTimeTool(),
+    EchoTool(),
+    WebSearchTool(),
+    WebFetchTool(),
+)
 
-__all__ = ["BUILTIN_TOOLS", "CurrentTimeTool", "EchoTool"]
+__all__ = [
+    "BUILTIN_TOOLS",
+    "CurrentTimeTool",
+    "EchoTool",
+    "WebFetchTool",
+    "WebSearchTool",
+]
