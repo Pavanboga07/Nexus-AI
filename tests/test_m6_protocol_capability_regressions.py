@@ -732,3 +732,52 @@ async def test_search_policy_deny_never_touches_provider(
 
     assert response.payload["status"] == "rejected"
     assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_search_provider_failure_maps_to_signed_failed(
+    db_session_factory, db_owner_id, policy_service, memory_manager
+) -> None:
+    """A SearchError from the provider finalizes as failed with a signed FAILED envelope."""
+    from app.a2a import signing
+    from app.a2a.repository import MessageRecordRepository
+    from app.search import SearchError
+    from tests.test_a2a_service import StubIdentity
+
+    class _FailingSearchProvider:
+        async def search(self, query: str, count: int = 5):
+            raise SearchError("upstream exploded")
+
+    sender = StubIdentity()
+    receiver = StubIdentity()
+    service = _search_service(
+        db_session_factory,
+        policy_service,
+        memory_manager,
+        receiver,
+        _FailingSearchProvider(),
+    )
+    await service.register_trusted_agent(
+        db_owner_id,
+        agent_id=sender.agent_id,
+        public_key=sender.public_key_b64,
+        display_name="Searcher",
+        endpoint=SEARCH_TEST_ENDPOINT,
+    )
+    await _allow_search(policy_service, db_owner_id, sender.agent_id)
+
+    envelope = await _signed_search_request(sender, receiver.agent_id)
+    response = await service.handle_inbound(db_owner_id, envelope)
+
+    assert response.payload["status"] == "failed"
+    assert response.payload["reason"] == "upstream exploded"
+    assert response.task_id == envelope.task_id
+    assert signing.verify_envelope_signature(response, receiver.public_key_b64) is True
+
+    async with db_session_factory() as session:
+        record = await MessageRecordRepository().get_by_message_id(
+            session, db_owner_id, envelope.message_id
+        )
+    assert record is not None
+    assert record.status == "failed"
+    assert record.policy_decision == "ALLOW"
