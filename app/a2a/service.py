@@ -702,7 +702,8 @@ class A2AService:
         Runs only after policy ALLOW, so the provider is never touched on
         DENY/ASK. The response carries results only, never memory.
         """
-        from app.search import SearchError, get_provider
+        from app.config.settings import get_settings
+        from app.search import SearchError, get_provider_from_settings
 
         payload = envelope.payload or {}
         query = payload.get("query", "")
@@ -710,7 +711,7 @@ class A2AService:
         provider = (
             self._search_provider
             if self._search_provider is not None
-            else get_provider()
+            else get_provider_from_settings(get_settings())
         )
         try:
             results = await provider.search(query, count)
