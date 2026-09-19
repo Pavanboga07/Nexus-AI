@@ -438,7 +438,14 @@ async def test_generate_with_tools_stops_sibling_calls_on_first_stop() -> None:
 
 
 async def test_generate_with_tools_exhausted_composes_final_answer() -> None:
-    """Search+fetch exhausts both rounds → one final compose call (no tools)."""
+    """Search+fetch exhausts both rounds → final compose call answers from evidence.
+
+    The compose call sends the UNSANITIZED history WITH tools= AND
+    tool_choice="none": this forces the model to answer from the evidence
+    instead of calling again, and keeps every tool_call_id paired with its
+    call (stripping assistant tool_calls orphans tool-role messages and
+    Groq 400s with "Tools should have a name!").
+    """
     provider, completions = _tools_provider(
         [
             _tool_call_completion("web_search", {"query": "q"}),
@@ -450,15 +457,23 @@ async def test_generate_with_tools_exhausted_composes_final_answer() -> None:
     async def _executor(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return {"text": "tool output", "stop": False}
 
+    schemas = _search_schemas()
     reply = await provider.generate_with_tools(
-        [{"role": "user", "content": "hi"}], _search_schemas(), _executor
+        [{"role": "user", "content": "hi"}], schemas, _executor
     )
 
     assert reply == "composed answer"
     assert completions.calls == 3
-    assert "tools" not in completions.kwargs_history[2]
-    compose_messages = completions.kwargs_history[2]["messages"]
-    assert all("tool_calls" not in m for m in compose_messages)
+    last_kwargs = completions.kwargs_history[2]
+    assert last_kwargs["tools"] == schemas
+    assert last_kwargs["tool_choice"] == "none"
+    compose_messages = last_kwargs["messages"]
+    assistant_with_calls = [
+        m
+        for m in compose_messages
+        if m.get("role") == "assistant" and m.get("tool_calls")
+    ]
+    assert assistant_with_calls, "compose history must keep original tool_calls"
     assert any(m.get("role") == "tool" for m in compose_messages)
 
 

@@ -455,38 +455,17 @@ class OpenAICompatibleProvider(LLMProvider):
         if last_content.strip():
             return last_content
         if has_tool_results:
-            # Groq (and other strict providers) reject a no-tools call whose
-            # history still carries assistant tool_calls: "Tool choice is
-            # none, but model called a tool". Rebuild a sanitized copy —
-            # assistant turns keep only text (tool evidence stays in the
-            # tool-role messages) — without mutating `history`.
-            compose_history: list[dict[str, Any]] = []
-            for msg in history:
-                if msg.get("role") == "assistant" and "tool_calls" in msg:
-                    text = msg.get("content") or ""
-                    if isinstance(text, str) and text.strip():
-                        compose_history.append(
-                            {"role": "assistant", "content": text}
-                        )
-                    else:
-                        names: list[str] = []
-                        for tc in msg.get("tool_calls") or []:
-                            _, name, _ = _parse_tool_call(tc)
-                            if name:
-                                names.append(name)
-                        summary = (
-                            f"Called {', '.join(names)}(...)"
-                            if names
-                            else "Called tools(...)"
-                        )
-                        compose_history.append(
-                            {"role": "assistant", "content": summary}
-                        )
-                else:
-                    compose_history.append(dict(msg))
+            # D4 follow-up: send the UNSANITIZED history WITH tools= PLUS
+            # tool_choice="none" — this forces the model to answer from the
+            # evidence instead of calling again, and keeps every
+            # tool_call_id paired with its call. Stripping assistant
+            # tool_calls orphans tool-role messages (Groq 400s with
+            # "Tools should have a name!").
             completion = await self._client.chat.completions.create(
                 model=self._model,
-                messages=compose_history,  # type: ignore[arg-type]
+                messages=history,  # type: ignore[arg-type]
+                tools=tool_schemas,  # type: ignore[arg-type]
+                tool_choice="none",  # type: ignore[arg-type]
             )
             message = _assistant_message(completion)
             content = message.get("content") or ""
