@@ -437,58 +437,80 @@ async def test_generate_with_tools_stops_sibling_calls_on_first_stop() -> None:
     assert completions.calls == 1
 
 
-async def test_generate_with_tools_exhausted_composes_final_answer() -> None:
-    """Search+fetch exhausts both rounds → final compose call answers from evidence.
+async def test_generate_with_tools_exhausted_returns_deterministic_digest() -> None:
+    """Two tool rounds then exhaustion → deterministic digest, zero extra calls.
 
-    The compose call sends the UNSANITIZED history WITH tools= AND
-    tool_choice="none": this forces the model to answer from the evidence
-    instead of calling again, and keeps every tool_call_id paired with its
-    call (stripping assistant tool_calls orphans tool-role messages and
-    Groq 400s with "Tools should have a name!").
+    No model compose round: the reply is built locally from the collected
+    tool outputs (capped cited list). The stub scripts exactly 2 responses,
+    so any third create() call fails loudly — asserting calls == 2 proves
+    zero further provider round-trips on this path.
+    """
+    import json
+
+    provider, completions = _tools_provider(
+        [
+            _tool_call_completion("web_search", {"query": "q"}),
+            _tool_call_completion("web_fetch", {"url": "https://example.com"}),
+        ]
+    )
+
+    async def _executor(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        if name == "web_search":
+            return {
+                "text": json.dumps(
+                    {
+                        "results": [
+                            {
+                                "title": "Example Title",
+                                "url": "https://example.com/",
+                                "snippet": "A snippet about q.",
+                            }
+                        ]
+                    }
+                ),
+                "stop": False,
+            }
+        return {
+            "text": json.dumps(
+                {
+                    "url": "https://example.com/",
+                    "title": "Example Title",
+                    "text": "Full page body text here.",
+                }
+            ),
+            "stop": False,
+        }
+
+    reply = await provider.generate_with_tools(
+        [{"role": "user", "content": "hi"}], _search_schemas(), _executor
+    )
+
+    assert completions.calls == 2
+    assert reply.startswith("Here's what I found:")
+    assert "Example Title" in reply
+    assert "https://example.com/" in reply
+
+
+async def test_generate_with_tools_exhausted_no_usable_items_keeps_fallback() -> None:
+    """Exhaustion with no usable items → existing fallback text preserved.
+
+    "No usable items" means precisely: zero parseable result items across
+    all collected tool texts, where parseable = a search-result dict with a
+    non-empty url (title/snippet) or a fetch dict with a non-empty url
+    (title/text). Non-empty but unparseable plain texts (e.g. "tool output")
+    and failure/empty strings do NOT count as usable — they still yield the
+    fallback below.
     """
     provider, completions = _tools_provider(
         [
             _tool_call_completion("web_search", {"query": "q"}),
             _tool_call_completion("web_fetch", {"url": "https://example.com"}),
-            _text_completion("composed answer"),
         ]
     )
+    texts = iter(["", "The search failed (boom), so I'll answer from what I know."])
 
     async def _executor(name: str, args: dict[str, Any]) -> dict[str, Any]:
-        return {"text": "tool output", "stop": False}
-
-    schemas = _search_schemas()
-    reply = await provider.generate_with_tools(
-        [{"role": "user", "content": "hi"}], schemas, _executor
-    )
-
-    assert reply == "composed answer"
-    assert completions.calls == 3
-    last_kwargs = completions.kwargs_history[2]
-    assert last_kwargs["tools"] == schemas
-    assert last_kwargs["tool_choice"] == "none"
-    compose_messages = last_kwargs["messages"]
-    assistant_with_calls = [
-        m
-        for m in compose_messages
-        if m.get("role") == "assistant" and m.get("tool_calls")
-    ]
-    assert assistant_with_calls, "compose history must keep original tool_calls"
-    assert any(m.get("role") == "tool" for m in compose_messages)
-
-
-async def test_generate_with_tools_exhausted_compose_empty_keeps_fallback() -> None:
-    """Persistent tool-calls + empty compose call → fallback text preserved."""
-    provider, completions = _tools_provider(
-        [
-            _tool_call_completion("web_search", {"query": "q"}),
-            _tool_call_completion("web_fetch", {"url": "https://example.com"}),
-            _text_completion("   "),
-        ]
-    )
-
-    async def _executor(name: str, args: dict[str, Any]) -> dict[str, Any]:
-        return {"text": "tool output", "stop": False}
+        return {"text": next(texts), "stop": False}
 
     reply = await provider.generate_with_tools(
         [{"role": "user", "content": "hi"}], _search_schemas(), _executor
@@ -498,7 +520,7 @@ async def test_generate_with_tools_exhausted_compose_empty_keeps_fallback() -> N
         "I looked that up but couldn't put together an answer. "
         "Please try again."
     )
-    assert completions.calls == 3
+    assert completions.calls == 2
 
 
 # --- D4 follow-up: nameless tool calls are dropped, missing ids synthesized ---

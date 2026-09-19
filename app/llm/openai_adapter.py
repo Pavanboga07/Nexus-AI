@@ -158,6 +158,91 @@ def _escape_retrieved(text: str) -> str:
     )
 
 
+#: Caps for the deterministic exhaustion digest (no model compose round).
+_DIGEST_MAX_ITEMS = 5
+_DIGEST_MAX_CHARS = 2000
+_DIGEST_SNIPPET_CHARS = 200
+
+
+def _parse_digest_items(texts: list[str]) -> list[tuple[str, str, str]]:
+    """Extract citable (title, url, snippet) items from tool result texts.
+
+    Understands the two shapes the chat executor produces
+    (``json.dumps(result.data)``): web_search ``{"results": [{title, url,
+    snippet}]}`` and web_fetch ``{"url", "title", "text"}``. Plain
+    non-JSON texts, failure strings, and empty strings yield no items.
+    An item is usable only with a non-empty url AND a non-empty
+    title/snippet (search) or title/text (fetch); url-only entries are
+    skipped as uninformative.
+    """
+    items: list[tuple[str, str, str]] = []
+    for text in texts:
+        if not text or not text.strip():
+            continue
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        results = data.get("results")
+        if isinstance(results, list):
+            for entry in results:
+                if not isinstance(entry, dict):
+                    continue
+                url = str(entry.get("url") or "").strip()
+                title = str(entry.get("title") or "").strip()
+                snippet = str(entry.get("snippet") or "").strip()
+                if not url or (not title and not snippet):
+                    continue
+                items.append(
+                    (
+                        title or url,
+                        url,
+                        snippet[:_DIGEST_SNIPPET_CHARS],
+                    )
+                )
+                if len(items) >= _DIGEST_MAX_ITEMS:
+                    return items
+        elif isinstance(data.get("url"), str) and str(data.get("url")).strip():
+            url = str(data.get("url")).strip()
+            title = str(data.get("title") or "").strip()
+            raw = str(data.get("text") or "").strip()
+            if not title and not raw:
+                continue
+            items.append(
+                (title or url, url, raw[:_DIGEST_SNIPPET_CHARS])
+            )
+            if len(items) >= _DIGEST_MAX_ITEMS:
+                return items
+    return items
+
+
+def _build_tool_digest(texts: list[str]) -> str | None:
+    """Render collected tool outputs as a cited list, or None if unusable.
+
+    "No usable items" = zero parseable result items (see
+    :func:`_parse_digest_items`); unparseable plain/failure texts do not
+    count. Returns None so the caller falls back to the existing
+    "I looked that up..." text. Capped at 5 items / 2000 chars total.
+    """
+    items = _parse_digest_items(texts)
+    if not items:
+        return None
+    lines = ["Here's what I found:"]
+    for index, (title, url, snippet) in enumerate(items[:_DIGEST_MAX_ITEMS], 1):
+        clean_title = " ".join(title.split())
+        clean_snippet = " ".join(snippet.split())
+        if clean_snippet:
+            lines.append(f"{index}. {clean_title} ({url}): {clean_snippet}")
+        else:
+            lines.append(f"{index}. {clean_title} ({url})")
+    digest = "\n".join(lines)
+    if len(digest) > _DIGEST_MAX_CHARS:
+        digest = digest[:_DIGEST_MAX_CHARS]
+    return digest
+
+
 class OpenAICompatibleProvider(LLMProvider):
     """Reasoning backend for any OpenAI-compatible chat-completions API."""
 
@@ -374,6 +459,7 @@ class OpenAICompatibleProvider(LLMProvider):
         history: list[dict[str, Any]] = [dict(m) for m in messages]
         last_content = ""
         has_tool_results = False
+        tool_texts: list[str] = []
         for _ in range(_MAX_TOOL_ROUNDS):
             completion = await self._client.chat.completions.create(
                 model=self._model,
@@ -430,6 +516,7 @@ class OpenAICompatibleProvider(LLMProvider):
             for call_id, name, args in valid_calls:
                 result = await executor(name, args)
                 text, stop = _normalize_executor_result(result)
+                tool_texts.append(text)
                 history.append(
                     {
                         "role": "tool",
@@ -455,26 +542,13 @@ class OpenAICompatibleProvider(LLMProvider):
         if last_content.strip():
             return last_content
         if has_tool_results:
-            # D4 follow-up: send the UNSANITIZED history WITH tools= PLUS
-            # tool_choice="none" — this forces the model to answer from the
-            # evidence instead of calling again, and keeps every
-            # tool_call_id paired with its call. Stripping assistant
-            # tool_calls orphans tool-role messages (Groq 400s with
-            # "Tools should have a name!").
-            completion = await self._client.chat.completions.create(
-                model=self._model,
-                messages=history,  # type: ignore[arg-type]
-                tools=tool_schemas,  # type: ignore[arg-type]
-                tool_choice="none",  # type: ignore[arg-type]
-            )
-            message = _assistant_message(completion)
-            content = message.get("content") or ""
-            if isinstance(content, str) and content.strip():
-                return content
-            try:
-                return self._extract_content(completion)
-            except Exception:  # noqa: BLE001 - empty/unusable → fallback below
-                pass
+            # No model compose round: any further provider call is
+            # unreliable here (no-tools call 400s on orphaned tool
+            # messages; tools+tool_choice:none 400s on tool_use_failed),
+            # so build the reply deterministically from collected outputs.
+            digest = _build_tool_digest(tool_texts)
+            if digest:
+                return digest
         return (
             "I looked that up but couldn't put together an answer. "
             "Please try again."
