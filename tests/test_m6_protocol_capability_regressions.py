@@ -372,3 +372,363 @@ def test_disabling_orchestration_does_not_remove_the_api() -> None:
     assert "workflows_router" in src
     assert "tasks_router" in src
     assert "orchestration_router" in src
+
+
+# ---------------------------------------------------------------------------
+# Phase D5: information.search capability contract
+# ---------------------------------------------------------------------------
+
+SEARCH_TEST_ENDPOINT = "http://127.0.0.1:9999/a2a/messages"
+
+
+class _StubSearchProvider:
+    """Stub for the shared search-provider path (no network in tests)."""
+
+    def __init__(self, results=None) -> None:
+        from app.search import SearchResult
+
+        self.calls: list[dict] = []
+        self._results = (
+            results
+            if results is not None
+            else [
+                SearchResult(
+                    title="Example",
+                    url="https://example.com",
+                    snippet="An example hit.",
+                ),
+                SearchResult(
+                    title="Second",
+                    url="https://example.com/2",
+                    snippet="Another hit.",
+                ),
+            ]
+        )
+
+    async def search(self, query: str, count: int = 5):
+        self.calls.append({"query": query, "count": count})
+        return list(self._results[:count])
+
+
+def _search_service(
+    db_session_factory, policy_service, memory_manager, receiver_identity, provider
+):
+    from app.a2a.rate_limit import SlidingWindowRateLimiter
+    from app.a2a.service import A2AService
+    from tests.test_a2a_service import LoopbackTransport
+
+    return A2AService(
+        session_factory=db_session_factory,
+        identity_service=receiver_identity,
+        policy_service=policy_service,
+        memory_manager=memory_manager,
+        transport=LoopbackTransport(),
+        rate_limiter=SlidingWindowRateLimiter(60),
+        allow_local_endpoints=True,
+        search_provider=provider,
+    )
+
+
+async def _signed_search_request(
+    sender,
+    recipient_agent_id: str,
+    *,
+    capability_id: str | None = "information.search",
+    capability_version: str = "1.0",
+    payload_extra: dict | None = None,
+):
+    from app.a2a import signing
+    from app.a2a.schemas import (
+        A2AEnvelope,
+        new_message_id,
+        new_task_id,
+        utc_iso_in,
+        utc_now_iso,
+    )
+
+    payload = {
+        "action": "disclose_information",
+        "data_category": "public-web",
+        "query": "latest nexus release",
+        "count": 2,
+    }
+    if payload_extra:
+        payload.update(payload_extra)
+    kwargs: dict = {}
+    if capability_id is not None:
+        kwargs["capability"] = {"id": capability_id, "version": capability_version}
+    envelope = A2AEnvelope(
+        message_id=new_message_id(),
+        task_id=new_task_id(),
+        sender=sender.agent_id,
+        recipient=recipient_agent_id,
+        timestamp=utc_now_iso(),
+        expires_at=utc_iso_in(60),
+        message_type="request",
+        purpose="research",
+        payload=payload,
+        **kwargs,
+    )
+    return await signing.sign_envelope(sender, envelope)
+
+
+async def _allow_search(policy_service, owner_id, requester_agent_id: str) -> None:
+    await policy_service.create_policy(
+        owner_id,
+        requester_agent_id=requester_agent_id,
+        data_category="public-web",
+        action="disclose_information",
+        purpose="research",
+        decision="ALLOW",
+        disclosure_scope="summary",
+    )
+
+
+def test_information_search_is_declared_with_schemas() -> None:
+    """The agent advertises information.search v1.0 with input/output contracts."""
+    from unittest.mock import MagicMock
+
+    from app.a2a.service import A2AService
+
+    service = A2AService(
+        session_factory=MagicMock(),
+        identity_service=MagicMock(),
+        policy_service=MagicMock(),
+        memory_manager=None,
+        transport=MagicMock(),
+        rate_limiter=MagicMock(),
+        search_provider=_StubSearchProvider(),
+    )
+    spec = service.capabilities.get("information.search")
+    assert spec is not None
+    assert spec.version == "1.0"
+    assert spec.data_category == "public-web"
+    assert spec.input_schema["properties"]["query"]["maxLength"] == 500
+    assert spec.input_schema["properties"]["count"]["maximum"] == 10
+    assert "results" in spec.output_schema["properties"]
+
+
+@pytest.mark.asyncio
+async def test_information_search_envelope_executes(
+    db_session_factory, db_owner_id, policy_service, memory_manager
+) -> None:
+    """A 0.2 envelope naming information.search validates and executes."""
+    from tests.test_a2a_service import StubIdentity
+
+    sender = StubIdentity()
+    receiver = StubIdentity()
+    provider = _StubSearchProvider()
+    service = _search_service(
+        db_session_factory, policy_service, memory_manager, receiver, provider
+    )
+    await service.register_trusted_agent(
+        db_owner_id,
+        agent_id=sender.agent_id,
+        public_key=sender.public_key_b64,
+        display_name="Searcher",
+        endpoint=SEARCH_TEST_ENDPOINT,
+    )
+    await _allow_search(policy_service, db_owner_id, sender.agent_id)
+    await memory_manager.store_memory(
+        db_owner_id, memory_type="semantic", content="a private memory that must not leak"
+    )
+
+    envelope = await _signed_search_request(sender, receiver.agent_id)
+    response = await service.handle_inbound(db_owner_id, envelope)
+
+    assert response.payload["status"] == "completed"
+    assert response.payload["results"] == [
+        {"title": "Example", "url": "https://example.com", "snippet": "An example hit."},
+        {"title": "Second", "url": "https://example.com/2", "snippet": "Another hit."},
+    ]
+    assert provider.calls == [{"query": "latest nexus release", "count": 2}]
+    # Results only: never memory.
+    assert "private memory" not in str(response.payload)
+    assert "memories" not in response.payload
+
+
+@pytest.mark.asyncio
+async def test_unknown_capability_is_refused_precisely(
+    db_session_factory, db_owner_id, policy_service, memory_manager
+) -> None:
+    """Naming a capability the agent does not offer is UNSUPPORTED_CAPABILITY."""
+    from tests.test_a2a_service import StubIdentity
+
+    sender = StubIdentity()
+    receiver = StubIdentity()
+    service = _search_service(
+        db_session_factory,
+        policy_service,
+        memory_manager,
+        receiver,
+        _StubSearchProvider(),
+    )
+    await service.register_trusted_agent(
+        db_owner_id,
+        agent_id=sender.agent_id,
+        public_key=sender.public_key_b64,
+        display_name="Searcher",
+        endpoint=SEARCH_TEST_ENDPOINT,
+    )
+
+    envelope = await _signed_search_request(
+        sender, receiver.agent_id, capability_id="nosuch.thing"
+    )
+    with pytest.raises(A2AError) as excinfo:
+        await service.handle_inbound(db_owner_id, envelope)
+    assert excinfo.value.code is A2AErrorCode.UNSUPPORTED_CAPABILITY
+
+
+@pytest.mark.asyncio
+async def test_search_major_version_mismatch_is_refused(
+    db_session_factory, db_owner_id, policy_service, memory_manager
+) -> None:
+    """information.search is offered at 1.0: a 2.0 request is refused."""
+    from tests.test_a2a_service import StubIdentity
+
+    sender = StubIdentity()
+    receiver = StubIdentity()
+    provider = _StubSearchProvider()
+    service = _search_service(
+        db_session_factory, policy_service, memory_manager, receiver, provider
+    )
+    await service.register_trusted_agent(
+        db_owner_id,
+        agent_id=sender.agent_id,
+        public_key=sender.public_key_b64,
+        display_name="Searcher",
+        endpoint=SEARCH_TEST_ENDPOINT,
+    )
+    await _allow_search(policy_service, db_owner_id, sender.agent_id)
+
+    envelope = await _signed_search_request(
+        sender, receiver.agent_id, capability_version="2.0"
+    )
+    with pytest.raises(A2AError) as excinfo:
+        await service.handle_inbound(db_owner_id, envelope)
+    assert excinfo.value.code is A2AErrorCode.UNSUPPORTED_CAPABILITY
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_search_minor_version_is_compatible(
+    db_session_factory, db_owner_id, policy_service, memory_manager
+) -> None:
+    """A 1.x request is served by the 1.0 contract (additive minor bumps)."""
+    from tests.test_a2a_service import StubIdentity
+
+    sender = StubIdentity()
+    receiver = StubIdentity()
+    service = _search_service(
+        db_session_factory,
+        policy_service,
+        memory_manager,
+        receiver,
+        _StubSearchProvider(),
+    )
+    await service.register_trusted_agent(
+        db_owner_id,
+        agent_id=sender.agent_id,
+        public_key=sender.public_key_b64,
+        display_name="Searcher",
+        endpoint=SEARCH_TEST_ENDPOINT,
+    )
+    await _allow_search(policy_service, db_owner_id, sender.agent_id)
+
+    envelope = await _signed_search_request(
+        sender, receiver.agent_id, capability_version="1.4"
+    )
+    response = await service.handle_inbound(db_owner_id, envelope)
+    assert response.payload["status"] == "completed"
+    assert len(response.payload["results"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_search_without_query_is_rejected(
+    db_session_factory, db_owner_id, policy_service, memory_manager
+) -> None:
+    """The contract requires a query: omitting it is INVALID_ENVELOPE."""
+    from tests.test_a2a_service import StubIdentity
+
+    from app.a2a import signing
+    from app.a2a.schemas import (
+        A2AEnvelope,
+        new_message_id,
+        new_task_id,
+        utc_iso_in,
+        utc_now_iso,
+    )
+
+    sender = StubIdentity()
+    receiver = StubIdentity()
+    provider = _StubSearchProvider()
+    service = _search_service(
+        db_session_factory, policy_service, memory_manager, receiver, provider
+    )
+    await service.register_trusted_agent(
+        db_owner_id,
+        agent_id=sender.agent_id,
+        public_key=sender.public_key_b64,
+        display_name="Searcher",
+        endpoint=SEARCH_TEST_ENDPOINT,
+    )
+    await _allow_search(policy_service, db_owner_id, sender.agent_id)
+
+    envelope = A2AEnvelope(
+        message_id=new_message_id(),
+        task_id=new_task_id(),
+        sender=sender.agent_id,
+        recipient=receiver.agent_id,
+        timestamp=utc_now_iso(),
+        expires_at=utc_iso_in(60),
+        message_type="request",
+        purpose="research",
+        payload={
+            "action": "disclose_information",
+            "data_category": "public-web",
+            "count": 2,
+        },
+        capability={"id": "information.search", "version": "1.0"},
+    )
+    signed = await signing.sign_envelope(sender, envelope)
+    with pytest.raises(A2AError) as excinfo:
+        await service.handle_inbound(db_owner_id, signed)
+    assert excinfo.value.code is A2AErrorCode.INVALID_ENVELOPE
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_search_policy_deny_never_touches_provider(
+    db_session_factory, db_owner_id, policy_service, memory_manager
+) -> None:
+    """Policy gates the provider: DENY returns rejected without searching."""
+    from tests.test_a2a_service import StubIdentity
+
+    sender = StubIdentity()
+    receiver = StubIdentity()
+    provider = _StubSearchProvider()
+    service = _search_service(
+        db_session_factory, policy_service, memory_manager, receiver, provider
+    )
+    await service.register_trusted_agent(
+        db_owner_id,
+        agent_id=sender.agent_id,
+        public_key=sender.public_key_b64,
+        display_name="Searcher",
+        endpoint=SEARCH_TEST_ENDPOINT,
+    )
+    await policy_service.create_policy(
+        db_owner_id,
+        requester_agent_id=sender.agent_id,
+        data_category="public-web",
+        action="disclose_information",
+        purpose="research",
+        decision="DENY",
+        priority=10,
+    )
+
+    envelope = await _signed_search_request(sender, receiver.agent_id)
+    response = await service.handle_inbound(db_owner_id, envelope)
+
+    assert response.payload["status"] == "rejected"
+    assert provider.calls == []

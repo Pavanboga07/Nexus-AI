@@ -1129,7 +1129,15 @@ def test_shared_types_agree_with_the_backend_schema() -> None:
 #: Registry ids that deliberately have no delegate task_type. Kept explicit
 #: and empty: every entry is a decision that a human made, not a place to
 #: silence the check.
-_INTENTIONALLY_UNMAPPED_CAPABILITIES: frozenset[str] = frozenset()
+_INTENTIONALLY_UNMAPPED_CAPABILITIES: frozenset[str] = frozenset(
+    {
+        # Phase D5: information.search is served on the 0.2 request path
+        # (policy -> provider -> results), not via task delegation, and no
+        # task handler implements web search. Mapping it to information_request
+        # would invoke the wrong handler, so the pickers leave it unmapped.
+        "information.search",
+    }
+)
 
 
 def _frontend_capability_task_types() -> dict[str, str]:

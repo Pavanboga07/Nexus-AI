@@ -99,6 +99,7 @@ class A2AService:
         rate_limiter: RateLimiter,
         tool_service: Any = None,
         task_registry: TaskHandlerRegistry | None = None,
+        search_provider: Any = None,
         max_negotiation_rounds: int = 3,
         task_ttl_seconds: float = 3600.0,
         max_message_bytes: int = 65_536,
@@ -113,6 +114,7 @@ class A2AService:
         self._transport = transport
         self._rate_limiter = rate_limiter
         self._tool_service = tool_service
+        self._search_provider = search_provider
         self._task_registry = task_registry or create_default_task_registry()
         self._max_negotiation_rounds = max_negotiation_rounds
         self._task_ttl = task_ttl_seconds
@@ -210,6 +212,36 @@ class A2AService:
                     "additionalProperties": True,
                 },
                 output_schema={"type": "object"},
+            ),
+            _Spec(
+                id="information.search",
+                version="1.0",
+                description="Search the public web for current or external information.",
+                data_category="public-web",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 500,
+                        },
+                        "count": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 10,
+                        },
+                    },
+                    "required": ["query"],
+                    "additionalProperties": True,
+                },
+                output_schema={
+                    "type": "object",
+                    "properties": {
+                        "results": {"type": "array"},
+                    },
+                    "additionalProperties": True,
+                },
             ),
         ]
         for spec in defaults:
@@ -633,6 +665,9 @@ class A2AService:
                 {"status": "approval_required"},
             )
 
+        if envelope.capability is not None and envelope.capability.id == "information.search":
+            return await self._handle_information_search(owner_id, envelope)
+
         memories: list[str] = []
         if self._memory is not None:
             found = await self._memory.get_relevant_memories(
@@ -657,6 +692,52 @@ class A2AService:
         )
         return await self._sign_response(
             envelope, disclosure.task_status, disclosure.to_payload()
+        )
+
+    async def _handle_information_search(
+        self, owner_id: uuid.UUID, envelope: A2AEnvelope
+    ) -> A2AEnvelope:
+        """Execute the ``information.search`` capability via the shared provider.
+
+        Runs only after policy ALLOW, so the provider is never touched on
+        DENY/ASK. The response carries results only, never memory.
+        """
+        from app.search import SearchError, get_provider
+
+        payload = envelope.payload or {}
+        query = payload.get("query", "")
+        count = payload.get("count", 5)
+        provider = (
+            self._search_provider
+            if self._search_provider is not None
+            else get_provider()
+        )
+        try:
+            results = await provider.search(query, count)
+        except SearchError as exc:
+            await self._finalize(owner_id, envelope, "failed", "ALLOW", None)
+            return await self._sign_response(
+                envelope,
+                TaskStatus.FAILED,
+                {"status": "failed", "reason": str(exc) or "search_failed"},
+            )
+        await self._finalize(owner_id, envelope, "accepted", "ALLOW", None)
+        logger.info(
+            "a2a_search_completed sender=%s task=%s hits=%d",
+            envelope.sender,
+            envelope.task_id,
+            len(results),
+        )
+        return await self._sign_response(
+            envelope,
+            TaskStatus.COMPLETED,
+            {
+                "status": "completed",
+                "results": [
+                    {"title": r.title, "url": r.url, "snippet": r.snippet}
+                    for r in results
+                ],
+            },
         )
 
     async def handle_gateway_delivery(
