@@ -388,3 +388,50 @@ async def test_generate_with_tools_stops_on_approval() -> None:
 
     assert reply == "That needs your approval"
     assert completions.calls == 1
+
+
+async def test_generate_with_tools_stops_sibling_calls_on_first_stop() -> None:
+    import json
+
+    provider, completions = _tools_provider(
+        [
+            _ToolCompletion(
+                choices=[
+                    _ToolChoice(
+                        _ToolMsg(
+                            content=None,
+                            tool_calls=[
+                                _ToolCall(
+                                    id="call_1",
+                                    function=_Func(
+                                        name="web_search",
+                                        arguments=json.dumps({"query": "q"}),
+                                    ),
+                                ),
+                                _ToolCall(
+                                    id="call_2",
+                                    function=_Func(
+                                        name="web_search",
+                                        arguments=json.dumps({"query": "q2"}),
+                                    ),
+                                ),
+                            ],
+                        )
+                    )
+                ]
+            )
+        ]
+    )
+    seen: list[tuple[str, dict[str, Any]]] = []
+
+    async def _executor(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        seen.append((name, args))
+        return {"text": "That needs your approval", "stop": True}
+
+    reply = await provider.generate_with_tools(
+        [{"role": "user", "content": "hi"}], _search_schemas(), _executor
+    )
+
+    assert reply == "That needs your approval"
+    assert len(seen) == 1
+    assert completions.calls == 1

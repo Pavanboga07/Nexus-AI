@@ -394,8 +394,9 @@ class OpenAICompatibleProvider(LLMProvider):
                         "content": text,
                     }
                 )
-                if stop and stop_text is None:
+                if stop:
                     stop_text = text or _APPROVAL_FALLBACK
+                    break
             if stop_text is not None:
                 return stop_text
         if last_content.strip():
