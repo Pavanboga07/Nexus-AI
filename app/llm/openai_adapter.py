@@ -365,6 +365,7 @@ class OpenAICompatibleProvider(LLMProvider):
         """
         history: list[dict[str, Any]] = [dict(m) for m in messages]
         last_content = ""
+        has_tool_results = False
         for _ in range(_MAX_TOOL_ROUNDS):
             completion = await self._client.chat.completions.create(
                 model=self._model,
@@ -413,10 +414,24 @@ class OpenAICompatibleProvider(LLMProvider):
                 if stop:
                     stop_text = text or _APPROVAL_FALLBACK
                     break
+            has_tool_results = True
             if stop_text is not None:
                 return stop_text
         if last_content.strip():
             return last_content
+        if has_tool_results:
+            completion = await self._client.chat.completions.create(
+                model=self._model,
+                messages=history,  # type: ignore[arg-type]
+            )
+            message = _assistant_message(completion)
+            content = message.get("content") or ""
+            if isinstance(content, str) and content.strip():
+                return content
+            try:
+                return self._extract_content(completion)
+            except Exception:  # noqa: BLE001 - empty/unusable → fallback below
+                pass
         return (
             "I looked that up but couldn't put together an answer. "
             "Please try again."

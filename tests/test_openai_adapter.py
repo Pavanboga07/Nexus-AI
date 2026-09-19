@@ -435,3 +435,49 @@ async def test_generate_with_tools_stops_sibling_calls_on_first_stop() -> None:
     assert reply == "That needs your approval"
     assert len(seen) == 1
     assert completions.calls == 1
+
+
+async def test_generate_with_tools_exhausted_composes_final_answer() -> None:
+    """Search+fetch exhausts both rounds → one final compose call (no tools)."""
+    provider, completions = _tools_provider(
+        [
+            _tool_call_completion("web_search", {"query": "q"}),
+            _tool_call_completion("web_fetch", {"url": "https://example.com"}),
+            _text_completion("composed answer"),
+        ]
+    )
+
+    async def _executor(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        return {"text": "tool output", "stop": False}
+
+    reply = await provider.generate_with_tools(
+        [{"role": "user", "content": "hi"}], _search_schemas(), _executor
+    )
+
+    assert reply == "composed answer"
+    assert completions.calls == 3
+    assert "tools" not in completions.kwargs_history[2]
+
+
+async def test_generate_with_tools_exhausted_compose_empty_keeps_fallback() -> None:
+    """Persistent tool-calls + empty compose call → fallback text preserved."""
+    provider, completions = _tools_provider(
+        [
+            _tool_call_completion("web_search", {"query": "q"}),
+            _tool_call_completion("web_fetch", {"url": "https://example.com"}),
+            _text_completion("   "),
+        ]
+    )
+
+    async def _executor(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        return {"text": "tool output", "stop": False}
+
+    reply = await provider.generate_with_tools(
+        [{"role": "user", "content": "hi"}], _search_schemas(), _executor
+    )
+
+    assert reply == (
+        "I looked that up but couldn't put together an answer. "
+        "Please try again."
+    )
+    assert completions.calls == 3
