@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 from urllib.parse import urlsplit
@@ -121,9 +122,16 @@ def _parse_tool_call(tc: Any) -> tuple[str, str, dict[str, Any]]:
     return call_id, name, parsed
 
 
+def _new_call_id() -> str:
+    """Synthesize a tool-call id (mirrors ``req_<hex>`` shape in tools/service)."""
+    return f"call_{uuid.uuid4().hex[:16]}"
+
+
 def _tool_call_payload(tc: Any) -> dict[str, Any]:
     """Serialize one tool call back into the OpenAI request shape."""
     call_id, name, args = _parse_tool_call(tc)
+    if name and not call_id:
+        call_id = _new_call_id()
     return {
         "id": call_id,
         "type": "function",
@@ -375,7 +383,27 @@ class OpenAICompatibleProvider(LLMProvider):
             message = _assistant_message(completion)
             content = message.get("content") or ""
             tool_calls = message.get("tool_calls") or []
-            if not tool_calls:
+            # D4 follow-up: some providers (observed: Groq) emit tool calls
+            # with an EMPTY function name. Those cannot execute and must not
+            # be echoed back verbatim (Groq 400 "Tools should have a name!").
+            valid_calls: list[tuple[str, str, dict[str, Any]]] = []
+            for tc in tool_calls:
+                call_id, name, args = _parse_tool_call(tc)
+                if not name:
+                    logger.warning(
+                        "llm_tool_call_dropped provider=%s reason=empty_name",
+                        self.name,
+                    )
+                    continue
+                if not call_id:
+                    call_id = _new_call_id()
+                    logger.debug(
+                        "llm_tool_call_id_synthesized provider=%s name=%s",
+                        self.name,
+                        name,
+                    )
+                valid_calls.append((call_id, name, args))
+            if not valid_calls:
                 if isinstance(content, str) and content.strip():
                     return content
                 return self._extract_content(completion)
@@ -386,13 +414,20 @@ class OpenAICompatibleProvider(LLMProvider):
                     "role": "assistant",
                     "content": content or None,
                     "tool_calls": [
-                        _tool_call_payload(tc) for tc in tool_calls
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": json.dumps(args),
+                            },
+                        }
+                        for call_id, name, args in valid_calls
                     ],
                 }
             )
             stop_text: str | None = None
-            for tc in tool_calls:
-                call_id, name, args = _parse_tool_call(tc)
+            for call_id, name, args in valid_calls:
                 result = await executor(name, args)
                 text, stop = _normalize_executor_result(result)
                 history.append(

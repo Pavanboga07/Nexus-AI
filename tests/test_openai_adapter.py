@@ -484,3 +484,147 @@ async def test_generate_with_tools_exhausted_compose_empty_keeps_fallback() -> N
         "Please try again."
     )
     assert completions.calls == 3
+
+
+# --- D4 follow-up: nameless tool calls are dropped, missing ids synthesized ---
+
+
+async def test_nameless_tool_call_is_dropped_and_valid_executes() -> None:
+    """One nameless + one valid call → only the valid executes, echo is clean."""
+    import json
+
+    provider, completions = _tools_provider(
+        [
+            _ToolCompletion(
+                choices=[
+                    _ToolChoice(
+                        _ToolMsg(
+                            content=None,
+                            tool_calls=[
+                                _ToolCall(
+                                    id="call_bad",
+                                    function=_Func(
+                                        name="",
+                                        arguments=json.dumps({"query": "junk"}),
+                                    ),
+                                ),
+                                _ToolCall(
+                                    id="call_1",
+                                    function=_Func(
+                                        name="web_search",
+                                        arguments=json.dumps({"query": "q"}),
+                                    ),
+                                ),
+                            ],
+                        )
+                    )
+                ]
+            ),
+            _text_completion("final answer"),
+        ]
+    )
+    seen: list[tuple[str, dict[str, Any]]] = []
+
+    async def _executor(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        seen.append((name, args))
+        return {"text": "tool output", "stop": False}
+
+    reply = await provider.generate_with_tools(
+        [{"role": "user", "content": "hi"}], _search_schemas(), _executor
+    )
+
+    assert reply == "final answer"
+    assert seen == [("web_search", {"query": "q"})]
+    assert completions.calls == 2
+    echo_messages = completions.kwargs_history[1]["messages"]
+    assistant_echo = next(m for m in echo_messages if m.get("role") == "assistant")
+    echoed = assistant_echo.get("tool_calls") or []
+    assert len(echoed) == 1
+    assert all((tc.get("function") or {}).get("name") for tc in echoed)
+    assert echoed[0]["function"]["name"] == "web_search"
+
+
+async def test_all_nameless_tool_calls_with_content_returns_content() -> None:
+    """All calls nameless + non-empty content → content, no second round."""
+    import json
+
+    provider, completions = _tools_provider(
+        [
+            _ToolCompletion(
+                choices=[
+                    _ToolChoice(
+                        _ToolMsg(
+                            content="hello text",
+                            tool_calls=[
+                                _ToolCall(
+                                    id="call_bad",
+                                    function=_Func(
+                                        name="",
+                                        arguments=json.dumps({"query": "junk"}),
+                                    ),
+                                ),
+                            ],
+                        )
+                    )
+                ]
+            ),
+        ]
+    )
+
+    async def _executor(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        raise AssertionError("executor must not run for nameless-only calls")
+
+    reply = await provider.generate_with_tools(
+        [{"role": "user", "content": "hi"}], _search_schemas(), _executor
+    )
+
+    assert reply == "hello text"
+    assert completions.calls == 1
+
+
+async def test_named_call_with_empty_id_gets_synthesized_id_in_echo() -> None:
+    """Named call with an empty id → echoed history carries a non-empty id."""
+    import json
+
+    provider, completions = _tools_provider(
+        [
+            _ToolCompletion(
+                choices=[
+                    _ToolChoice(
+                        _ToolMsg(
+                            content=None,
+                            tool_calls=[
+                                _ToolCall(
+                                    id="",
+                                    function=_Func(
+                                        name="web_search",
+                                        arguments=json.dumps({"query": "q"}),
+                                    ),
+                                ),
+                            ],
+                        )
+                    )
+                ]
+            ),
+            _text_completion("final answer"),
+        ]
+    )
+
+    async def _executor(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        return {"text": "tool output", "stop": False}
+
+    reply = await provider.generate_with_tools(
+        [{"role": "user", "content": "hi"}], _search_schemas(), _executor
+    )
+
+    assert reply == "final answer"
+    assert completions.calls == 2
+    echo_messages = completions.kwargs_history[1]["messages"]
+    assistant_echo = next(m for m in echo_messages if m.get("role") == "assistant")
+    echoed = assistant_echo.get("tool_calls") or []
+    assert len(echoed) == 1
+    assert echoed[0].get("id"), "echoed tool call must carry a synthesized id"
+    tool_msgs = [m for m in echo_messages if m.get("role") == "tool"]
+    assert tool_msgs, "tool result must be echoed into history"
+    assert tool_msgs[0].get("tool_call_id"), "tool result must carry the id"
+    assert tool_msgs[0]["tool_call_id"] == echoed[0]["id"]
