@@ -457,6 +457,9 @@ async def test_generate_with_tools_exhausted_composes_final_answer() -> None:
     assert reply == "composed answer"
     assert completions.calls == 3
     assert "tools" not in completions.kwargs_history[2]
+    compose_messages = completions.kwargs_history[2]["messages"]
+    assert all("tool_calls" not in m for m in compose_messages)
+    assert any(m.get("role") == "tool" for m in compose_messages)
 
 
 async def test_generate_with_tools_exhausted_compose_empty_keeps_fallback() -> None:
