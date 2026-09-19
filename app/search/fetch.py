@@ -2,7 +2,8 @@
 
 ``fetch_url`` validates the URL with ``validate_endpoint`` FIRST (SSRF
 protection reused verbatim from ``app.a2a.transport``), then reads through
-a module-level pooled ``httpx.AsyncClient`` (follows redirects, max 3,
+a module-level pooled ``httpx.AsyncClient`` (redirects NOT followed
+automatically — each hop is resolved and re-validated manually, max 3,
 timeout 10s) with a streaming read capped at 8 KB. Boilerplate
 (``script``/``style``/``nav``) is stripped with stdlib ``html.parser`` only.
 """
@@ -12,6 +13,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
+from urllib.parse import urljoin
 
 import httpx
 
@@ -22,10 +24,17 @@ from app.search import SearchError
 MAX_BYTES = 8 * 1024
 
 _client = httpx.AsyncClient(
-    follow_redirects=True,
-    max_redirects=3,
+    follow_redirects=False,
     timeout=10.0,
 )
+
+_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+_MAX_REDIRECTS = 3
+
+
+async def aclose_fetcher() -> None:
+    """Close the module-level pooled fetch client."""
+    await _client.aclose()
 
 _WHITESPACE = re.compile(r"\s+")
 _SKIP_TAGS = {"script", "style", "nav"}
@@ -88,47 +97,63 @@ class _TextParser(HTMLParser):
 
 async def fetch_url(url: str, *, allow_local: bool = False) -> FetchedPage:
     """Fetch a page: SSRF-validated, redirect-bounded, size-capped, stripped."""
-    try:
-        validate_endpoint(url, allow_local=allow_local)
-    except A2AError as exc:
-        raise FetchError(f"Blocked URL {url!r}: {exc}") from exc
+    current_url = url
+    redirects_followed = 0
+    while True:
+        try:
+            validate_endpoint(current_url, allow_local=allow_local)
+        except A2AError as exc:
+            raise FetchError(f"Blocked URL {current_url!r}: {exc}") from exc
 
-    try:
-        async with _client.stream(
-            "GET",
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-        ) as response:
-            if response.status_code >= 400:
-                raise FetchError(
-                    f"Fetch failed with HTTP {response.status_code} for {url!r}."
-                )
-            # Content-Length pre-check: refuse the body up front when the
-            # response declares more than the cap (saves bandwidth/time
-            # on huge pages). Malformed/missing header falls through to
-            # the streaming cap below.
-            try:
-                declared = response.headers.get("content-length")
-                if declared is not None and int(declared) > MAX_BYTES:
-                    return FetchedPage(url=str(response.url), title="", text="")
-            except (TypeError, ValueError):
-                pass
-            raw = bytearray()
-            async for chunk in response.aiter_bytes():
-                remaining = MAX_BYTES - len(raw)
-                if remaining <= 0:
-                    break
-                raw += chunk[:remaining]
-                if len(raw) >= MAX_BYTES:
-                    break
-            final_url = str(response.url)
-    except httpx.HTTPError as exc:
-        raise FetchError(f"Fetch failed for {url!r} ({type(exc).__name__}).") from exc
+        try:
+            async with _client.stream(
+                "GET",
+                current_url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            ) as response:
+                if response.status_code in _REDIRECT_STATUSES:
+                    location = response.headers.get("location")
+                    if not location:
+                        raise FetchError(
+                            f"Fetch failed with HTTP {response.status_code} "
+                            f"for {current_url!r}."
+                        )
+                    redirects_followed += 1
+                    if redirects_followed > _MAX_REDIRECTS:
+                        raise FetchError(
+                            f"Fetch failed for {url!r} (TooManyRedirects)."
+                        )
+                    current_url = urljoin(current_url, location)
+                    continue
+                if response.status_code >= 400:
+                    raise FetchError(
+                        f"Fetch failed with HTTP {response.status_code} for {current_url!r}."
+                    )
+                # Content-Length pre-check: refuse the body up front when the
+                # response declares more than the cap (saves bandwidth/time
+                # on huge pages). Malformed/missing header falls through to
+                # the streaming cap below.
+                try:
+                    declared = response.headers.get("content-length")
+                    if declared is not None and int(declared) > MAX_BYTES:
+                        return FetchedPage(url=str(response.url), title="", text="")
+                except (TypeError, ValueError):
+                    pass
+                raw = bytearray()
+                async for chunk in response.aiter_bytes():
+                    remaining = MAX_BYTES - len(raw)
+                    if remaining <= 0:
+                        break
+                    raw += chunk[:remaining]
+                    if len(raw) >= MAX_BYTES:
+                        break
+                final_url = str(response.url)
+                parser = _TextParser()
+                parser.feed(raw.decode("utf-8", errors="replace"))
+                parser.close()
+                return FetchedPage(url=final_url, title=parser.title, text=parser.text)
+        except httpx.HTTPError as exc:
+            raise FetchError(f"Fetch failed for {url!r} ({type(exc).__name__}).") from exc
 
-    parser = _TextParser()
-    parser.feed(raw.decode("utf-8", errors="replace"))
-    parser.close()
-    return FetchedPage(url=final_url, title=parser.title, text=parser.text)
 
-
-__all__ = ["FetchError", "FetchedPage", "MAX_BYTES", "fetch_url"]
+__all__ = ["FetchError", "FetchedPage", "MAX_BYTES", "aclose_fetcher", "fetch_url"]

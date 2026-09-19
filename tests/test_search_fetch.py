@@ -47,14 +47,20 @@ class _FetchHandler(BaseHTTPRequestHandler):
     redirects: dict[str, str] = {}
     hits: list[str] = []
     precheck_writes: list[int] = []
+    precheck_done: threading.Event | None = None
 
     def do_GET(self) -> None:
         type(self).hits.append(self.path)
         if self.path == "/precheck":
             # Lying header: declares 100 KB but the real body is small and
-            # delayed. With the pre-check the client returns after headers
-            # and closes, so the delayed write fails (zero bytes
-            # delivered). Without it the client waits and reads the marker.
+            # delayed. With the pre-check the client returns right after
+            # headers without waiting for (or reading) the body; without it
+            # the client blocks on the delay and reads the marker below.
+            # NOTE: the delayed single write itself still lands in the
+            # socket even when the client already went away (verified
+            # empirically), so the test must discriminate on
+            # client-observable behavior (content + timing), NOT on
+            # whether the server-side write succeeded.
             body = (
                 b"<html><head><title>Precheck</title></head>"
                 b"<body><p>SHOULD_NOT_BE_READ</p></body></html>"
@@ -69,6 +75,10 @@ class _FetchHandler(BaseHTTPRequestHandler):
                 type(self).precheck_writes.append(len(body))
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            finally:
+                done = type(self).precheck_done
+                if done is not None:
+                    done.set()
             return
         if self.path in type(self).redirects:
             target = type(self).redirects[self.path]
@@ -117,6 +127,7 @@ def fetch_server():
     }
     _FetchHandler.hits = []
     _FetchHandler.precheck_writes = []
+    _FetchHandler.precheck_done = threading.Event()
     server = ThreadingHTTPServer(("127.0.0.1", 0), _FetchHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -126,6 +137,7 @@ def fetch_server():
     _FetchHandler.redirects = {}
     _FetchHandler.hits = []
     _FetchHandler.precheck_writes = []
+    _FetchHandler.precheck_done = None
 
 
 def _base_url(server: ThreadingHTTPServer) -> str:
@@ -185,12 +197,20 @@ async def test_short_redirect_chain_is_followed(fetch_server) -> None:
 
 
 async def test_content_length_precheck_skips_body_download(fetch_server) -> None:
-    # Same zero-hits pattern as the SSRF test, but for the body: the server
-    # counts delivered body bytes; the pre-check closes after headers, so
-    # the delayed body write fails and zero bytes are delivered.
+    # The server declares 100 KB yet sends a small body after a 0.5s delay.
+    # With the pre-check the client returns after headers without waiting
+    # for (or reading) the body; without it the client blocks ~0.5s and
+    # reads the marker — so content + timing genuinely fail on unfixed code.
     _FetchHandler.precheck_writes = []
+    started = time.monotonic()
     page = await fetch_url(f"{_base_url(fetch_server)}/precheck", allow_local=True)
+    elapsed = time.monotonic() - started
 
     assert page.text == ""
     assert "SHOULD_NOT_BE_READ" not in page.text
-    assert _FetchHandler.precheck_writes == []
+    # Returned without waiting for the delayed body (server sleeps 0.5s).
+    assert elapsed < 0.45
+    # Join the server past its write window so the assertions above are
+    # ordered against the delayed body instead of racing ahead of it.
+    assert _FetchHandler.precheck_done is not None
+    assert _FetchHandler.precheck_done.wait(timeout=5)

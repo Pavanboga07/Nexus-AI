@@ -89,6 +89,7 @@ from app.policy.service import PolicyService
 from app.tools.builtin import BUILTIN_TOOLS
 from app.tools.registry import ToolRegistry
 from app.tools.service import ToolService
+from app.search.fetch import aclose_fetcher
 
 #: Maps a framework HTTP status onto the shared error-code vocabulary, so a
 #: route's `raise HTTPException(404)` produces the same envelope (and the same
@@ -600,6 +601,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await app.state.agent.aclose()
         if app.state.engine is not None:
             await app.state.engine.dispose()
+        await aclose_fetcher()
         logger.info("nexus_stopped")
 
 
