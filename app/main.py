@@ -143,7 +143,11 @@ def configure_logging(settings: Settings) -> None:
     )
 
 
-def build_agent(settings: Settings, engine: AsyncEngine | None) -> NexusAgent:
+def build_agent(
+    settings: Settings,
+    engine: AsyncEngine | None,
+    tool_service: ToolService | None = None,
+) -> NexusAgent:
     """Construct the agent graph from settings.
 
     With an engine (normal operation), sessions persist to PostgreSQL and the
@@ -188,6 +192,7 @@ def build_agent(settings: Settings, engine: AsyncEngine | None) -> NexusAgent:
         memory_manager=memory_manager,
         memory_top_k=settings.nexus_memory_top_k,
         memory_enabled=settings.nexus_memory_enabled,
+        tool_service=tool_service,
     )
 
 
@@ -334,7 +339,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.tool_service = tool_service
     app.state.tools_ok = tool_service is not None
 
-    app.state.agent = build_agent(settings, engine)
+    app.state.agent = build_agent(settings, engine, tool_service)
 
     # --- A2A (Part 6) -----------------------------------------------------------
     # Secure agent-to-agent communication. Requires identity (signing),

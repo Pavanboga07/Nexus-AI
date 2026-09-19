@@ -228,3 +228,163 @@ class _FakeResponse:
 
     def json(self) -> dict:
         return {}
+
+
+# --- D4: bounded tool-calling loop --------------------------------------------
+
+
+@dataclass
+class _Func:
+    name: str
+    arguments: str
+
+
+@dataclass
+class _ToolCall:
+    id: str
+    function: _Func
+
+
+@dataclass
+class _ToolMsg:
+    content: str | None
+    tool_calls: list[_ToolCall] | None = None
+
+
+@dataclass
+class _ToolChoice:
+    message: _ToolMsg
+
+
+@dataclass
+class _ToolCompletion:
+    choices: list[_ToolChoice] = field(default_factory=list)
+
+
+def _tool_call_completion(
+    name: str, arguments: dict[str, Any], content: str | None = None
+) -> _ToolCompletion:
+    import json
+
+    return _ToolCompletion(
+        choices=[
+            _ToolChoice(
+                _ToolMsg(
+                    content=content,
+                    tool_calls=[
+                        _ToolCall(
+                            id="call_1",
+                            function=_Func(
+                                name=name, arguments=json.dumps(arguments)
+                            ),
+                        )
+                    ],
+                )
+            )
+        ]
+    )
+
+
+def _text_completion(text: str) -> _ToolCompletion:
+    return _ToolCompletion(choices=[_ToolChoice(_ToolMsg(content=text))])
+
+
+class _ToolsStubCompletions:
+    """Stub recording create() kwargs (to assert tools= passthrough)."""
+
+    def __init__(self, responses: list[Any]) -> None:
+        self._responses = list(responses)
+        self.calls = 0
+        self.kwargs_history: list[dict[str, Any]] = []
+
+    async def create(self, **kwargs: Any) -> Any:
+        self.calls += 1
+        self.kwargs_history.append(kwargs)
+        assert self._responses, (
+            f"stub called {self.calls} time(s) but no responses remain"
+        )
+        return self._responses.pop(0)
+
+
+def _tools_provider(
+    responses: list[Any],
+) -> tuple[OpenAICompatibleProvider, _ToolsStubCompletions]:
+    provider = OpenAICompatibleProvider(api_key="sk-test", model="stub-model")
+    completions = _ToolsStubCompletions(responses)
+    provider._client = _StubClient(_StubChat(completions))  # type: ignore[assignment]
+    return provider, completions
+
+
+def _search_schemas() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "search",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+
+
+async def test_generate_with_tools_runs_executor_and_returns_final() -> None:
+    provider, completions = _tools_provider(
+        [
+            _tool_call_completion(
+                "web_search", {"query": "nexus ai", "count": 5}
+            ),
+            _text_completion("cited answer"),
+        ]
+    )
+    seen: list[tuple[str, dict[str, Any]]] = []
+
+    async def _executor(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        seen.append((name, args))
+        return {"text": "tool output", "stop": False}
+
+    reply = await provider.generate_with_tools(
+        [{"role": "user", "content": "hi"}], _search_schemas(), _executor
+    )
+
+    assert reply == "cited answer"
+    assert seen == [("web_search", {"query": "nexus ai", "count": 5})]
+    assert completions.calls == 2
+    assert completions.kwargs_history[0]["tools"] == _search_schemas()
+
+
+async def test_generate_with_tools_stops_after_two_rounds() -> None:
+    """A model that always tool-calls must not loop forever."""
+    provider, completions = _tools_provider(
+        [
+            _tool_call_completion("web_search", {"query": "q"}, content="partial"),
+            _tool_call_completion("web_search", {"query": "q"}, content="partial"),
+            _tool_call_completion("web_search", {"query": "q"}, content="never"),
+        ]
+    )
+
+    async def _executor(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        return {"text": "tool output", "stop": False}
+
+    reply = await provider.generate_with_tools(
+        [{"role": "user", "content": "hi"}], _search_schemas(), _executor
+    )
+
+    assert completions.calls == 2
+    assert reply == "partial"
+
+
+async def test_generate_with_tools_stops_on_approval() -> None:
+    provider, completions = _tools_provider(
+        [_tool_call_completion("web_search", {"query": "q"})]
+    )
+
+    async def _executor(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        return {"text": "That needs your approval", "stop": True}
+
+    reply = await provider.generate_with_tools(
+        [{"role": "user", "content": "hi"}], _search_schemas(), _executor
+    )
+
+    assert reply == "That needs your approval"
+    assert completions.calls == 1

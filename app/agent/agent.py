@@ -35,8 +35,18 @@ from app.llm.base import LLMProvider
 
 if TYPE_CHECKING:
     from app.memory.manager import MemoryManager
+    from app.tools.service import ToolService
 
 logger = logging.getLogger("nexus.agent")
+
+#: Tools the chat loop may offer the model (allowlist — never the registry).
+_SEARCH_TOOL_ALLOWLIST = ("web_search", "web_fetch")
+
+#: Purpose bound to every chat-turn tool execution (fits PURPOSE_PATTERN).
+_WEB_RESEARCH_PURPOSE = "web-research"
+
+#: User-facing fallback when a policy stop carries no accompanying text.
+_APPROVAL_FALLBACK = "That needs your approval — check your inbox."
 
 
 class NexusAgent:
@@ -51,6 +61,7 @@ class NexusAgent:
         memory_manager: MemoryManager | None = None,
         memory_top_k: int = 5,
         memory_enabled: bool = True,
+        tool_service: ToolService | None = None,
     ) -> None:
         self._provider = provider
         self._sessions = sessions
@@ -58,6 +69,7 @@ class NexusAgent:
         self._memory = memory_manager
         self._memory_top_k = memory_top_k
         self._memory_enabled = memory_enabled
+        self._tool_service = tool_service
 
     @property
     def provider_name(self) -> str:
@@ -152,7 +164,9 @@ class NexusAgent:
         )
 
         try:
-            reply = await self._provider.generate(messages)
+            reply = await self._generate_with_optional_tools(
+                owner_id, messages
+            )
         except Exception:
             logger.warning(
                 "llm_error session_id=%s provider=%s",
@@ -172,6 +186,86 @@ class NexusAgent:
 
         self._schedule_extraction(owner_id, session_id, message, reply)
         return reply
+
+    async def _generate_with_optional_tools(
+        self, owner_id: uuid.UUID, messages: list[dict[str, str]]
+    ) -> str:
+        """Plain generate, or the bounded search loop when available.
+
+        The loop runs only when a tool service is present, the provider
+        offers ``generate_with_tools``, and at least one allowlisted search
+        tool is registered. Anything else falls back to ``generate`` so old
+        behaviour (and providers without tool support) is preserved.
+        """
+        tool_service = self._tool_service
+        loop = getattr(self._provider, "generate_with_tools", None)
+        if tool_service is None or not callable(loop):
+            return await self._provider.generate(messages)
+        schemas = self._search_tool_schemas(tool_service)
+        if not schemas:
+            return await self._provider.generate(messages)
+
+        async def _executor(
+            name: str, arguments: dict
+        ) -> dict[str, object]:
+            from app.tools.schemas import ToolInvocation
+
+            try:
+                result = await tool_service.execute(
+                    owner_id,
+                    ToolInvocation(
+                        tool_name=name,
+                        arguments=arguments,
+                        purpose=_WEB_RESEARCH_PURPOSE,
+                    ),
+                )
+            except Exception:
+                logger.warning("chat_tool_error tool=%s", name, exc_info=True)
+                return {
+                    "text": "The search failed, so I'll answer from what I know.",
+                    "stop": False,
+                }
+            if result.status in ("approval_required", "denied"):
+                text = (
+                    result.error.message
+                    if result.error and result.error.message
+                    else _APPROVAL_FALLBACK
+                )
+                return {"text": text, "stop": True}
+            if result.success and result.data is not None:
+                import json as _json
+
+                return {"text": _json.dumps(result.data), "stop": False}
+            err = (
+                result.error.message
+                if result.error and result.error.message
+                else "unknown error"
+            )
+            return {
+                "text": f"The search failed ({err}), so I'll answer from what I know.",
+                "stop": False,
+            }
+
+        return await loop(messages, schemas, _executor)
+
+    @staticmethod
+    def _search_tool_schemas(tool_service: ToolService) -> list[dict]:
+        """Allowlisted search tools in the OpenAI ``tools=`` shape."""
+        schemas = []
+        for meta in tool_service.list_tools():
+            if meta.get("name") not in _SEARCH_TOOL_ALLOWLIST:
+                continue
+            schemas.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": meta.get("name"),
+                        "description": meta.get("description", ""),
+                        "parameters": meta.get("inputSchema", {"type": "object"}),
+                    },
+                }
+            )
+        return schemas
 
     async def _relevant_memories(self, owner_id: uuid.UUID, query: str) -> list[str]:
         """Best-effort retrieval; never raises into the chat path."""
