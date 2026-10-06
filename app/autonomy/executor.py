@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -74,7 +74,7 @@ class AutonomyExecutor:
         is_pre_approved: bool = False,
     ) -> ExecutionResult:
         """Evaluate and conditionally execute a single plan action."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         if run.started_at is None:
             run.started_at = now
 

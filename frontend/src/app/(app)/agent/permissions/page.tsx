@@ -23,6 +23,7 @@ import {
   RefreshCw,
   Activity,
 } from "lucide-react";
+import { errorMessage } from "@/lib/api/client";
 
 export default function PermissionsPage() {
   // The three sources load together; a total failure throws so the page shows
@@ -77,8 +78,8 @@ export default function PermissionsPage() {
         peer_agent_id: simPeerId || undefined,
       });
       setSimResult(res);
-    } catch (err: any) {
-      setSimError(`Policy evaluation failed: ${err.message}`);
+    } catch (err) {
+      setSimError(`Policy evaluation failed: ${errorMessage(err)}`);
     } finally {
       setSimulating(false);
     }
