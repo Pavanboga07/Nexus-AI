@@ -35,7 +35,7 @@ the most personal statement of intent.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from app.observability import POLICY_DECISIONS
 from app.policy.models import (
@@ -168,7 +168,7 @@ class PolicyEngine:
         consents: list[Consent],
         now: datetime | None = None,
     ) -> EvaluationResult:
-        now = now or datetime.now(timezone.utc)
+        now = now or datetime.now(UTC)
 
         # 1. Consents: the owner's explicit, most recent intent. Exact match
         #    on all four dimensions (consents never use wildcards).

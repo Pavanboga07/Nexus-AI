@@ -102,7 +102,7 @@ docker exec nexus_postgres psql -U nexus -d nexus_restore \
   -c "SELECT count(*) FROM owners; SELECT count(*) FROM agents; SELECT count(*) FROM memories;"
 
 # 4. Confirm the schema is at the expected revision, not merely present.
-DATABASE_URL=postgresql+asyncpg://nexus:nexus@localhost:5433/nexus_restore \
+DATABASE_URL=postgresql+asyncpg://nexus@localhost:5433/nexus_restore \
   python -m alembic current          # must print the revision in the backup
 
 # 5. Swap.

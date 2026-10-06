@@ -25,8 +25,8 @@ The card never contains private keys, memory, or policy details.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.a2a.schemas import AGENT_ID_PATTERN, PROTOCOL, PROTOCOL_VERSION
@@ -110,7 +110,7 @@ def build_card(
     dict
         Unsigned card dict.  Pass to ``sign_card()`` to add a signature.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     issued_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
     expires_at = (now + timedelta(seconds=ttl_seconds)).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
@@ -273,12 +273,12 @@ def validate_card_time_window(
     Raises CardValidationError when the card is expired or issued
     too far in the future.
     """
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     issued_at = datetime.strptime(card["issued_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
-        tzinfo=timezone.utc
+        tzinfo=UTC
     )
     expires_at = datetime.strptime(card["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
-        tzinfo=timezone.utc
+        tzinfo=UTC
     )
 
     if expires_at <= now:

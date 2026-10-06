@@ -25,7 +25,7 @@ import re
 import uuid
 
 from app.a2a.schemas import TraceContext
-from app.observability import current_trace_id, NO_TRACE
+from app.observability import NO_TRACE, current_trace_id
 
 _HEX_ID = re.compile(r"^[0-9a-f]{16,32}$")
 

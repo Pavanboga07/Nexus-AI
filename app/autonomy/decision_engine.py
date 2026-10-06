@@ -8,14 +8,14 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any
 
 from app.autonomy.limits import check_limits, classify_risk
 from app.autonomy.models import (
     ActionType,
     AutonomyConfig,
-    AutonomyDecision,
     AutonomyMode,
     AutonomyRun,
     DecisionResult,
