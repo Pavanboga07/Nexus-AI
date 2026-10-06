@@ -35,6 +35,7 @@ import {
   AlertTriangle,
   StopCircle,
 } from "lucide-react";
+import { errorMessage } from "@/lib/api/client";
 
 export default function AutonomyPage() {
   const [statusFilter, setStatusFilter] = useState("all");
@@ -106,8 +107,8 @@ export default function AutonomyPage() {
       setActionError(null);
       await updateAutonomyConfig({ mode: newMode });
       reloadConfig();
-    } catch (err: any) {
-      setActionError(`Failed to update mode: ${err.message}`);
+    } catch (err) {
+      setActionError(`Failed to update mode: ${errorMessage(err)}`);
     } finally {
       setUpdatingConfig(false);
     }
@@ -120,8 +121,8 @@ export default function AutonomyPage() {
       setActionError(null);
       await updateAutonomyConfig({ [key]: val });
       reloadConfig();
-    } catch (err: any) {
-      setActionError(`Failed to update setting: ${err.message}`);
+    } catch (err) {
+      setActionError(`Failed to update setting: ${errorMessage(err)}`);
     } finally {
       setUpdatingConfig(false);
     }
@@ -143,8 +144,8 @@ export default function AutonomyPage() {
       setCreateModalOpen(false);
       reloadRuns();
       handleSelectRun(newRun);
-    } catch (err: any) {
-      setCreateError(`Failed to trigger autonomous run: ${err.message}`);
+    } catch (err) {
+      setCreateError(`Failed to trigger autonomous run: ${errorMessage(err)}`);
     } finally {
       setCreating(false);
     }
@@ -161,8 +162,8 @@ export default function AutonomyPage() {
       const res = await approveAutonomyRun(runId, notes);
       reloadRuns();
       handleSelectRun(res);
-    } catch (err: any) {
-      setActionError(`Failed to approve run: ${err.message}`);
+    } catch (err) {
+      setActionError(`Failed to approve run: ${errorMessage(err)}`);
     } finally {
       setBusyId(null);
     }
@@ -179,8 +180,8 @@ export default function AutonomyPage() {
       const res = await rejectAutonomyRun(runId, notes);
       reloadRuns();
       handleSelectRun(res);
-    } catch (err: any) {
-      setActionError(`Failed to reject run: ${err.message}`);
+    } catch (err) {
+      setActionError(`Failed to reject run: ${errorMessage(err)}`);
     } finally {
       setBusyId(null);
     }
@@ -197,8 +198,8 @@ export default function AutonomyPage() {
       const res = await cancelAutonomyRun(runId, "Stopped by owner");
       reloadRuns();
       handleSelectRun(res);
-    } catch (err: any) {
-      setActionError(`Failed to stop run: ${err.message}`);
+    } catch (err) {
+      setActionError(`Failed to stop run: ${errorMessage(err)}`);
     } finally {
       setBusyId(null);
     }

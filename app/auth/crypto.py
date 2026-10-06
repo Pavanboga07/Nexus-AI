@@ -36,7 +36,7 @@ import uuid
 from dataclasses import dataclass
 
 from argon2 import PasswordHasher
-from argon2.exceptions import InvalidHashError, VerifyMismatchError, VerificationError
+from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 
 logger = logging.getLogger("nexus.auth.crypto")
 
@@ -138,7 +138,7 @@ def _b64url_decode(value: str) -> bytes:
 
 def _derive_key(secret: str) -> bytes:
     """HKDF-ish derivation so the signing key differs from the raw secret."""
-    return hashlib.sha256(f"nexus-session-v1:{secret}".encode("utf-8")).digest()
+    return hashlib.sha256(f"nexus-session-v1:{secret}".encode()).digest()
 
 
 def sign_session_payload(payload: dict, *, secret: str) -> str:
