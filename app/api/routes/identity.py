@@ -9,14 +9,12 @@ from __future__ import annotations
 import base64
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, status
 
-from app.api.auth_context import request_owner_id
+from app.a2a.service import A2AService
 from app.api.dependencies import get_a2a_service, get_identity_service
 from app.identity import crypto
 from app.identity.service import IdentityService
-from app.a2a.service import A2AService
 from app.schemas.identity import (
     CapabilityListResponse,
     CapabilityOut,

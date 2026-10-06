@@ -10,8 +10,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from app.agent.agent import NexusAgent
 from app.api.auth_context import request_owner_id
 from app.api.dependencies import get_agent, get_tool_service
-from app.tools.schemas import ToolInvocation
-from app.tools.service import ToolService
 from app.schemas.tools import (
     ToolAuditEntryOut,
     ToolAuditResponse,
@@ -20,6 +18,8 @@ from app.schemas.tools import (
     ToolListResponse,
     ToolMetadataOut,
 )
+from app.tools.schemas import ToolInvocation
+from app.tools.service import ToolService
 
 logger = logging.getLogger("nexus.api.tools")
 

@@ -13,6 +13,7 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agent.session import Session, SessionNotFoundError, SessionStore
+from app.database.models import Conversation
 from app.database.models import Message as MessageModel
 from app.database.repositories import (
     ConversationRepository,
@@ -25,10 +26,8 @@ logger = logging.getLogger("nexus.agent.session.db")
 class DatabaseSessionStore(SessionStore):
     """Persistent ``SessionStore`` over PostgreSQL.
 
-    Every method takes the acting ``owner_id`` explicitly. The store
-    deliberately does NOT resolve an owner for itself: doing so (the old
-    ``_get_owner_id`` process-wide cache) is exactly what made the API
-    single-tenant and allowed one user to read another's conversation.
+    Every method takes the acting ``owner_id`` explicitly — the store never
+    resolves an owner itself, which is what keeps the API multi-tenant.
     """
 
     def __init__(
@@ -120,8 +119,6 @@ class DatabaseSessionStore(SessionStore):
 
     async def list_sessions(self, owner_id: uuid.UUID) -> list[str]:
         from sqlalchemy import select
-
-        from app.database.models import Conversation
 
         async with self._session_factory() as session:
             result = await session.execute(

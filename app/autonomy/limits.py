@@ -6,8 +6,8 @@ deterministic and governed by hardcoded safety rules.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Sequence
+from collections.abc import Sequence
+from datetime import UTC, datetime
 
 from app.autonomy.models import (
     ActionType,
@@ -106,7 +106,7 @@ def check_limits(
         (is_within_limits, violation_reason)
     """
     if now is None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
     # 1. Step count limit
     if run.steps_executed >= config.max_steps_per_run:

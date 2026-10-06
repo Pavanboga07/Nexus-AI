@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,7 +37,7 @@ class ToolExecutionRepository:
     async def mark_completed(
         self, session: AsyncSession, record: ToolExecutionRecord
     ) -> ToolExecutionRecord:
-        record.completed_at = datetime.now(timezone.utc)
+        record.completed_at = datetime.now(UTC)
         await session.flush()
         return record
 

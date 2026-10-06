@@ -2,27 +2,18 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Literal
+from datetime import UTC, datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
 
 from app.tools.builtin_search import WebFetchTool, WebSearchTool
 from app.tools.registry import BaseTool
-from app.tools.schemas import ToolContext
-
-
-class _StrictModel(BaseModel):
-    """Arguments model base: rejects unknown fields (additionalProperties:
-    false in the derived JSON schema)."""
-
-    model_config = ConfigDict(extra="forbid")
-
+from app.tools.schemas import StrictModel, ToolContext
 
 # --- get_current_time -----------------------------------------------------------
 
 
-class CurrentTimeArgs(_StrictModel):
+class CurrentTimeArgs(StrictModel):
     # No arguments - the empty strict model renders as
     # {"properties": {}, "additionalProperties": false}
     pass
@@ -37,14 +28,14 @@ class CurrentTimeTool(BaseTool):
     async def execute(
         self, arguments: CurrentTimeArgs, context: ToolContext
     ) -> dict[str, str]:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         return {"utc": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
 
 
 # --- echo ------------------------------------------------------------------------
 
 
-class EchoArgs(_StrictModel):
+class EchoArgs(StrictModel):
     text: str = Field(min_length=1, max_length=1000)
 
 

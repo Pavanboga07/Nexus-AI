@@ -13,9 +13,9 @@ from app.auth.crypto import (
 )
 from app.auth.models import AuthSession, UserCredential
 from app.auth.service import (
+    AuthenticatedUser,
     AuthError,
     AuthService,
-    AuthenticatedUser,
     EmailAlreadyRegisteredError,
     IssuedSession,
     RegistrationError,

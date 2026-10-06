@@ -5,11 +5,14 @@
 #
 # Why this script exists rather than "just run uvicorn": the checked-in .env
 # points DATABASE_URL at a hosted Neon instance. Running the app from a shell
-# would therefore write demo data to a remote database - and, since the audit
-# found a credential committed in this repository, that database must be treated
-# as compromised anyway. The environment variables below override .env for this
-# process only (pydantic-settings reads os.environ before the file), so nothing
-# in the repository is modified.
+# would therefore write demo data to a remote database. The environment
+# variables below override .env for this process only (pydantic-settings reads
+# os.environ before the file), so nothing in the repository is modified.
+#
+# Note: since the 2026-10-06 security pass, no credentials are committed in
+# this repository (local dev uses trust auth - see docker-compose.yml). The old
+# password still exists in git history: if you ever reused it anywhere outside
+# this repo, rotate it.
 
 param(
     [switch]$Migrate,
@@ -20,7 +23,7 @@ $ErrorActionPreference = "Stop"
 $repo = $PSScriptRoot
 
 # --- Local services -------------------------------------------------------
-$env:DATABASE_URL = "postgresql+asyncpg://nexus:nexus@localhost:5433/nexus"
+$env:DATABASE_URL="postgresql+asyncpg://nexus@localhost:5433/nexus"
 $env:NEXUS_ENV = "development"
 $env:NEXUS_HOST = "127.0.0.1"
 $env:NEXUS_PORT = "$Port"

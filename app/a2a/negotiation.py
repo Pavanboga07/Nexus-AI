@@ -12,8 +12,7 @@ Negotiation allows personal agents to exchange counter-proposals (e.g.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any
+from datetime import UTC, datetime
 
 from app.a2a.errors import A2AError, A2AErrorCode
 from app.a2a.models import A2ATask, TaskStatus
@@ -30,7 +29,7 @@ def validate_negotiation_round(current_round: int, max_rounds: int) -> None:
 
 def validate_task_active(task: A2ATask, now: datetime | None = None) -> None:
     """Check that the task is still active and has not expired or terminated."""
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
 
     if task.expires_at is not None and task.expires_at <= now:
         raise A2AError(

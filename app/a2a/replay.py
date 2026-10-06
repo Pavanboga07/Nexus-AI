@@ -12,7 +12,7 @@ exists to tolerate small drift between honest agents.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from app.a2a.errors import A2AError, A2AErrorCode
 from app.a2a.schemas import A2AEnvelope, parse_iso
@@ -25,7 +25,7 @@ def validate_time_window(
     now: datetime | None = None,
 ) -> None:
     """Raise A2AError when the message is expired or from the future."""
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     timestamp = parse_iso(envelope.timestamp)
     expires_at = parse_iso(envelope.expires_at)
 

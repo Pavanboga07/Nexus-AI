@@ -1,6 +1,6 @@
 """Web search + fetch tools (Phase D, task D3).
 
-Follow ``CurrentTimeTool`` exactly: ``_StrictModel`` args (extra=forbid),
+Follow ``CurrentTimeTool`` exactly: ``StrictModel`` args (extra=forbid),
 ``data_category = "public-web"``, ``execute(arguments, context)`` returning
 JSON-able dicts. Provider + fetch helper are constructor-injected with sane
 defaults (keyless DuckDuckGo + ``fetch_url``) so ``BUILTIN_TOOLS`` stays a
@@ -12,8 +12,9 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
 
+from app.config.settings import get_settings
 from app.search import (
     SearchError,
     SearchProvider,
@@ -23,25 +24,15 @@ from app.search import (
 from app.search.fetch import FetchedPage, fetch_url
 from app.tools.errors import ToolError, ToolErrorCode
 from app.tools.registry import BaseTool
-from app.tools.schemas import ToolContext
+from app.tools.schemas import StrictModel, ToolContext
 
 
-class _StrictModel(BaseModel):
-    """Arguments model base: rejects unknown fields.
-
-    Local copy of ``app.tools.builtin._StrictModel`` (importing it here
-    would be circular once ``builtin/__init__`` imports this module).
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-
-class WebSearchArgs(_StrictModel):
+class WebSearchArgs(StrictModel):
     query: str = Field(min_length=1, max_length=500)
     count: int = Field(default=5, ge=1, le=10)
 
 
-class WebFetchArgs(_StrictModel):
+class WebFetchArgs(StrictModel):
     url: str = Field(min_length=1, max_length=2000)
 
 
@@ -60,8 +51,6 @@ class WebSearchTool(BaseTool):
         else:
             # No-arg default stays intact for BUILTIN_TOOLS: the provider
             # comes from settings (default: keyless DuckDuckGo).
-            from app.config.settings import get_settings
-
             self._provider = get_provider_from_settings(get_settings())
 
     async def execute(

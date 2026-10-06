@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import re
-from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
-
 
 _ENDPOINT_PATTERN = re.compile(r"^https?://[^\s]+$")
 

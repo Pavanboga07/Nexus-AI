@@ -12,6 +12,15 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict
+
+
+class StrictModel(BaseModel):
+    """Arguments model base for tools: rejects unknown fields
+    (additionalProperties: false in the derived JSON schema)."""
+
+    model_config = ConfigDict(extra="forbid")
+
 
 @dataclass(frozen=True)
 class ToolInvocation:
