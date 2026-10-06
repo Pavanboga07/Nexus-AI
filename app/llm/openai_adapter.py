@@ -27,6 +27,7 @@ from openai import (
     RateLimitError,
 )
 
+from app.jobs.queue import compute_backoff_seconds
 from app.llm.base import (
     LLMConfigurationError,
     LLMProvider,
@@ -335,7 +336,7 @@ class OpenAICompatibleProvider(LLMProvider):
             try:
                 completion = await self._client.chat.completions.create(
                     model=self._model,
-                    messages=messages,  # type: ignore[arg-type]
+                    messages=messages,
                 )
             except AuthenticationError as exc:
                 # Never retry: the key is wrong, and retrying risks lockout.
@@ -402,8 +403,6 @@ class OpenAICompatibleProvider(LLMProvider):
         """
         if attempt >= self._max_attempts:
             return False
-        from app.jobs.queue import compute_backoff_seconds
-
         delay = compute_backoff_seconds(
             attempt, base_seconds=self._retry_base_seconds or 0.5, max_seconds=30.0
         )
@@ -463,8 +462,8 @@ class OpenAICompatibleProvider(LLMProvider):
         for _ in range(_MAX_TOOL_ROUNDS):
             completion = await self._client.chat.completions.create(
                 model=self._model,
-                messages=history,  # type: ignore[arg-type]
-                tools=tool_schemas,  # type: ignore[arg-type]
+                messages=history,
+                tools=tool_schemas,
             )
             message = _assistant_message(completion)
             content = message.get("content") or ""

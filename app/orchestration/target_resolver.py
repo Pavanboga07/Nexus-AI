@@ -10,15 +10,16 @@ import logging
 import uuid
 from typing import Any
 
+import httpx
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.a2a import signing
+from app.a2a.cards import validate_card_schema, validate_card_time_window
 from app.a2a.models import TrustStatus
 from app.a2a.repository import TrustedAgentRepository
-from app.orchestration.models import Contact
+from app.a2a.transport import validate_endpoint
 from app.orchestration.repository import ContactRepository
 from app.orchestration.schemas import TargetResolution, TargetResolutionStatus
-
-import httpx
 
 logger = logging.getLogger("nexus.orchestration.target_resolver")
 
@@ -63,8 +64,6 @@ class TargetResolver:
         # Same SSRF discipline as every other outbound call. The gateway base
         # is operator-configured but user input is appended to it, so the
         # composed URL is validated before we dial it.
-        from app.a2a.transport import validate_endpoint
-
         validate_endpoint(url, allow_local=True)
         if self._http_client:
             return await self._http_client.get(url)
@@ -90,9 +89,6 @@ class TargetResolver:
                 return self._discovery.verify_card(
                     card, expected_agent_id=expected_agent_id
                 )
-            from app.a2a import signing
-            from app.a2a.cards import validate_card_schema, validate_card_time_window
-
             validate_card_schema(card)
             if expected_agent_id and card.get("agent_id") != expected_agent_id:
                 return None
