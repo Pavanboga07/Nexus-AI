@@ -20,18 +20,13 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.a2a import signing
-from app.a2a.models import TrustStatus
 from app.a2a.repository import TrustedAgentRepository
 from app.a2a.service import A2AService
 from app.autonomy.decision_engine import DecisionEngine
 from app.orchestration.context import OrchestrationContextManager
 from app.orchestration.errors import (
-    AmbiguousTargetError,
     OrchestrationError,
-    OrchestrationPolicyError,
     TargetResolutionError,
-    UntrustedAgentError,
 )
 from app.orchestration.executor import OrchestrationExecutor
 from app.orchestration.intent import IntentResolver
