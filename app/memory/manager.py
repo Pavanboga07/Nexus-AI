@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -267,7 +267,7 @@ class MemoryManager:
         if agent_id is not None:
             memories = [m for m in memories if m.agent_id == agent_id]
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         return {
             "format": "nexus-memory-export",
             "version": 1,
@@ -375,7 +375,7 @@ class MemoryManager:
         """
         if not episodic_retention_days or episodic_retention_days <= 0:
             return 0
-        cutoff = datetime.now(timezone.utc) - timedelta(days=episodic_retention_days)
+        cutoff = datetime.now(UTC) - timedelta(days=episodic_retention_days)
         async with self._session_factory() as session:
             removed = await self._repo.reap_old(
                 session,
