@@ -108,7 +108,7 @@ class Agent(Base):
         nullable=False,
     )
 
-    keys: Mapped[list["AgentKey"]] = relationship(
+    keys: Mapped[list[AgentKey]] = relationship(
         back_populates="agent",
         cascade="all, delete-orphan",
         order_by="AgentKey.created_at",
@@ -182,7 +182,7 @@ class AgentKey(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
-    agent: Mapped["Agent | None"] = relationship(back_populates="keys")
+    agent: Mapped[Agent | None] = relationship(back_populates="keys")
 
     @property
     def is_revoked(self) -> bool:

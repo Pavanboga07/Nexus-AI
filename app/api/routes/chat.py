@@ -10,12 +10,10 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
-from app import __version__
 from app.agent.agent import NexusAgent
 from app.agent.session import Session, SessionNotFoundError
 from app.api.auth_context import RequestContext, get_request_context
 from app.api.dependencies import get_agent
-from app.config.settings import Settings, get_settings
 from app.llm.base import (
     LLMConfigurationError,
     LLMProviderError,
@@ -25,7 +23,6 @@ from app.schemas.chat import (
     ChatRequest,
     ChatResponse,
     ErrorResponse,
-    HealthResponse,
     SessionCreateResponse,
     SessionResponse,
 )
@@ -36,7 +33,7 @@ router = APIRouter()
 
 
 def _to_session_response(session: Session) -> SessionResponse:
-    return SessionResponse(**session.to_dict())  # type: ignore[arg-type]
+    return SessionResponse(**session.to_dict())
 
 
 # NOTE: /health moved to app/api/routes/system.py so it can be mounted WITHOUT

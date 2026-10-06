@@ -11,7 +11,6 @@ from app.api.auth_context import (
     auth_required,
     extract_session_token,
     get_auth_service,
-    get_request_context,
     require_authenticated_context,
 )
 from app.auth.crypto import SESSION_COOKIE_NAME
