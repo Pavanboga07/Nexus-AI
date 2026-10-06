@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -25,12 +25,12 @@ from app.policy.engine import (
     PolicyEngine,
 )
 from app.policy.models import (
+    WILDCARD,
     Consent,
     DisclosureScope,
     Policy,
     PolicyDecision,
     PolicyDecisionRecord,
-    WILDCARD,
 )
 from app.policy.repository import PolicyRepository
 
@@ -59,7 +59,7 @@ class PolicyService:
         """Authorize a request: consent/policy lookup, decision, audit,
         and (for single-use consents) atomic consumption - all in one
         transaction."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         async with self._session_factory() as session:
             consents = await self._repo.list_consents(session, owner_id)
             policies = await self._repo.list_policies(session, owner_id)

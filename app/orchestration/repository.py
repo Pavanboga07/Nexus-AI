@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.orchestration.models import Contact, OrchestrationRun, OrchestrationState
+from app.orchestration.models import (
+    Contact,
+    OrchestrationContext,
+    OrchestrationRun,
+    OrchestrationState,
+)
 
 
 class ContactRepository:
@@ -303,7 +309,6 @@ class OrchestrationContextRepository:
     async def get_by_session_id(
         self, session: AsyncSession, session_id: str
     ) -> Any | None:
-        from app.orchestration.models import OrchestrationContext
         stmt = select(OrchestrationContext).where(
             OrchestrationContext.session_id == session_id
         )
@@ -324,7 +329,6 @@ class OrchestrationContextRepository:
         last_intent_type: str | None = None,
         pending_approval: dict[str, Any] | None = None,
     ) -> Any:
-        from app.orchestration.models import OrchestrationContext
         ctx = await self.get_by_session_id(session, session_id)
         if ctx is None:
             ctx = OrchestrationContext(

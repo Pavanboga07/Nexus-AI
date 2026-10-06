@@ -7,11 +7,11 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     DateTime,
     ForeignKey,
     Integer,
-    JSON,
     String,
     Text,
     func,
@@ -19,6 +19,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from app.autonomy.run_status import RunStatus  # noqa: F401  (re-export)
 from app.database.models import Base
 
 
@@ -54,18 +55,6 @@ class DecisionResult(str, enum.Enum):
     ASK = "ask"
     DENY = "deny"
     STOP = "stop"
-
-
-class RunStatus(str, enum.Enum):
-    PENDING = "pending"
-    RUNNING = "running"
-    WAITING_APPROVAL = "waiting_approval"
-    WAITING_REMOTE = "waiting_remote"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    STOPPED = "stopped"
-    EXPIRED = "expired"
-    CANCELLED = "cancelled"
 
 
 class ApprovalStatus(str, enum.Enum):
