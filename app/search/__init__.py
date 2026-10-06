@@ -42,6 +42,8 @@ def get_provider(
 ) -> SearchProvider:
     """Return the named provider (default: keyless DuckDuckGo)."""
     if name == "duckduckgo":
+        # lazy: avoids circular import app.search.duckduckgo -> app.search
+        # (the provider module imports names from this package __init__).
         from app.search.duckduckgo import DuckDuckGoProvider
 
         return DuckDuckGoProvider()

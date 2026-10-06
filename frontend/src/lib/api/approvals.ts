@@ -22,6 +22,67 @@
 import { apiFetch, ApiError } from "./client";
 import { shortContactId } from "../useContactNames";
 
+/**
+ * Raw JSON records from the backend. Fields are read defensively (the
+ * backend is the source of truth for shapes; the UI only needs the fields
+ * it renders, all optional).
+ */
+type RawJson = Record<string, unknown>;
+
+type RawTask = RawJson & {
+  task_id?: string;
+  sender_agent_id?: string;
+  recipient_agent_id?: string;
+  status?: string;
+  task_type?: string;
+  purpose?: string;
+  created_at?: string;
+  expires_at?: string;
+  request_payload?: RawJson & {
+    message?: string;
+    query?: string;
+    action?: string;
+    data_category?: string;
+  };
+};
+
+type RawWorkflow = RawJson & {
+  workflow_id?: string;
+  workflow_type?: string;
+  status?: string;
+  purpose?: string;
+  failure_reason?: string;
+  current_step_number?: number;
+  created_at?: string;
+  expires_at?: string;
+};
+
+type RawAutonomyRun = RawJson & {
+  id?: string;
+  run_id?: string;
+  goal?: string;
+  status?: string;
+  approval_prompt?: string;
+  stop_reason?: string;
+  requested_action?: string;
+  risk_level?: string;
+  mode?: string;
+  created_at?: string;
+};
+
+type RawOrchestrationRun = RawJson & {
+  run_id?: string;
+  goal?: string;
+  state?: string;
+  approval_prompt?: string;
+  approval_reason?: string;
+  requested_action?: string;
+  target_person?: string;
+  approval_category?: string;
+  approval_purpose?: string;
+  created_at?: string;
+};
+
 export type ApprovalSource = "task" | "workflow" | "autonomy" | "orchestration";
 
 export type ApprovalItem = {
@@ -111,7 +172,7 @@ async function loadSource<T>(
 
 async function loadTasks(): Promise<TaskBuckets> {
   const [data, identity] = await Promise.all([
-    apiFetch<{ tasks: any[] }>("/a2a/tasks"),
+    apiFetch<{ tasks: RawTask[] }>("/a2a/tasks"),
     // Outbound means "sent by me": the delegate path records
     // sender_agent_id = the local agent id (A2AService.delegate_task in
     // app/a2a/service.py), so the owner-scoped list is split on /identity.
@@ -160,11 +221,11 @@ function isTaskTerminal(status: unknown): boolean {
   return typeof status === "string" && TASK_TERMINAL_STATUSES.has(status);
 }
 
-function toTaskPendingItem(t: any): ApprovalItem {
+function toTaskPendingItem(t: RawTask): ApprovalItem {
   return {
     id: `task:${t.task_id}`,
     source: "task" as const,
-    recordId: t.task_id,
+    recordId: t.task_id ?? "",
     // The sender is resolved to a display name at render time (the Inbox
     // holds the contact-names map); here only a short, obviously-truncated
     // fallback is used — never a raw 24-char ID slice.
@@ -184,7 +245,7 @@ function toTaskPendingItem(t: any): ApprovalItem {
   };
 }
 
-function toTaskOutboxItem(t: any): ApprovalItem {
+function toTaskOutboxItem(t: RawTask): ApprovalItem {
   return {
     ...toTaskPendingItem(t),
     // The peer we are waiting on is the recipient, not the sender.
@@ -193,7 +254,7 @@ function toTaskOutboxItem(t: any): ApprovalItem {
   };
 }
 
-function toTaskDecidedItem(t: any, ownId: string | null): ApprovalItem {
+function toTaskDecidedItem(t: RawTask, ownId: string | null): ApprovalItem {
   const outbound = ownId !== null && t.sender_agent_id === ownId;
   const peer = outbound ? t.recipient_agent_id : t.sender_agent_id;
   return {
@@ -211,13 +272,13 @@ export type TaskBuckets = {
 };
 
 async function loadWorkflows(): Promise<ApprovalItem[]> {
-  const data = await apiFetch<{ workflows: any[] }>("/workflows");
+  const data = await apiFetch<{ workflows: RawWorkflow[] }>("/workflows");
   return (data.workflows ?? [])
     .filter((w) => isPending(w.status))
     .map((w) => ({
       id: `workflow:${w.workflow_id}`,
       source: "workflow" as const,
-      recordId: w.workflow_id,
+      recordId: w.workflow_id ?? "",
       title: w.workflow_type?.replace(/[_-]/g, " ") ?? "Workflow",
       summary: short(
         w.failure_reason ??
@@ -231,8 +292,10 @@ async function loadWorkflows(): Promise<ApprovalItem[]> {
 }
 
 async function loadAutonomy(): Promise<ApprovalItem[]> {
-  const data = await apiFetch<{ runs?: any[] }>("/autonomy/runs");
-  const runs = data.runs ?? (Array.isArray(data) ? (data as any[]) : []);
+  const data = await apiFetch<{ runs?: RawAutonomyRun[] }>("/autonomy/runs");
+  const runs: RawAutonomyRun[] =
+    data.runs ??
+    (Array.isArray(data) ? (data as unknown as RawAutonomyRun[]) : []);
   return runs
     .filter((r) => isPending(r.status))
     .map((r) => ({
@@ -293,7 +356,7 @@ function isRecentlyDecided(state: unknown): boolean {
   );
 }
 
-function toOrchestrationItem(r: any): ApprovalItem {
+function toOrchestrationItem(r: RawOrchestrationRun): ApprovalItem {
   return {
     id: `orchestration:${r.run_id}`,
     source: "orchestration" as const,
@@ -321,8 +384,12 @@ export type OrchestrationBuckets = {
 };
 
 async function loadOrchestration(): Promise<OrchestrationBuckets> {
-  const data = await apiFetch<{ runs?: any[] }>("/orchestration/runs");
-  const runs = data.runs ?? (Array.isArray(data) ? (data as any[]) : []);
+  const data = await apiFetch<{ runs?: RawOrchestrationRun[] }>(
+    "/orchestration/runs"
+  );
+  const runs: RawOrchestrationRun[] =
+    data.runs ??
+    (Array.isArray(data) ? (data as unknown as RawOrchestrationRun[]) : []);
   const pending: ApprovalItem[] = [];
   const waitingOutbox: ApprovalItem[] = [];
   const recentlyDecided: ApprovalItem[] = [];

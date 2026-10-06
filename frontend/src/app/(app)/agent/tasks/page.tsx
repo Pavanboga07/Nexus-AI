@@ -28,6 +28,7 @@ import {
   Plus,
   RefreshCw,
 } from "lucide-react";
+import { errorMessage } from "@/lib/api/client";
 
 export default function TasksPage() {
   const [statusFilter, setStatusFilter] = useState("all");
@@ -178,8 +179,8 @@ export default function TasksPage() {
         setPayloadText(template);
       }
       refreshTasks();
-    } catch (err: any) {
-      setCreateError(`Failed to delegate task: ${err.message}`);
+    } catch (err) {
+      setCreateError(`Failed to delegate task: ${errorMessage(err)}`);
     } finally {
       setCreating(false);
     }
@@ -196,8 +197,8 @@ export default function TasksPage() {
         const updated = await getTask(taskId);
         await openTask(updated);
       }
-    } catch (err: any) {
-      setActionError(`Failed to approve task: ${err.message}`);
+    } catch (err) {
+      setActionError(`Failed to approve task: ${errorMessage(err)}`);
     } finally {
       setBusyId(null);
     }
@@ -217,8 +218,8 @@ export default function TasksPage() {
         const updated = await getTask(taskId);
         await openTask(updated);
       }
-    } catch (err: any) {
-      setActionError(`Failed to reject task: ${err.message}`);
+    } catch (err) {
+      setActionError(`Failed to reject task: ${errorMessage(err)}`);
     } finally {
       setBusyId(null);
     }
@@ -238,8 +239,8 @@ export default function TasksPage() {
         const updated = await getTask(taskId);
         await openTask(updated);
       }
-    } catch (err: any) {
-      setActionError(`Failed to cancel task: ${err.message}`);
+    } catch (err) {
+      setActionError(`Failed to cancel task: ${errorMessage(err)}`);
     } finally {
       setBusyId(null);
     }
@@ -268,8 +269,8 @@ export default function TasksPage() {
       refreshTasks();
       const updated = await getTask(selectedTask.task_id);
       await openTask(updated);
-    } catch (err: any) {
-      setNegotiateError(`Failed to submit counter-offer: ${err.message}`);
+    } catch (err) {
+      setNegotiateError(`Failed to submit counter-offer: ${errorMessage(err)}`);
     } finally {
       setNegotiating(false);
     }
