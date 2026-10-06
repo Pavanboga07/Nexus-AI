@@ -9,7 +9,7 @@ kind with no handler is a startup/test failure rather than something that
 dead-letters in production.
 """
 
-from app.jobs.models import Job, JobState, TERMINAL_STATES
+from app.jobs.models import TERMINAL_STATES, Job, JobState
 from app.jobs.queue import JobQueue, compute_backoff_seconds
 from app.jobs.worker import (
     CircuitBreaker,

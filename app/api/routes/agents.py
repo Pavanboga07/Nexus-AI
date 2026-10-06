@@ -21,6 +21,8 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
+from app.a2a.cards import AgentCapability, build_card, capabilities_from_tools
+from app.a2a.signing import sign_card
 from app.api.auth_context import request_owner_id
 from app.api.dependencies import get_identity_service
 from app.config.settings import Settings, get_settings
@@ -42,8 +44,6 @@ from app.schemas.identity import (
     AgentStatusUpdate,
     DeleteResponse,
 )
-from app.a2a.cards import AgentCapability, build_card, capabilities_from_tools
-from app.a2a.signing import sign_card
 
 logger = logging.getLogger("nexus.api.agents")
 

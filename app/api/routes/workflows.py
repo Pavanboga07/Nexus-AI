@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
@@ -22,7 +21,6 @@ from app.agent.agent import NexusAgent
 from app.api.auth_context import request_owner_id
 from app.api.dependencies import get_agent, get_workflow_service
 from app.schemas.workflows import (
-    WorkflowActionResponse,
     WorkflowCreateRequest,
     WorkflowListResponse,
     WorkflowOut,
