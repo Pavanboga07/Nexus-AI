@@ -13,7 +13,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
@@ -260,7 +260,7 @@ class AuthService:
             row = result.scalar_one_or_none()
             if row is None:
                 return False
-            row.revoked_at = datetime.now(timezone.utc)
+            row.revoked_at = datetime.now(UTC)
             await session.commit()
         return True
 
@@ -273,7 +273,7 @@ class AuthService:
                     AuthSession.owner_id == owner_id,
                     AuthSession.revoked_at.is_(None),
                 )
-                .values(revoked_at=datetime.now(timezone.utc))
+                .values(revoked_at=datetime.now(UTC))
             )
             await session.commit()
             return int(result.rowcount or 0)
@@ -309,9 +309,9 @@ class AuthService:
             row = result.scalar_one_or_none()
             if row is None or row.revoked_at is not None:
                 return None
-            if row.expires_at <= datetime.now(timezone.utc):
+            if row.expires_at <= datetime.now(UTC):
                 return None
-            row.last_seen_at = datetime.now(timezone.utc)
+            row.last_seen_at = datetime.now(UTC)
             await session.commit()
 
             credential = await self._credential_for_owner(session, owner_id)
@@ -355,7 +355,7 @@ class AuthService:
         # independent of the signed claims.
         payload = crypto.build_session_payload(owner_id, ttl_seconds=self._ttl)
         signed = crypto.sign_session_payload(payload, secret=self._secret)
-        expires_at = datetime.fromtimestamp(payload["exp"], tz=timezone.utc)
+        expires_at = datetime.fromtimestamp(payload["exp"], tz=UTC)
 
         session.add(
             AuthSession(

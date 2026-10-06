@@ -1,15 +1,11 @@
 # Nexus — direct dependencies, pinned.
 #
-# Verification status: every `==` below matches a version that is installed and
-# exercised by this repository's test suite (checked by
-# `nexus-gateway/tests/test_m11_hardening_regressions.py`, which fails if a pin
-# names a version the environment does not actually have).
+# Pins are `==`, not `>=`: a floating range would let a major upgrade arrive on
+# the next `pip install` with no commit that mentions it. Keep this file as the
+# readable list of what the project actually asks for; it is not a lockfile
+# (no transitive closure is committed - regenerate with `pip-compile` if you
+# need a fully reproducible build).
 #
-# Pins are `==`, not `>=`. The audit's finding was that a floating range lets a
-# major upgrade arrive on the next `pip install` with no commit that mentions it.
-# `requirements.lock.txt` carries the full transitive closure for a reproducible
-# build; this file stays readable as the list of what the project actually asks
-# for.
 
 fastapi==0.115.0
 uvicorn[standard]==0.52.4

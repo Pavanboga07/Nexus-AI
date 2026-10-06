@@ -13,11 +13,10 @@ from app.a2a.schemas import A2AEnvelope
 from app.a2a.service import A2AService
 from app.agent.agent import NexusAgent
 from app.api.auth_context import request_owner_id
-from app.api.dependencies import get_agent, get_a2a_service
+from app.api.dependencies import get_a2a_service, get_agent
 from app.schemas.a2a import (
     A2AAuditEntryOut,
     A2AAuditResponse,
-    A2AMessageIn,
     A2ASendRequest,
     A2ASendResponse,
     DeleteResponse,
@@ -59,7 +58,7 @@ async def register_agent(
         )
     except A2AError as exc:
         raise HTTPException(status_code=exc.http_status, detail=exc.message) from exc
-    return TrustedAgentOut(**record.to_dict())  # type: ignore[arg-type]
+    return TrustedAgentOut(**record.to_dict())
 
 
 @router.get(
@@ -75,7 +74,7 @@ async def list_agents(
 ) -> TrustedAgentListResponse:
     owner_id = await _owner_id(request)
     agents = await a2a_service.list_trusted_agents(owner_id)
-    items = [TrustedAgentOut(**a.to_dict()) for a in agents]  # type: ignore[arg-type]
+    items = [TrustedAgentOut(**a.to_dict()) for a in agents]
     return TrustedAgentListResponse(agents=items, total=len(items))
 
 
@@ -96,7 +95,7 @@ async def get_agent_record(
     record = await a2a_service.get_trusted_agent(owner_id, agent_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Agent not found.")
-    return TrustedAgentOut(**record.to_dict())  # type: ignore[arg-type]
+    return TrustedAgentOut(**record.to_dict())
 
 
 @router.delete(
@@ -136,7 +135,7 @@ async def revoke_agent(
     revoked = await a2a_service.revoke_trusted_agent(owner_id, agent_id)
     if not revoked:
         raise HTTPException(status_code=404, detail="Agent not found.")
-    return TrustedAgentOut(**revoked.to_dict())  # type: ignore[arg-type]
+    return TrustedAgentOut(**revoked.to_dict())
 
 
 @router.post(
@@ -226,7 +225,7 @@ async def list_a2a_audit(
 ) -> A2AAuditResponse:
     owner_id = await _owner_id(request)
     records = await a2a_service.list_audit(owner_id, limit=limit)
-    entries = [A2AAuditEntryOut(**r.to_dict()) for r in records]  # type: ignore[arg-type]
+    entries = [A2AAuditEntryOut(**r.to_dict()) for r in records]
     return A2AAuditResponse(messages=entries, total=len(entries))
 
 

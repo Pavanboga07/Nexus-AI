@@ -124,7 +124,9 @@ class LocalHashEmbeddingProvider(EmbeddingProvider):
             for i in range(len(normalized) - self._ngram + 1)
         )
         for gram in grams:
-            digest = hashlib.md5(gram.encode("utf-8")).digest()
+            # blake2b, not md5: same speed for bucketing, but md5 is flagged
+            # by every security scanner and raises on FIPS-mode systems.
+            digest = hashlib.blake2b(gram.encode("utf-8"), digest_size=8).digest()
             bucket = int.from_bytes(digest[:4], "big") % self.dimensions
             sign = 1.0 if digest[4] % 2 == 0 else -1.0
             vector[bucket] += sign

@@ -33,20 +33,13 @@ logger = logging.getLogger("nexus.identity.bound")
 
 
 class AgentIdentity:
-    """Pre-M4 identity interface, backed by one agent row.
+    """Agent identity bound to one agent row.
 
-    ``get_public_identity()`` is intentionally SYNCHRONOUS and returns the
-    identity captured at bind time. That keeps the pre-M4 call sites (A2A
-    signing, card building, the gateway handshake) unchanged, while ``sign()``
-    resolves the agent's CURRENT key on every call - so a rotation or
-    revocation takes effect immediately instead of being masked by a cached
-    private key.
-
-    The consequence to be aware of: the reported ``agent_id`` is a snapshot. A
-    rotation changes the real agent_id, so after rotating a key the caller must
-    rebind (``AgentIdentity.for_agent``) to pick up the new identity. Signing
-    would otherwise use the new key while advertising the old id. ``is_stale``
-    makes that checkable.
+    ``get_public_identity()`` is synchronous by design (a snapshot taken at
+    bind time), while ``sign()`` always resolves the CURRENT key — so a
+    rotation or revocation takes effect immediately. After rotating, rebind
+    via ``AgentIdentity.for_agent``: signing would otherwise use the new key
+    while advertising the old id (``is_stale`` makes that checkable).
     """
 
     def __init__(
@@ -66,7 +59,7 @@ class AgentIdentity:
         *,
         identity_service: IdentityService,
         agent_row_id: uuid.UUID,
-    ) -> "AgentIdentity":
+    ) -> AgentIdentity:
         """Bind the adapter to an agent, reading its current identity."""
         public = await identity_service.get_public_identity_for(agent_row_id)
         return cls(

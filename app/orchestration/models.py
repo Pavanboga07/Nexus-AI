@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import enum
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import (
@@ -23,7 +23,7 @@ from app.database.models import Base
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class OrchestrationState(str, enum.Enum):

@@ -25,6 +25,7 @@ import {
   RefreshCw,
   ShieldAlert,
 } from "lucide-react";
+import { errorMessage } from "@/lib/api/client";
 
 export default function WorkflowsPage() {
   const [statusFilter, setStatusFilter] = useState("all");
@@ -83,8 +84,8 @@ export default function WorkflowsPage() {
         const updated = await getWorkflow(id);
         setSelectedWorkflow(updated);
       }
-    } catch (err: any) {
-      setActionError(`Failed to start workflow: ${err.message}`);
+    } catch (err) {
+      setActionError(`Failed to start workflow: ${errorMessage(err)}`);
     } finally {
       setBusyId(null);
     }
@@ -99,8 +100,8 @@ export default function WorkflowsPage() {
       refreshWorkflows();
       const updated = await getWorkflow(id);
       setSelectedWorkflow(updated);
-    } catch (err: any) {
-      setActionError(`Failed to approve workflow step: ${err.message}`);
+    } catch (err) {
+      setActionError(`Failed to approve workflow step: ${errorMessage(err)}`);
     } finally {
       setBusyId(null);
     }
@@ -120,8 +121,8 @@ export default function WorkflowsPage() {
         const updated = await getWorkflow(id);
         setSelectedWorkflow(updated);
       }
-    } catch (err: any) {
-      setActionError(`Failed to cancel workflow: ${err.message}`);
+    } catch (err) {
+      setActionError(`Failed to cancel workflow: ${errorMessage(err)}`);
     } finally {
       setBusyId(null);
     }
@@ -165,8 +166,8 @@ export default function WorkflowsPage() {
       setCreateModalOpen(false);
       refreshWorkflows();
       setSelectedWorkflow(created);
-    } catch (err: any) {
-      setCreateError(`Failed to create workflow: ${err.message}`);
+    } catch (err) {
+      setCreateError(`Failed to create workflow: ${errorMessage(err)}`);
     } finally {
       setCreating(false);
     }

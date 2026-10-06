@@ -7,7 +7,7 @@ constraints (e.g. {"date": "2026-09-16", "start_time": "18:00", "timezone": ...}
 from __future__ import annotations
 
 import re
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -56,7 +56,7 @@ class DateTimeNormalizer:
         try:
             tz = ZoneInfo(tz_str)
         except Exception:
-            tz = timezone.utc
+            tz = UTC
             tz_str = "UTC"
 
         now = reference_time or datetime.now(tz)

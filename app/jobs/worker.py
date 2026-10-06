@@ -23,7 +23,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.jobs.models import Job, JobState
+from app.jobs.models import Job
 from app.jobs.queue import JobQueue
 from app.observability import JOB_OUTCOMES, JOB_QUEUE_DEPTH
 
@@ -105,7 +105,7 @@ class JobWorker:
         self,
         *,
         queue: JobQueue,
-        registry: "JobRegistry",
+        registry: JobRegistry,
         kinds: list[str] | None = None,
         poll_interval_seconds: float = 1.0,
         batch_size: int = 5,
@@ -170,7 +170,7 @@ class JobWorker:
             return
         try:
             await asyncio.wait_for(self._task, timeout=drain_seconds)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
+        except (TimeoutError, asyncio.CancelledError):
             self._task.cancel()
             try:
                 await self._task
@@ -254,7 +254,7 @@ class JobWorker:
 
         try:
             await asyncio.wait_for(handler(job), timeout=self._job_timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._failed += 1
             self._breaker.record_failure()
             await self._queue.fail(

@@ -208,7 +208,7 @@ def test_identity_reset_refuses_without_yes() -> None:
             "-m",
             "scripts.reset_local_identity",
             "--database-url",
-            "postgresql+asyncpg://nexus:nexus@localhost:5433/nexus",
+            "postgresql+asyncpg://nexus@localhost:5433/nexus",
         ],
         cwd=NEXUS_ROOT,
         capture_output=True,

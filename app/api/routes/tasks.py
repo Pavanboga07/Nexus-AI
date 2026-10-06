@@ -95,7 +95,7 @@ async def list_tasks(
 ) -> TaskListResponse:
     owner_id = await _owner_id(request)
     tasks = await a2a_service.list_tasks(owner_id, status=status, limit=limit)
-    items = [TaskOut(**t.to_dict()) for t in tasks]  # type: ignore[arg-type]
+    items = [TaskOut(**t.to_dict()) for t in tasks]
     return TaskListResponse(tasks=items, total=len(items))
 
 
@@ -120,7 +120,7 @@ async def get_task(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Task not found."
         )
-    return TaskOut(**task.to_dict())  # type: ignore[arg-type]
+    return TaskOut(**task.to_dict())
 
 
 @router.post(

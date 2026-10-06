@@ -3,19 +3,13 @@
 from __future__ import annotations
 
 import re
-import uuid
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
 from app.autonomy.models import (
     ActionType,
-    ApprovalStatus,
     AutonomyMode,
-    DecisionResult,
-    RiskLevel,
-    RunStatus,
-    TriggerType,
 )
 
 SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")

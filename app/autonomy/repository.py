@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import uuid
-from typing import Sequence
+from collections.abc import Sequence
 
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -16,7 +16,6 @@ from app.autonomy.models import (
     AutonomyDecision,
     AutonomyMode,
     AutonomyRun,
-    AutonomyTrigger,
     RunStatus,
 )
 

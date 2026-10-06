@@ -233,8 +233,9 @@ async def directory_search(
     query = q.strip()
     results: list[dict] = []
 
-    import httpx
     from urllib.parse import quote
+
+    import httpx
 
     # Every outbound call in this codebase goes through validate_endpoint();
     # this route previously interpolated raw user input into the URL and

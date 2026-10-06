@@ -8,7 +8,6 @@ can be swapped without touching the agent runtime.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any
 
 # A chat message in the OpenAI-style shape: {"role": ..., "content": ...}.
 Message = dict[str, str]

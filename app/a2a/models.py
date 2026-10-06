@@ -13,7 +13,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Integer, JSON, String, Text, UniqueConstraint, func
+from sqlalchemy import JSON, DateTime, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 

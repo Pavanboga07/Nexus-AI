@@ -1198,9 +1198,11 @@ def test_a4_workflow_resume_callback_wired_in_main():
 
     from app import main as main_module
 
-    src = inspect.getsource(main_module.lifespan)
+    src = inspect.getsource(main_module.build_workflows)
     assert "register_task_completion_callback" in src
     assert "workflow_service.handle_task_completion" in src
+    # And lifespan still builds workflows at startup.
+    assert "build_workflows(" in inspect.getsource(main_module.lifespan)
 
 
 @pytest.mark.asyncio

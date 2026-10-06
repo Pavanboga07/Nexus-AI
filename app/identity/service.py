@@ -29,12 +29,11 @@ import base64
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.database.models import Owner
 from app.identity import crypto
 from app.identity.models import (
     ACTIVE,
@@ -43,6 +42,7 @@ from app.identity.models import (
     Agent,
     AgentKey,
 )
+from app.identity.serialization import canonical_json_bytes
 
 logger = logging.getLogger("nexus.identity")
 
@@ -263,7 +263,7 @@ class IdentityService:
             agent = await self._require_agent(session, owner_id, agent_row_id)
             agent.status = status
             if status == REVOKED:
-                now = datetime.now(timezone.utc)
+                now = datetime.now(UTC)
                 for key in (
                     await session.execute(
                         select(AgentKey).where(AgentKey.agent_row_id == agent.id)
@@ -339,7 +339,7 @@ class IdentityService:
                     "Cannot rotate the key of a revoked agent."
                 )
 
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             cutoff = now + timedelta(seconds=overlap_seconds)
 
             # Retire the current key at the end of the overlap window.
@@ -391,7 +391,7 @@ class IdentityService:
             ).scalar_one_or_none()
             if key is None:
                 raise AgentNotFoundError(f"No key {agent_id} for this agent.")
-            key.revoked_at = datetime.now(timezone.utc)
+            key.revoked_at = datetime.now(UTC)
             key.revoked_reason = reason
             await session.commit()
             logger.warning("agent_key_revoked agent_id=%s reason=%s", agent_id, reason)
@@ -519,8 +519,6 @@ class IdentityService:
     async def sign_json(
         self, payload: object, *, agent_row_id: uuid.UUID | None = None
     ) -> bytes:
-        from app.identity.serialization import canonical_json_bytes
-
         return await self.sign(canonical_json_bytes(payload), agent_row_id=agent_row_id)
 
     async def verify(
@@ -541,7 +539,7 @@ class IdentityService:
         Receivers use this to reject signatures from revoked keys while still
         accepting signatures produced during a key's validity window.
         """
-        when = when or datetime.now(timezone.utc)
+        when = when or datetime.now(UTC)
         async with self._session_factory() as session:
             key = (
                 await session.execute(
@@ -578,7 +576,7 @@ class IdentityService:
                 crypto.private_key_bytes(private_key), self._secret or ""
             ),
             key_algorithm=crypto.KEY_ALGORITHM,
-            not_before=datetime.now(timezone.utc),
+            not_before=datetime.now(UTC),
         )
 
     async def _require_agent(
@@ -644,7 +642,7 @@ class IdentityService:
     def _assert_key_usable(self, key: AgentKey) -> None:
         if key.revoked_at is not None:
             raise AgentNotUsableError("This key has been revoked and cannot sign.")
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         if not key.is_usable_at(now):
             raise AgentNotUsableError("This key is outside its validity window.")
 

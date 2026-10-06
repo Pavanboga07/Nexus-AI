@@ -7,7 +7,7 @@ read method anywhere in this class.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -106,7 +106,7 @@ class PolicyRepository:
         Consents never use wildcards, so matching is equality on all four
         dimensions. Expired and already-consumed consents never match.
         """
-        now = now or datetime.now(timezone.utc)
+        now = now or datetime.now(UTC)
         result = await session.execute(
             select(Consent)
             .where(
@@ -144,7 +144,7 @@ class PolicyRepository:
                 Consent.owner_id == owner_id,
                 Consent.used_at.is_(None),
             )
-            .values(used_at=datetime.now(timezone.utc))
+            .values(used_at=datetime.now(UTC))
         )
         return bool(result.rowcount)
 

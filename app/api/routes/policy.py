@@ -40,12 +40,12 @@ async def _owner_id(request: Request) -> uuid.UUID:
 
 def _policy_out(policy) -> PolicyOut:
     data = policy.to_dict()
-    return PolicyOut(**data)  # type: ignore[arg-type]
+    return PolicyOut(**data)
 
 
 def _consent_out(consent) -> ConsentOut:
     data = consent.to_dict()
-    return ConsentOut(**data)  # type: ignore[arg-type]
+    return ConsentOut(**data)
 
 
 @router.get(
@@ -233,7 +233,7 @@ async def evaluate_policy(
             resource_id=payload.resource_id,
         ),
     )
-    return PolicyEvaluateResponse(**result.to_dict())  # type: ignore[arg-type]
+    return PolicyEvaluateResponse(**result.to_dict())
 
 
 @router.get(

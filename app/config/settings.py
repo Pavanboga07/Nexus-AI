@@ -87,7 +87,7 @@ class Settings(BaseSettings):
     )
 
     # --- Database (Part 2) ------------------------------------------------
-    database_url: str = "postgresql+asyncpg://nexus:nexus@localhost:5433/nexus"
+    database_url: str = "postgresql+asyncpg://nexus@localhost:5433/nexus"  # No credentials: local compose uses trust auth (dev only).
     nexus_db_echo: bool = False
 
     # --- Embeddings (Part 2) ----------------------------------------------
@@ -109,6 +109,10 @@ class Settings(BaseSettings):
     # Memories whose cosine similarity to an existing memory exceeds this are
     # treated as duplicates (update instead of insert).
     nexus_memory_dedup_threshold: float = Field(default=0.92, gt=0, le=1)
+    # Retention for EPISODIC memories only (events age out; semantic and
+    # relationship memories are never reaped). Drives the periodic retention
+    # task started in app.main.lifespan. 0/unset disables retention entirely.
+    nexus_memory_episodic_retention_days: int = Field(default=0, ge=0)
 
     # --- Identity (Part 3) ---------------------------------------------------
     # Secret used to encrypt the agent's Ed25519 private key at rest. Generate

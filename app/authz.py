@@ -89,11 +89,11 @@ class Requester:
     agent_id: str
 
     @classmethod
-    def remote(cls, agent_id: str) -> "Requester":
+    def remote(cls, agent_id: str) -> Requester:
         return cls(agent_id=agent_id)
 
     @classmethod
-    def local(cls) -> "Requester":
+    def local(cls) -> Requester:
         return cls(agent_id=cls.SELF)
 
 

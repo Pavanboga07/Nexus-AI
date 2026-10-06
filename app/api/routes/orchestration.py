@@ -4,15 +4,12 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.agent import NexusAgent
 from app.api.auth_context import request_owner_id
 from app.api.dependencies import get_agent, get_orchestrator
-from app.orchestration.models import OrchestrationRun
 from app.orchestration.orchestrator import AgentOrchestrator
 from app.orchestration.repository import ContactRepository, OrchestrationRunRepository
 from app.orchestration.schemas import (

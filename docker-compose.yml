@@ -4,8 +4,16 @@ services:
     container_name: nexus_postgres
     environment:
       POSTGRES_USER: nexus
-      POSTGRES_PASSWORD: nexus
       POSTGRES_DB: nexus
+      # Trust auth for LOCAL DEVELOPMENT ONLY. No password is committed or
+      # required: the container only listens on the host's loopback via the
+      # port mapping below. Do not use trust auth on a shared/networked host.
+      # If you switch to password auth, set POSTGRES_PASSWORD from your own
+      # .env - never commit a password here.
+      # NOTE: if you already have a `nexus_pgdata` volume created with the old
+      # password-auth config, pg_hba.conf lives inside the volume: run
+      # `docker compose down -v` (destroys local dev data) to pick this up.
+      POSTGRES_HOST_AUTH_METHOD: trust
     ports:
       # 5432 on the host is already used by another project; Nexus uses 5433.
       - "5433:5432"

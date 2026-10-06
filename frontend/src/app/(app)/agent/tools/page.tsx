@@ -13,7 +13,7 @@ import {
   getToolAudit,
   ToolAuditEntry,
 } from "@/lib/api/tools";
-import { ToolInfo } from "@/types/api";
+import { ToolInfo, ToolExecuteResponse } from "@/types/api";
 import { formatDate } from "@/lib/utils";
 import {
   Wrench,
@@ -21,6 +21,7 @@ import {
   RefreshCw,
   Activity,
 } from "lucide-react";
+import { errorMessage } from "@/lib/api/client";
 
 export default function ToolsPage() {
   // The two sources load together; a total failure throws so the page shows
@@ -58,7 +59,9 @@ export default function ToolsPage() {
   const [selectedTool, setSelectedTool] = useState<ToolInfo | null>(null);
   const [paramInput, setParamInput] = useState("{}");
   const [executing, setExecuting] = useState(false);
-  const [execResult, setExecResult] = useState<any>(null);
+  const [execResult, setExecResult] = useState<
+    ToolExecuteResponse | { success: boolean; error: string } | null
+  >(null);
   /** JSON/validation failures render inside the modal, not in a native dialog. */
   const [execError, setExecError] = useState<string | null>(null);
 
@@ -107,10 +110,10 @@ export default function ToolsPage() {
       setExecResult(res);
       // Refresh the audit trail behind the modal.
       reload();
-    } catch (err: any) {
+    } catch (err) {
       setExecResult({
         success: false,
-        error: err.message || "Execution error",
+        error: errorMessage(err) || "Execution error",
       });
     } finally {
       setExecuting(false);

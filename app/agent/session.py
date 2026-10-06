@@ -17,7 +17,7 @@ import logging
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from app.llm.base import Message
 
@@ -50,8 +50,8 @@ class Session:
     session_id: str
     owner_id: uuid.UUID | None = None
     messages: list[Message] = field(default_factory=list)
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def append(self, role: str, content: str) -> Message:
         """Append a message and return it."""
@@ -59,7 +59,7 @@ class Session:
             raise ValueError(f"Invalid role: {role!r}")
         message: Message = {"role": role, "content": content}
         self.messages.append(message)
-        self.updated_at = datetime.now(timezone.utc)
+        self.updated_at = datetime.now(UTC)
         return message
 
     def trim(self, max_messages: int) -> None:
@@ -157,7 +157,7 @@ class InMemorySessionStore(SessionStore):
             if session is None:
                 raise SessionNotFoundError(session_id)
             session.messages.clear()
-            session.updated_at = datetime.now(timezone.utc)
+            session.updated_at = datetime.now(UTC)
         logger.info("session_cleared session_id=%s", session_id)
         return session
 

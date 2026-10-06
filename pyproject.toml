@@ -1,0 +1,44 @@
+[project]
+name = "nexus"
+version = "0.1.0"
+description = "Nexus Runtime - a personal AI agent core"
+requires-python = ">=3.11"
+
+[tool.ruff]
+# Lint + format gate (audit N7). Run: `ruff check app/` / `ruff format --check app/`
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "F",      # pyflakes: unused imports/variables, undefined names
+    "E4", "E7", "E9",  # pycodestyle errors (syntax-adjacent)
+    "W",      # pycodestyle warnings
+    "I",      # isort: import sorting
+    "B",      # flake8-bugbear: likely bugs
+    "UP",     # pyupgrade: modern syntax
+    "ASYNC",  # flake8-async
+    "S",      # flake8-bandit: security (non-blocking; review hits)
+    "BLE",    # flake8-blind-except (non-blocking; review hits)
+]
+ignore = [
+    "S101",   # assert usage is fine in this codebase (tests + invariants)
+    "BLE001", # blind-except is used deliberately with logging; keep the noqa habit
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app", "tests", "scripts"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+# Lenient baseline (audit N7): catch the cheap, obvious issues without
+# going down a strict-mode rabbit hole.
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = true
+# The codebase is not annotated end-to-end; only check bodies of annotated
+# functions so unannotated code doesn't drown the signal.
+check_untyped_defs = false
+disallow_untyped_defs = false

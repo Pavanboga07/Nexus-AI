@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
@@ -98,7 +98,7 @@ class TaskRepository:
                 found.negotiation_round = task.negotiation_round
             if task.expires_at is not None:
                 found.expires_at = task.expires_at
-            found.updated_at = datetime.now(timezone.utc)
+            found.updated_at = datetime.now(UTC)
             await session.flush()
             return found
         if task.negotiation_round is None:
@@ -153,7 +153,7 @@ class TaskRepository:
             task.failure_reason = failure_reason
         if completed_at is not None:
             task.completed_at = completed_at
-        task.updated_at = datetime.now(timezone.utc)
+        task.updated_at = datetime.now(UTC)
         await session.flush()
         return task
 
@@ -215,7 +215,7 @@ class TrustedAgentCardRepository:
         if not include_expired:
             stmt = stmt.where(
                 (TrustedAgentCard.card_expires_at.is_(None))
-                | (TrustedAgentCard.card_expires_at > datetime.now(timezone.utc))
+                | (TrustedAgentCard.card_expires_at > datetime.now(UTC))
             )
         stmt = stmt.order_by(TrustedAgentCard.verified_at.desc()).limit(limit)
         result = await session.execute(stmt)
@@ -274,7 +274,7 @@ class MessageRecordRepository:
         record.status = status
         record.policy_decision = policy_decision
         record.error_code = error_code
-        record.processed_at = datetime.now(timezone.utc)
+        record.processed_at = datetime.now(UTC)
         await session.flush()
         return record
 

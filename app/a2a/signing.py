@@ -12,6 +12,7 @@ import base64
 
 from app.a2a.schemas import A2AEnvelope
 from app.identity import crypto
+from app.identity.serialization import canonical_json_bytes
 from app.identity.service import IdentityService
 
 
@@ -71,8 +72,6 @@ async def sign_card(
     The signature covers the canonical JSON of the card EXCLUDING the
     ``signature`` field, using the same serializer as A2A envelopes.
     """
-    from app.identity.serialization import canonical_json_bytes
-
     unsigned = {k: v for k, v in card.items() if k != "signature"}
     canonical = canonical_json_bytes(unsigned)
     signature = await identity_service.sign(canonical)
@@ -87,8 +86,6 @@ def verify_card_signature(card: dict, public_key_b64: str) -> bool:
 
     Returns False for any malformed input - never raises.
     """
-    from app.identity.serialization import canonical_json_bytes
-
     signature_b64 = card.get("signature")
     if not signature_b64 or not public_key_b64:
         return False

@@ -13,13 +13,15 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
-from typing import Any, Sequence
+from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.autonomy.repository import AutonomyRunRepository
+from app.autonomy.run_status import RunStatus
 from app.jobs.queue import JobQueue
-from app.policy.engine import EvaluationRequest
 from app.policy.models import PolicyDecision
 from app.policy.service import PolicyService
 from app.schemas.workflows import WorkflowStepSpec
@@ -29,7 +31,6 @@ from app.workflows.errors import (
     WorkflowNotFoundError,
 )
 from app.workflows.handlers import (
-    BaseWorkflowStepHandler,
     StepResult,
     WorkflowStepContext,
     WorkflowStepHandlerRegistry,
@@ -52,7 +53,7 @@ logger = logging.getLogger("nexus.workflows.service")
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class WorkflowService:
@@ -598,10 +599,6 @@ class WorkflowService:
             return wf
 
     async def _sync_linked_runs(self, workflow_id: uuid.UUID) -> None:
-        # Local import: autonomy->workflows is the established direction, so keep this workflows->autonomy edge deferred to avoid a top-level cycle.
-        from app.autonomy.models import RunStatus
-        from app.autonomy.repository import AutonomyRunRepository
-
         async with self._session_factory() as session:
             wf = await self._repo.get(session, workflow_id)
             if wf is None:

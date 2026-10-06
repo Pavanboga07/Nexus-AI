@@ -10,7 +10,33 @@ export class ApiError extends Error {
   }
 }
 
-const BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const BASE_URL = ((): string => {
+  const url = process.env.NEXT_PUBLIC_API_URL;
+  if (!url) {
+    if (process.env.NODE_ENV === "production") {
+      // Fail fast: a production build without the API URL would silently
+      // talk to localhost and fail in confusing ways.
+      throw new Error(
+        "NEXT_PUBLIC_API_URL is not set. Set it to your API origin " +
+          "(e.g. https://api.example.com); refusing to silently fall back " +
+          "to localhost in a production build."
+      );
+    }
+    return "http://localhost:8000";
+  }
+  return url;
+})();
+
+/** Human-readable message from anything caught: Error, ApiError, or junk. */
+export function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message || err.name || "Unknown error";
+  if (typeof err === "string") return err;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return "Unknown error";
+  }
+}
 
 export async function apiFetch<T>(
   endpoint: string,

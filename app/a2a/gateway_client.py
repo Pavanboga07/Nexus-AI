@@ -18,14 +18,15 @@ import base64
 import json
 import logging
 import uuid
-from typing import Any, Callable, Coroutine
+from collections.abc import Callable, Coroutine
+from typing import Any
 
 import websockets
 
 try:
     from websockets.asyncio.client import ClientConnection as WSClient
 except ImportError:
-    from websockets.client import WebSocketClientProtocol as WSClient  # type: ignore
+    from websockets.client import WebSocketClientProtocol as WSClient
 
 from app.a2a.errors import A2AError, A2AErrorCode
 from app.a2a.schemas import A2AEnvelope
@@ -293,14 +294,14 @@ class GatewayClient:
                 if task_id in self._pending_responses:
                     self._pending_responses.pop(task_id, None)
                 return {"status": "queued", "relay_id": relay_id}
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("Timed out waiting for delivery_ack (relay_id=%s)", relay_id)
             self._pending_acks.pop(relay_id, None)
 
         # Wait for the response envelope from remote agent
         try:
             return await asyncio.wait_for(resp_fut, timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._pending_responses.pop(task_id, None)
             raise A2AError(
                 A2AErrorCode.TRANSPORT_ERROR,

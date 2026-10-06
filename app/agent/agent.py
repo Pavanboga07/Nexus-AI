@@ -31,7 +31,10 @@ from typing import TYPE_CHECKING
 
 from app.agent.context import ContextBuilder
 from app.agent.session import Session, SessionStore
+from app.database.session_store import DatabaseSessionStore
 from app.llm.base import LLMProvider
+from app.memory.extractor import MemoryExtractor
+from app.tools.schemas import ToolInvocation
 
 if TYPE_CHECKING:
     from app.memory.manager import MemoryManager
@@ -86,7 +89,7 @@ class NexusAgent:
     # the collaborators this agent is willing to share are exposed explicitly.
 
     @property
-    def memory(self) -> "MemoryManager | None":
+    def memory(self) -> MemoryManager | None:
         """The agent's memory manager, or None when memory is disabled."""
         return self._memory
 
@@ -116,8 +119,6 @@ class NexusAgent:
         Public in M5: route/service code used to call ``agent._owner_id()``,
         reaching into private state.
         """
-        from app.database.session_store import DatabaseSessionStore
-
         if isinstance(self._sessions, DatabaseSessionStore):
             return await self._sessions.fallback_owner_id()
         # Non-DB stores (tests, Part 1 fallback) have no owner concept; use a
@@ -208,8 +209,6 @@ class NexusAgent:
         async def _executor(
             name: str, arguments: dict
         ) -> dict[str, object]:
-            from app.tools.schemas import ToolInvocation
-
             try:
                 result = await tool_service.execute(
                     owner_id,
@@ -300,7 +299,10 @@ class NexusAgent:
             )
         )
         # Keep a reference so the task isn't garbage-collected mid-flight.
-        self._background_tasks = getattr(self, "_background_tasks", set())
+        background_tasks: set[asyncio.Task[None]] = getattr(
+            self, "_background_tasks", set()
+        )
+        self._background_tasks = background_tasks
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
@@ -311,8 +313,6 @@ class NexusAgent:
         user_message: str,
         assistant_message: str,
     ) -> None:
-        from app.memory.extractor import MemoryExtractor
-
         try:
             extractor = MemoryExtractor(provider=self._provider)
             candidates = await extractor.extract(user_message, assistant_message)
@@ -374,7 +374,7 @@ class NexusAgent:
 
     async def aclose(self) -> None:
         # Let in-flight background extraction finish (bounded by provider timeout).
-        tasks = getattr(self, "_background_tasks", set())
+        tasks: set[asyncio.Task[None]] = getattr(self, "_background_tasks", set())
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         await self._provider.aclose()

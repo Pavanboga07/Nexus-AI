@@ -7,8 +7,8 @@ One engine per process; sessions are handed out via the async context manager
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
 
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,

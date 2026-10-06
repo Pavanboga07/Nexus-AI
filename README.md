@@ -1,11 +1,14 @@
 # Nexus Runtime
 
 A personal AI agent system, built in parts. **This repository currently
-contains Part 1 (Personal Agent Core), Part 2 (Persistent Personal Memory),
-Part 3 (Cryptographic Agent Identity), Part 4 (Policy, Consent &
-Minimum-Disclosure Engine), Part 5 (MCP-Compatible Tool System), Part 6
-(Secure Agent-to-Agent Communication), Part 7 (Agent Discovery & Agent Cards),
-and Part 8 (Agent Task Delegation & Negotiation). Parts 1–8 complete.**
+contains Parts 1–10 (Personal Agent Core through Controlled Autonomy),
+Part 12 (Natural-Language Orchestration), Part 13 (Integration & Real-Network
+Orchestration), Part 14 (Gateway-Centered Discovery), the Phase A–D work
+streams (workflow engine, frontend product, ops hardening, web search), the
+M0–M11 audit-driven hardening milestones, and the Next.js frontend.** (Part 11
+is the Nexus Gateway relay itself — a separate service; this repo ships the
+gateway client, the directory protocol, and the A2A transport that talks to
+it.)
 
 Nexus is not "a wrapper around OpenAI". It is an agent runtime that *owns*
 session state, conversation flow, configuration, and orchestration, and treats
@@ -532,7 +535,7 @@ docker-compose.yml           # pgvector/pgvector:pg16 on host port 5433
    docker compose up -d
    ```
 
-   Host port **5433** (5432 is often taken); credentials `nexus:nexus`,
+   Host port **5433** (5432 is often taken); no password (local trust auth),
    database `nexus`. Data persists in the `nexus_nexus_pgdata` volume.
 
 2. **Configure `.env`** (see `.env.example`): set `DATABASE_URL`, and pick an
@@ -1219,7 +1222,7 @@ Comprehensive test suite in `tests/test_workflows.py`:
 # Run Part 9 workflow tests
 python -m pytest tests/test_workflows.py -v
 
-# Run full regression suite (399 tests)
+# Run full regression suite (~750 tests)
 python -m pytest -q
 ```
 
@@ -1338,7 +1341,7 @@ Part 10 introduces **controlled autonomy** to the Nexus Personal AI Network. Nex
 # Run Part 10 comprehensive autonomy test suite
 python -m pytest tests/test_part10_autonomy.py -v
 
-# Run full project regression suite across Parts 1–10 (414 tests)
+# Run full project regression suite (~750 tests)
 python -m pytest -q
 
 # Run end-to-end standalone demo showcasing all 5 autonomy scenarios
@@ -1347,5 +1350,40 @@ python demo_part10_autonomy.py
 
 ---
 
-**Parts 1–10 and Frontend complete.**
+## 13. What Parts 12–14 implement
+
+**Part 12 — Natural-Language Orchestration.** Free-text requests ("ask Rahul
+if he's free tomorrow") are converted into agent actions via an LLM intent
+resolver plus fuzzy target matching. Gated behind `NEXUS_ORCHESTRATION_ENABLED`
+(decision D5): OFF by default, because a wrong guess is acted upon silently.
+Explicit asks and the workflow API work without it.
+
+**Part 13 — Integration & Real-Network Orchestration.** Two-device
+coordination over the real network with gateway-preferred transport:
+WebSocket sessions, inbound response correlation by `task_id` across
+asynchronous boundaries. See `demo_part13_network.py`.
+
+**Part 14 — Gateway-Centered Discovery & Identity.** Agent discovery through
+the gateway directory: exact agent-ID lookup, card verification (schema,
+fingerprint, Ed25519 signature, time window), and display-name/handle
+resolution. See `demo_part14_gateway_discovery.py`.
+
+## 14. Phases A–D and milestones M0–M11
+
+**Phases** are cross-cutting work streams (plans in `docs/plans/`):
+A — workflow engine, B — frontend product, C — ops hardening, D — web search
+(DuckDuckGo keyless default, Tavily optional; SSRF-guarded fetch).
+
+**Milestones M0–M11** are audit-driven hardening milestones, each with a
+regression suite in `tests/test_m<N>_*.py`: M0 security/correctness fixes, M1
+trustworthy discovery, M3 authenticated API, M4 multi-agent identity, M5
+error-envelope consistency, M6 protocol 0.2 + capability contracts, M7
+durable jobs, M8 memory retention/scoping, M9 protocol conformance vectors,
+M10 frontend contract, M11 operations (observability, DR runbook, load).
+
+---
+
+**Parts 1–10, 12–14, Phases A–D, milestones M0–M11, and the frontend are
+complete.** (Part 11 is the external Nexus Gateway relay; this repo ships its
+client and protocol support.)
 

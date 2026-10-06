@@ -405,9 +405,10 @@ def test_app_registers_handlers_and_starts_the_worker() -> None:
     """Wiring: the worker must actually be started and drained."""
     import app.main as main_module
 
-    src = inspect.getsource(main_module.lifespan)
+    src = inspect.getsource(main_module.build_jobs)
     assert "JobWorker" in src
     assert "job_worker.start()" in src
-    assert "job_worker.stop()" in src
     # Handler registration is explicit, not implicit by convention.
     assert "registry.register(" in src
+    # Shutdown still drains the worker.
+    assert "job_worker.stop()" in inspect.getsource(main_module.lifespan)

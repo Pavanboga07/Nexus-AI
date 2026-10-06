@@ -11,7 +11,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -58,7 +58,7 @@ class SessionOrchestrationContext:
     last_run_id: str | None = None
     last_intent_type: str | None = None
     pending_approval: dict[str, Any] | None = None
-    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 class OrchestrationContextManager:
@@ -156,7 +156,7 @@ class OrchestrationContextManager:
         ctx.active_target = target_name
         if agent_id:
             ctx.active_agent_id = agent_id
-        ctx.updated_at = datetime.now(timezone.utc)
+        ctx.updated_at = datetime.now(UTC)
 
         if self._session_factory is None or owner_id is None:
             return AwaitableNone(None)
@@ -213,7 +213,7 @@ class OrchestrationContextManager:
         ctx.last_proposed_time = proposed_time
         if task_id:
             ctx.last_task_id = task_id
-        ctx.updated_at = datetime.now(timezone.utc)
+        ctx.updated_at = datetime.now(UTC)
 
         if self._session_factory is None or owner_id is None:
             return AwaitableNone(None)
@@ -258,7 +258,7 @@ class OrchestrationContextManager:
 
         ctx = self.get_context_sync(session_id)
         ctx.pending_approval = approval_data
-        ctx.updated_at = datetime.now(timezone.utc)
+        ctx.updated_at = datetime.now(UTC)
 
         if self._session_factory is None or owner_id is None:
             return AwaitableNone(None)

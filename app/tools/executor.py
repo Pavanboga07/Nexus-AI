@@ -61,7 +61,7 @@ async def run_with_guards(
         raw_result = await asyncio.wait_for(
             tool.execute(arguments, context), timeout=timeout_seconds
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         raise ToolError(
             ToolErrorCode.TIMEOUT,
             f"Tool {tool.name} exceeded the {timeout_seconds:g}s limit.",

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Sequence
+from collections.abc import Sequence
+from datetime import UTC, datetime
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -18,7 +19,6 @@ from app.autonomy.errors import (
 from app.autonomy.executor import AutonomyExecutor
 from app.autonomy.models import (
     ApprovalStatus,
-    AutonomyApproval,
     AutonomyConfig,
     AutonomyDecision,
     AutonomyMode,
@@ -40,7 +40,7 @@ logger = logging.getLogger("nexus.autonomy.service")
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class AutonomyService:

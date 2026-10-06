@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import re
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator
@@ -140,17 +140,17 @@ class TraceContext(BaseModel):
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def utc_iso_in(seconds: float) -> str:
-    future = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+    future = datetime.now(UTC) + timedelta(seconds=seconds)
     return future.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def parse_iso(value: str) -> datetime:
     return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
-        tzinfo=timezone.utc
+        tzinfo=UTC
     )
 
 
@@ -245,9 +245,9 @@ class A2AEnvelope(BaseModel):
     # --- 0.2 additions (all optional; default to 0.1 behaviour) ------------
     correlation_id: str | None = None
     reply_to: str | None = None
-    capability: "CapabilityRef | None" = None
-    authorization: "AuthorizationRef | None" = None
-    trace: "TraceContext | None" = None
+    capability: CapabilityRef | None = None
+    authorization: AuthorizationRef | None = None
+    trace: TraceContext | None = None
     # base64 Ed25519 signature over canonical(unsigned envelope); not part
     # of the signed bytes.
     signature: str | None = None

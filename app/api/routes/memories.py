@@ -27,7 +27,7 @@ VALID_MEMORY_TYPES = {"semantic", "episodic", "relationship"}
 
 
 def _memory_out(memory) -> MemoryOut:
-    return MemoryOut(**memory.to_dict())  # type: ignore[arg-type]
+    return MemoryOut(**memory.to_dict())
 
 
 async def _owner_id(request: Request) -> uuid.UUID:

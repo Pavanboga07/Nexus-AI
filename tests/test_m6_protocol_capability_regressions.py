@@ -359,9 +359,11 @@ def test_orchestration_is_disabled_by_default() -> None:
 def test_startup_logs_and_skips_orchestration_when_disabled() -> None:
     import app.main as main_module
 
-    src = inspect.getsource(main_module.lifespan)
+    src = inspect.getsource(main_module.build_orchestration)
     assert "nexus_orchestration_enabled" in src
     assert "orchestration_disabled" in src
+    # And lifespan still invokes the builder at startup.
+    assert "build_orchestration(" in inspect.getsource(main_module.lifespan)
 
 
 def test_disabling_orchestration_does_not_remove_the_api() -> None:

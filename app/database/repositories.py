@@ -7,7 +7,7 @@ the app builds queries. Owner scoping is enforced here, not by callers.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -281,7 +281,7 @@ class MemoryRepository:
         rows = [(row[0], float(row[1])) for row in result.all()]
 
         # Lifecycle: record retrieval for future memory management.
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         for memory, _sim in rows:
             memory.last_accessed_at = now
         await session.flush()

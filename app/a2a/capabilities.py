@@ -111,7 +111,7 @@ class CapabilitySpec:
         }
 
     @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> "CapabilitySpec":
+    def from_dict(cls, raw: dict[str, Any]) -> CapabilitySpec:
         if not isinstance(raw, dict):
             raise CapabilityValidationError("Capability must be an object.")
         return cls(

@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import random
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import func, or_, select
@@ -84,7 +84,7 @@ class JobQueue:
                     state=JobState.PENDING.value,
                     attempt=0,
                     max_attempts=max(1, int(max_attempts)),
-                    run_after=run_after or datetime.now(timezone.utc),
+                    run_after=run_after or datetime.now(UTC),
                     priority=priority,
                 )
                 # In PostgreSQL a NULL idempotency_key does not conflict, so
@@ -117,7 +117,7 @@ class JobQueue:
         SKIP LOCKED so two workers never claim the same job, and a job whose
         lease has expired (its worker died) becomes claimable again.
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         async with self._session_factory() as session:
             conditions = [
                 Job.state.in_([JobState.PENDING.value, JobState.RUNNING.value]),
@@ -154,7 +154,7 @@ class JobQueue:
             if job is None:
                 return
             job.state = JobState.SUCCEEDED.value
-            job.finished_at = datetime.now(timezone.utc)
+            job.finished_at = datetime.now(UTC)
             job.lease_expires_at = None
             job.claimed_by = None
             job.last_error = None
@@ -177,7 +177,7 @@ class JobQueue:
             history = list(job.error_history or [])
             history.append({"attempt": job.attempt, "error": reason[:300]})
             job.error_history = history[-10:]
-            job.finished_at = datetime.now(timezone.utc)
+            job.finished_at = datetime.now(UTC)
             job.lease_expires_at = None
             job.claimed_by = None
             await session.commit()
@@ -216,7 +216,7 @@ class JobQueue:
 
             if job.attempt >= job.max_attempts:
                 job.state = JobState.DEAD_LETTER.value
-                job.finished_at = datetime.now(timezone.utc)
+                job.finished_at = datetime.now(UTC)
                 job.lease_expires_at = None
                 job.claimed_by = None
                 await session.commit()
@@ -239,7 +239,7 @@ class JobQueue:
                 else compute_backoff_seconds(job.attempt)
             )
             job.state = JobState.PENDING.value
-            job.run_after = datetime.now(timezone.utc) + timedelta(seconds=delay)
+            job.run_after = datetime.now(UTC) + timedelta(seconds=delay)
             job.lease_expires_at = None
             job.claimed_by = None
             await session.commit()
@@ -261,7 +261,7 @@ class JobQueue:
         A worker that died mid-job leaves a RUNNING row with a stale lease;
         without this the row would sit RUNNING for ever.
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         async with self._session_factory() as session:
             jobs = list(
                 (
@@ -298,7 +298,7 @@ class JobQueue:
             .select_from(Job)
             .where(
                 Job.state == JobState.PENDING.value,
-                Job.run_after <= datetime.now(timezone.utc),
+                Job.run_after <= datetime.now(UTC),
             )
         )
         if kinds:

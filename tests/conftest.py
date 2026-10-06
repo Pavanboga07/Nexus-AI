@@ -44,7 +44,7 @@ from app.main import create_app
 from app.memory.embeddings import LocalHashEmbeddingProvider
 from app.memory.manager import MemoryManager
 
-TEST_DATABASE_URL = "postgresql+asyncpg://nexus:nexus@localhost:5433/nexus_test"
+TEST_DATABASE_URL = "postgresql+asyncpg://nexus@localhost:5433/nexus_test"
 
 
 class FakeProvider(LLMProvider):
@@ -125,7 +125,7 @@ async def db_engine() -> AsyncIterator[AsyncEngine | None]:
     the real database separately), and drops everything on session end.
     """
     admin_engine = create_engine(
-        "postgresql+asyncpg://nexus:nexus@localhost:5433/nexus"
+        "postgresql+asyncpg://nexus@localhost:5433/nexus"
     )
     try:
         async with admin_engine.connect() as conn:

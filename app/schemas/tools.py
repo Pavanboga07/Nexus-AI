@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
-
-import re
 
 _TOOL_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _SLUG_PATTERN = re.compile(r"^[a-z0-9:_\-.]{1,64}$")
