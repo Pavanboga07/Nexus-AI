@@ -17,44 +17,53 @@ layer never constructs domain objects itself.
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 import logging
+import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import Any
 
 from fastapi import Depends, FastAPI, Request
-from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app import __version__
+from app.a2a.rate_limit import SlidingWindowRateLimiter
+from app.a2a.service import A2AService
+from app.a2a.transport import A2ATransport, HttpA2ATransport
 from app.agent.agent import NexusAgent
 from app.agent.context import ContextBuilder
 from app.agent.session import InMemorySessionStore, SessionStore
 from app.api.auth_context import get_request_context
 from app.api.dependencies import HTTPDependencyError
+from app.api.middleware import MetricsMiddleware, TraceMiddleware
+from app.api.readiness import build_system_router, reset_readiness_cache
 from app.api.routes.a2a import router as a2a_router
 from app.api.routes.agents import router as agents_router
 from app.api.routes.auth import router as auth_router
-from app.api.middleware import MetricsMiddleware, TraceMiddleware
-from app.api.readiness import build_system_router, reset_readiness_cache
+from app.api.routes.autonomy import router as autonomy_router
 from app.api.routes.chat import router as chat_router
-from app.api.routes.system import router as system_router
 from app.api.routes.discovery import router as discovery_router
 from app.api.routes.identity import router as identity_router
 from app.api.routes.memories import router as memories_router
+from app.api.routes.orchestration import router as orchestration_router
 from app.api.routes.policy import router as policy_router
+from app.api.routes.system import router as system_router
 from app.api.routes.tasks import router as tasks_router
 from app.api.routes.tools import router as tools_router
 from app.api.routes.workflows import router as workflows_router
-from app.api.routes.autonomy import router as autonomy_router
-from app.api.routes.orchestration import router as orchestration_router
-from app.a2a.rate_limit import SlidingWindowRateLimiter
-from app.a2a.service import A2AService
-from app.a2a.transport import HttpA2ATransport
 from app.auth.service import AuthService
 from app.config.settings import Settings, get_settings
+from app.database.connection import (
+    create_engine,
+    create_session_factory,
+)
+from app.database.session_store import DatabaseSessionStore
 from app.errors import (
     CODE_BAD_REQUEST,
     CODE_CONFLICT,
@@ -74,11 +83,6 @@ from app.errors import (
     NexusError,
     ValidationError,
 )
-from app.database.connection import (
-    create_engine,
-    create_session_factory,
-)
-from app.database.session_store import DatabaseSessionStore
 from app.identity.bound import AgentIdentity
 from app.identity.service import IdentityCorruptionError, IdentityService
 from app.llm import build_provider
@@ -86,18 +90,14 @@ from app.memory.embeddings import build_embedding_provider
 from app.memory.manager import MemoryManager
 from app.observability import configure_structured_logging
 from app.policy.service import PolicyService
+from app.search.fetch import aclose_fetcher
 from app.tools.builtin import BUILTIN_TOOLS
 from app.tools.registry import ToolRegistry
 from app.tools.service import ToolService
-from app.search.fetch import aclose_fetcher
 
 #: Maps a framework HTTP status onto the shared error-code vocabulary, so a
 #: route's `raise HTTPException(404)` produces the same envelope (and the same
 #: machine-readable code) as a domain `NotFoundError`.
-#:
-#: Every value is a declared constant from `app.errors`. Inlining the strings
-#: here let the map name four codes that existed nowhere else in the codebase -
-#: a client switching on `error.code` would have had to guess them.
 _HTTP_STATUS_TO_CODE = {
     400: CODE_BAD_REQUEST,
     401: CODE_UNAUTHENTICATED,
@@ -196,6 +196,34 @@ def build_agent(
     )
 
 
+async def _memory_retention_loop(
+    memory_manager: MemoryManager, retention_days: int
+) -> None:
+    """Reap expired episodic memories once a day until cancelled."""
+    while True:
+        try:
+            await asyncio.sleep(24 * 3600)
+            removed = await memory_manager.reap_expired(
+                episodic_retention_days=retention_days
+            )
+            logger.info("memory_retention_tick removed=%d", removed)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the loop must survive a bad tick
+            logger.warning("memory_retention_tick_failed detail=%s", exc)
+
+
+def start_memory_retention(
+    settings, memory_manager: MemoryManager | None
+) -> asyncio.Task | None:
+    """Start the daily episodic-memory retention task; None when disabled."""
+    retention_days = settings.nexus_memory_episodic_retention_days
+    if not retention_days or memory_manager is None:
+        return None
+    logger.info("memory_retention_enabled days=%d", retention_days)
+    return asyncio.create_task(_memory_retention_loop(memory_manager, retention_days))
+
+
 async def _try_connect(database_url: str, echo: bool) -> AsyncEngine | None:
     """Create an engine and verify connectivity; None if unreachable.
 
@@ -218,27 +246,34 @@ async def _try_connect(database_url: str, echo: bool) -> AsyncEngine | None:
         return None
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Create the agent on startup and release resources on shutdown."""
-    settings = get_settings()
-    configure_logging(settings)
+@dataclasses.dataclass
+class _IdentityParts:
+    """Everything the identity block produces; threaded into later builders."""
 
-    engine = await _try_connect(settings.database_url, settings.nexus_db_echo)
-    app.state.engine = engine
-    app.state.database_ok = engine is not None
+    session_factory: async_sessionmaker | None
+    identity_service: IdentityService | None
+    primary_identity: AgentIdentity | None
+    owner_id: uuid.UUID | None
 
-    # --- Identity (Part 3, M4 multi-agent) ---------------------------------
-    # Identity is per-AGENT, not per-process. Startup ensures the deployment
-    # owner has at least one agent (idempotent) and binds an AgentIdentity
-    # adapter for the protocol stack. A corrupted identity (wrong secret,
-    # mismatched keypair) aborts startup: silently regenerating would break
-    # all future trust relationships.
+
+async def build_identity(
+    settings: Settings, engine: AsyncEngine | None
+) -> _IdentityParts:
+    """Build the session factory + deployment-owner identity (Part 3, M4).
+
+    Identity is per-AGENT, not per-process. Startup ensures the deployment
+    owner has at least one agent (idempotent) and binds an AgentIdentity
+    adapter for the protocol stack. A corrupted identity (wrong secret,
+    mismatched keypair) aborts startup: silently regenerating would break
+    all future trust relationships.
+    """
     session_factory = None
     identity_service: IdentityService | None = None
     primary_identity: AgentIdentity | None = None
+    owner_id: uuid.UUID | None = None
     if engine is not None:
         session_factory = create_session_factory(engine)
+        # lazy: deferred to startup; keeps `import app.main` light for tests/tooling.
         from app.database.repositories import OwnerRepository
 
         async with session_factory() as session:
@@ -270,185 +305,212 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             logger.critical("identity_verification_failure detail=%s", exc)
             await engine.dispose()
             raise RuntimeError(f"Fatal identity error: {exc}") from exc
-    app.state.identity_service = identity_service
-    #: Back-compat name used by the A2A stack, the gateway client and card
-    #: signing. It is the PRIMARY agent's identity adapter, not a singleton
-    #: identity.
-    app.state.primary_identity = primary_identity
-    app.state.identity_ok = primary_identity is not None
+    return _IdentityParts(
+        session_factory=session_factory,
+        identity_service=identity_service,
+        primary_identity=primary_identity,
+        owner_id=owner_id,
+    )
 
-    # --- Authentication (M3) --------------------------------------------------
-    # Every request resolves its own principal from a session. Until this
-    # existed the owner was resolved ONCE here from the first `owners` row and
-    # cached, which made the whole API single-tenant and left authorization
-    # with nothing to authorize against.
-    auth_service: AuthService | None = None
-    if engine is not None:
-        session_secret = settings.nexus_session_key or settings.nexus_identity_key
-        if settings.auth_is_required and not settings.nexus_session_key:
-            # Refuse to run "authenticated" with a borrowed/missing secret:
-            # sessions would be forgeable by anyone who knows the identity key.
-            logger.critical(
-                "auth_required_without_session_key: NEXUS_SESSION_KEY must be "
-                "set when NEXUS_AUTH_REQUIRED is true."
-            )
-            raise RuntimeError(
-                "NEXUS_SESSION_KEY is required when authentication is enforced."
-            )
-        if not settings.nexus_session_key:
-            logger.warning(
-                "auth_session_key_not_set: falling back to NEXUS_IDENTITY_KEY "
-                "for session signing; set NEXUS_SESSION_KEY before production."
-            )
-        auth_service = AuthService(
-            session_factory=session_factory,
-            session_secret=session_secret,
-            session_ttl_seconds=settings.nexus_session_ttl_seconds,
-            allow_registration=settings.nexus_allow_registration,
+
+def build_auth(
+    settings: Settings, session_factory: async_sessionmaker | None
+) -> AuthService | None:
+    """Build the session authentication service (M3).
+
+    Every request resolves its own principal from a session. Until this
+    existed the owner was resolved ONCE here from the first `owners` row and
+    cached, which made the whole API single-tenant and left authorization
+    with nothing to authorize against.
+    """
+    if session_factory is None:
+        return None
+    session_secret = settings.nexus_session_key or settings.nexus_identity_key
+    if settings.auth_is_required and not settings.nexus_session_key:
+        # Refuse to run "authenticated" with a borrowed/missing secret:
+        # sessions would be forgeable by anyone who knows the identity key.
+        logger.critical(
+            "auth_required_without_session_key: NEXUS_SESSION_KEY must be "
+            "set when NEXUS_AUTH_REQUIRED is true."
         )
-    app.state.auth_service = auth_service
-    app.state.auth_required = settings.auth_is_required
-    app.state.registration_open = settings.nexus_allow_registration
-    app.state.cookie_secure = settings.cookie_secure_effective
-    app.state.session_ttl_seconds = settings.nexus_session_ttl_seconds
-    app.state.adopt_legacy_owner = settings.nexus_adopt_legacy_owner
-
-    # --- Policy & Consent (Part 4) ------------------------------------------
-    # Deterministic authorization over policies/consents; requires the DB.
-    policy_service: PolicyService | None = None
-    if engine is not None:
-        policy_service = PolicyService(session_factory=session_factory)
-    app.state.policy_service = policy_service
-    app.state.policy_ok = policy_service is not None
-
-    # --- Tools (Part 5) --------------------------------------------------------
-    # MCP-compatible registry + policy-gated execution service. Application-
-    # scoped: one registry per process, built-ins registered at startup.
-    tool_service: ToolService | None = None
-    if engine is not None and policy_service is not None:
-        registry = ToolRegistry()
-        for builtin in BUILTIN_TOOLS:
-            registry.register(builtin)
-        tool_service = ToolService(
-            registry=registry,
-            policy_service=policy_service,
-            session_factory=session_factory,
-            timeout_seconds=settings.nexus_tool_timeout_seconds,
-            max_result_bytes=settings.nexus_tool_max_result_bytes,
+        raise RuntimeError(
+            "NEXUS_SESSION_KEY is required when authentication is enforced."
         )
-    app.state.tool_service = tool_service
-    app.state.tools_ok = tool_service is not None
-
-    app.state.agent = build_agent(settings, engine, tool_service)
-
-    # --- A2A (Part 6) -----------------------------------------------------------
-    # Secure agent-to-agent communication. Requires identity (signing),
-    # policy (authorization), and the database; the memory manager is reused
-    # from the agent for policy-gated disclosures.
-    a2a_service: A2AService | None = None
-    if (
-        engine is not None
-        and primary_identity is not None
-        and policy_service is not None
-    ):
-        http_transport = HttpA2ATransport(
-            timeout_seconds=settings.nexus_a2a_timeout_seconds,
-            max_response_bytes=settings.nexus_a2a_max_message_bytes,
-            allow_local=settings.nexus_a2a_allow_local_endpoints,
+    if not settings.nexus_session_key:
+        logger.warning(
+            "auth_session_key_not_set: falling back to NEXUS_IDENTITY_KEY "
+            "for session signing; set NEXUS_SESSION_KEY before production."
         )
+    return AuthService(
+        session_factory=session_factory,
+        session_secret=session_secret,
+        session_ttl_seconds=settings.nexus_session_ttl_seconds,
+        allow_registration=settings.nexus_allow_registration,
+    )
 
-        gateway_client = None
-        transport: A2ATransport = http_transport
 
-        if settings.nexus_gateway_url:
-            from app.a2a.gateway_client import GatewayA2ATransport, GatewayClient
+def build_policy(session_factory: async_sessionmaker | None) -> PolicyService | None:
+    """Build deterministic authorization over policies/consents (Part 4)."""
+    if session_factory is None:
+        return None
+    return PolicyService(session_factory=session_factory)
 
-            async def _handle_gateway_inbound(envelope):
-                if a2a_service is not None and owner_id is not None:
-                    # The gateway is an untrusted relay: a malformed or
-                    # hostile frame must never raise into the reader loop.
-                    return await a2a_service.handle_gateway_delivery(
-                        owner_id, envelope
-                    )
-                return None
 
-            gateway_client = GatewayClient(
-                gateway_url=settings.nexus_gateway_url,
-                identity_service=primary_identity,
-                owner_id=owner_id,
-                inbound_handler=_handle_gateway_inbound,
-                display_name=settings.nexus_agent_display_name,
-                handle=settings.nexus_agent_handle,
-            )
-            transport = GatewayA2ATransport(
-                http_transport=http_transport,
-                gateway_client=gateway_client,
-                allow_direct_egress=settings.nexus_a2a_direct_egress,
-            )
-            app.state.gateway_client = gateway_client
-            await gateway_client.start()
-            logger.info("gateway_relay_active url=%s", settings.nexus_gateway_url)
+def build_tools(
+    settings: Settings,
+    session_factory: async_sessionmaker | None,
+    policy_service: PolicyService | None,
+) -> ToolService | None:
+    """Build the MCP-compatible registry + policy-gated execution (Part 5)."""
+    if session_factory is None or policy_service is None:
+        return None
+    registry = ToolRegistry()
+    for builtin in BUILTIN_TOOLS:
+        registry.register(builtin)
+    return ToolService(
+        registry=registry,
+        policy_service=policy_service,
+        session_factory=session_factory,
+        timeout_seconds=settings.nexus_tool_timeout_seconds,
+        max_result_bytes=settings.nexus_tool_max_result_bytes,
+    )
 
-        a2a_service = A2AService(
-            session_factory=session_factory,
+
+def build_a2a(
+    settings: Settings,
+    identity: _IdentityParts,
+    policy_service: PolicyService | None,
+    agent: NexusAgent,
+    tool_service: ToolService | None,
+) -> tuple[A2AService | None, Any]:
+    """Build secure agent-to-agent communication (Part 6).
+
+    Requires identity (signing), policy (authorization), and the database;
+    the memory manager is reused from the agent for policy-gated disclosures.
+    Returns (a2a_service, gateway_client); the client is None unless a
+    gateway URL is configured. The caller starts the gateway client AFTER
+    storing it on app.state, so shutdown can always find it.
+    """
+    # lazy: deferred to startup; keeps `import app.main` light for tests/tooling.
+    from app.a2a.gateway_client import GatewayA2ATransport, GatewayClient
+
+    session_factory = identity.session_factory
+    primary_identity = identity.primary_identity
+    owner_id = identity.owner_id
+    if session_factory is None or primary_identity is None or policy_service is None:
+        return None, None
+
+    http_transport = HttpA2ATransport(
+        timeout_seconds=settings.nexus_a2a_timeout_seconds,
+        max_response_bytes=settings.nexus_a2a_max_message_bytes,
+        allow_local=settings.nexus_a2a_allow_local_endpoints,
+    )
+
+    gateway_client = None
+    transport: A2ATransport = http_transport
+
+    # Late-binding box: the inbound handler is registered before the service
+    # exists, but it only ever runs after startup has assigned it.
+    box: dict[str, A2AService | None] = {"service": None}
+
+    async def _handle_gateway_inbound(envelope):
+        service = box["service"]
+        if service is not None and owner_id is not None:
+            # The gateway is an untrusted relay: a malformed or
+            # hostile frame must never raise into the reader loop.
+            return await service.handle_gateway_delivery(owner_id, envelope)
+        return None
+
+    if settings.nexus_gateway_url:
+        gateway_client = GatewayClient(
+            gateway_url=settings.nexus_gateway_url,
             identity_service=primary_identity,
-            policy_service=policy_service,
-            memory_manager=app.state.agent.memory,
-            transport=transport,
-            rate_limiter=SlidingWindowRateLimiter(
-                settings.nexus_a2a_rate_limit_per_minute
-            ),
-            max_message_bytes=settings.nexus_a2a_max_message_bytes,
-            max_clock_skew_seconds=settings.nexus_a2a_max_clock_skew_seconds,
-            message_ttl_seconds=settings.nexus_a2a_message_ttl_seconds,
-            allow_local_endpoints=settings.nexus_a2a_allow_local_endpoints,
-            tool_service=tool_service,
-            max_negotiation_rounds=settings.nexus_a2a_max_negotiation_rounds,
-            task_ttl_seconds=settings.nexus_a2a_task_ttl_seconds,
+            owner_id=owner_id,
+            inbound_handler=_handle_gateway_inbound,
+            display_name=settings.nexus_agent_display_name,
+            handle=settings.nexus_agent_handle,
         )
-    app.state.a2a_service = a2a_service
-    app.state.a2a_ok = a2a_service is not None
-    app.state.gateway_ok = gateway_client is not None
+        transport = GatewayA2ATransport(
+            http_transport=http_transport,
+            gateway_client=gateway_client,
+            allow_direct_egress=settings.nexus_a2a_direct_egress,
+        )
 
-    # --- Discovery (Part 7) ---------------------------------------------------
-    # Agent discovery and card hosting. Requires identity (card signing) and
-    # A2A (trusted-agent registration). Falls back gracefully when unavailable.
+    a2a_service = A2AService(
+        session_factory=session_factory,
+        identity_service=primary_identity,
+        policy_service=policy_service,
+        memory_manager=agent.memory,
+        transport=transport,
+        rate_limiter=SlidingWindowRateLimiter(
+            settings.nexus_a2a_rate_limit_per_minute
+        ),
+        max_message_bytes=settings.nexus_a2a_max_message_bytes,
+        max_clock_skew_seconds=settings.nexus_a2a_max_clock_skew_seconds,
+        message_ttl_seconds=settings.nexus_a2a_message_ttl_seconds,
+        allow_local_endpoints=settings.nexus_a2a_allow_local_endpoints,
+        tool_service=tool_service,
+        max_negotiation_rounds=settings.nexus_a2a_max_negotiation_rounds,
+        task_ttl_seconds=settings.nexus_a2a_task_ttl_seconds,
+    )
+    box["service"] = a2a_service
+    return a2a_service, gateway_client
+
+
+def build_discovery(
+    settings: Settings,
+    identity: _IdentityParts,
+    a2a_service: A2AService | None,
+) -> Any:
+    """Build agent discovery and card hosting (Part 7).
+
+    Requires identity (card signing) and A2A (trusted-agent registration).
+    Falls back gracefully when unavailable.
+    """
+    # lazy: deferred to startup; keeps `import app.main` light for tests/tooling.
     from app.a2a.discovery import DiscoveryService
 
-    discovery_service: DiscoveryService | None = None
-    if a2a_service is not None and primary_identity is not None:
-        discovery_service = DiscoveryService(
-            identity_service=primary_identity,
-            a2a_service=a2a_service,
-            allow_local_endpoints=settings.nexus_a2a_allow_local_endpoints,
-            timeout_seconds=settings.nexus_discovery_timeout_seconds,
-            max_card_bytes=settings.nexus_discovery_max_card_bytes,
-            session_factory=session_factory,
-        )
-    app.state.discovery_service = discovery_service
-    app.state.discovery_ok = discovery_service is not None
+    if a2a_service is None or identity.primary_identity is None:
+        return None
+    return DiscoveryService(
+        identity_service=identity.primary_identity,
+        a2a_service=a2a_service,
+        allow_local_endpoints=settings.nexus_a2a_allow_local_endpoints,
+        timeout_seconds=settings.nexus_discovery_timeout_seconds,
+        max_card_bytes=settings.nexus_discovery_max_card_bytes,
+        session_factory=identity.session_factory,
+    )
 
-    # --- Workflows (Part 9) ---------------------------------------------------
+
+async def build_workflows(
+    settings: Settings,
+    identity: _IdentityParts,
+    policy_service: PolicyService | None,
+    tool_service: ToolService | None,
+    a2a_service: A2AService | None,
+    agent: NexusAgent,
+) -> Any:
+    """Build the workflow engine (Part 9), resume listeners and crash recovery."""
+    # lazy: deferred to startup; keeps `import app.main` light for tests/tooling.
     from app.workflows.service import WorkflowService
 
-    workflow_service: WorkflowService | None = None
-    if session_factory is not None and policy_service is not None:
-        workflow_service = WorkflowService(
-            session_factory=session_factory,
-            policy_service=policy_service,
-            tool_service=tool_service,
-            a2a_service=a2a_service,
-            memory_manager=app.state.agent.memory,
-            identity_service=primary_identity,
-            default_ttl_seconds=settings.nexus_workflow_default_ttl_seconds,
-            max_step_attempts=settings.nexus_workflow_max_step_attempts,
-        )
-    app.state.workflow_service = workflow_service
-    app.state.workflows_ok = workflow_service is not None
+    session_factory = identity.session_factory
+    if session_factory is None or policy_service is None:
+        return None
+    workflow_service = WorkflowService(
+        session_factory=session_factory,
+        policy_service=policy_service,
+        tool_service=tool_service,
+        a2a_service=a2a_service,
+        memory_manager=agent.memory,
+        identity_service=identity.primary_identity,
+        default_ttl_seconds=settings.nexus_workflow_default_ttl_seconds,
+        max_step_attempts=settings.nexus_workflow_max_step_attempts,
+    )
 
     # Resume path: remote A2A responses arrive on the bus, so the workflow
     # engine must listen for them — otherwise WAITING_REMOTE steps never wake.
-    if a2a_service is not None and workflow_service is not None:
+    if a2a_service is not None:
         a2a_service.register_task_completion_callback(
             workflow_service.handle_task_completion
         )
@@ -457,114 +519,257 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # approval) are left in a non-terminal state by a process restart. Resume
     # them now, mirroring autonomy's reconcile_on_startup(). Without this,
     # interrupted workflows stay wedged forever.
-    if workflow_service is not None:
-        try:
-            resumed = await workflow_service.recover_interrupted_workflows()
-            if resumed:
-                logger.info(
-                    "workflow_crash_recovery_completed count=%d", len(resumed)
-                )
-        except Exception as exc:
-            logger.warning("workflow_startup_recovery_warning: %s", exc)
+    try:
+        resumed = await workflow_service.recover_interrupted_workflows()
+        if resumed:
+            logger.info("workflow_crash_recovery_completed count=%d", len(resumed))
+    except Exception as exc:
+        logger.warning("workflow_startup_recovery_warning: %s", exc)
+    return workflow_service
 
-    # --- Autonomy & Decision Engine (Part 10) ---------------------------------
+
+async def build_autonomy(
+    identity: _IdentityParts,
+    policy_service: PolicyService | None,
+    tool_service: ToolService | None,
+    a2a_service: A2AService | None,
+    workflow_service: Any,
+    agent: NexusAgent,
+) -> Any:
+    """Build the autonomy service + decision engine (Part 10)."""
+    # lazy: deferred to startup; keeps `import app.main` light for tests/tooling.
     from app.autonomy.service import AutonomyService
 
-    autonomy_service: AutonomyService | None = None
-    if session_factory is not None and policy_service is not None:
-        autonomy_service = AutonomyService(
-            session_factory=session_factory,
-            policy_service=policy_service,
-            tool_service=tool_service,
-            a2a_service=a2a_service,
-            workflow_service=workflow_service,
-            memory_manager=app.state.agent.memory,
-        )
-        try:
-            reconciled = await autonomy_service.reconcile_on_startup()
-            if reconciled > 0:
-                logger.info("autonomy_crash_recovery_completed count=%d", reconciled)
-        except Exception as exc:
-            logger.warning("autonomy_startup_reconciliation_warning: %s", exc)
+    session_factory = identity.session_factory
+    if session_factory is None or policy_service is None:
+        return None
+    autonomy_service = AutonomyService(
+        session_factory=session_factory,
+        policy_service=policy_service,
+        tool_service=tool_service,
+        a2a_service=a2a_service,
+        workflow_service=workflow_service,
+        memory_manager=agent.memory,
+    )
+    try:
+        reconciled = await autonomy_service.reconcile_on_startup()
+        if reconciled > 0:
+            logger.info("autonomy_crash_recovery_completed count=%d", reconciled)
+    except Exception as exc:
+        logger.warning("autonomy_startup_reconciliation_warning: %s", exc)
+    return autonomy_service
 
-    app.state.autonomy_service = autonomy_service
-    app.state.autonomy_ok = autonomy_service is not None
 
-    # --- Orchestration (Part 12) ---------------------------------------------
-    # Gated behind NEXUS_ORCHESTRATION_ENABLED (decision D5): OFF by default.
-    # Orchestration converts free text into agent actions through an LLM intent
-    # resolver plus fuzzy target matching, so a wrong guess is acted upon - and
-    # silently. Explicit asks and the workflow API work without it, so this
-    # costs convenience rather than capability.
+def build_orchestration(
+    settings: Settings,
+    identity: _IdentityParts,
+    a2a_service: A2AService | None,
+    policy_service: PolicyService | None,
+    discovery_service: Any,
+    agent: NexusAgent,
+    autonomy_service: Any,
+    workflow_service: Any,
+) -> Any:
+    """Build natural-language orchestration (Part 12).
+
+    Gated behind NEXUS_ORCHESTRATION_ENABLED (decision D5): OFF by default.
+    Orchestration converts free text into agent actions through an LLM intent
+    resolver plus fuzzy target matching, so a wrong guess is acted upon - and
+    silently. Explicit asks and the workflow API work without it, so this
+    costs convenience rather than capability.
+    """
+    # lazy: deferred to startup; keeps `import app.main` light for tests/tooling.
     from app.orchestration.intent import IntentResolver
-    from app.orchestration.target_resolver import TargetResolver
-    from app.orchestration.orchestrator import AgentOrchestrator
 
-    orchestrator: AgentOrchestrator | None = None
+    # lazy: deferred to startup; keeps `import app.main` light for tests/tooling.
+    from app.orchestration.orchestrator import AgentOrchestrator
+    from app.orchestration.target_resolver import TargetResolver
+
     if not settings.nexus_orchestration_enabled:
         logger.info(
             "orchestration_disabled detail=NEXUS_ORCHESTRATION_ENABLED is false; "
             "natural-language orchestration is off (chat and explicit asks are "
             "unaffected)"
         )
-    elif (
-        session_factory is not None
-        and a2a_service is not None
-        and policy_service is not None
+        return None
+    session_factory = identity.session_factory
+    if (
+        session_factory is None
+        or a2a_service is None
+        or policy_service is None
     ):
-        intent_resolver = IntentResolver(llm_provider=app.state.agent.provider)
-        target_resolver = TargetResolver(
-            session_factory=session_factory,
-            trusted_agents=a2a_service.trusted_agents,
-            discovery_service=discovery_service,
-            memory_manager=app.state.agent.memory,
-            gateway_url=settings.nexus_gateway_url,
-        )
-        decision_engine = getattr(autonomy_service, "_decision_engine", None)
-        orchestrator = AgentOrchestrator(
-            session_factory=session_factory,
-            a2a_service=a2a_service,
-            policy_service=policy_service,
-            intent_resolver=intent_resolver,
-            target_resolver=target_resolver,
-            decision_engine=decision_engine,
-            workflow_service=workflow_service,
-        )
+        return None
+    intent_resolver = IntentResolver(llm_provider=agent.provider)
+    target_resolver = TargetResolver(
+        session_factory=session_factory,
+        trusted_agents=a2a_service.trusted_agents,
+        discovery_service=discovery_service,
+        memory_manager=agent.memory,
+        gateway_url=settings.nexus_gateway_url,
+    )
+    decision_engine = getattr(autonomy_service, "_decision_engine", None)
+    return AgentOrchestrator(
+        session_factory=session_factory,
+        a2a_service=a2a_service,
+        policy_service=policy_service,
+        intent_resolver=intent_resolver,
+        target_resolver=target_resolver,
+        decision_engine=decision_engine,
+        workflow_service=workflow_service,
+    )
+
+
+async def build_jobs(
+    settings: Settings,
+    identity: _IdentityParts,
+    workflow_service: Any,
+) -> tuple[Any, Any, Any]:
+    """Build the durable job queue + worker (M7).
+
+    A Postgres-backed queue (decision D6) so retries, backoff, idempotency and
+    dead-lettering exist at all. Before this, asynchronous work was either
+    inline in a request or a fire-and-forget task whose failure was lost.
+    Returns (job_queue, job_worker, job_registry); all None when no database.
+    """
+    # lazy: deferred to startup; keeps `import app.main` light for tests/tooling.
+    from app.jobs import JobQueue, JobRegistry, JobWorker
+
+    session_factory = identity.session_factory
+    if session_factory is None:
+        return None, None, None
+    job_queue = JobQueue(session_factory=session_factory)
+    registry = JobRegistry()
+
+    # Handler registration is explicit: a kind is enqueued only if a handler
+    # exists, and an unregistered kind dead-letters with a clear reason.
+    if workflow_service is not None:
+        async def _advance_workflow_job(job) -> None:
+            workflow_id = uuid.UUID(str(job.payload.get("workflow_id")))
+            await workflow_service.advance_workflow(workflow_id)
+
+        registry.register("workflow.advance", _advance_workflow_job)
+
+    job_worker = JobWorker(
+        queue=job_queue,
+        registry=registry,
+        poll_interval_seconds=settings.nexus_job_poll_interval_seconds,
+        batch_size=settings.nexus_job_batch_size,
+        lease_seconds=settings.nexus_job_lease_seconds,
+        job_timeout_seconds=settings.nexus_job_timeout_seconds,
+    )
+    await job_worker.start()
+    return job_queue, job_worker, registry
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Create the agent on startup and release resources on shutdown."""
+    settings = get_settings()
+    configure_logging(settings)
+
+    engine = await _try_connect(settings.database_url, settings.nexus_db_echo)
+    app.state.engine = engine
+    app.state.database_ok = engine is not None
+
+    identity = await build_identity(settings, engine)
+    app.state.identity_service = identity.identity_service
+    #: Back-compat name used by the A2A stack, the gateway client and card
+    #: signing. It is the PRIMARY agent's identity adapter, not a singleton
+    #: identity.
+    app.state.primary_identity = identity.primary_identity
+    app.state.identity_ok = identity.primary_identity is not None
+
+    auth_service = build_auth(settings, identity.session_factory)
+    app.state.auth_service = auth_service
+    app.state.auth_required = settings.auth_is_required
+    app.state.registration_open = settings.nexus_allow_registration
+    app.state.cookie_secure = settings.cookie_secure_effective
+    app.state.session_ttl_seconds = settings.nexus_session_ttl_seconds
+    app.state.adopt_legacy_owner = settings.nexus_adopt_legacy_owner
+
+    policy_service = build_policy(identity.session_factory)
+    app.state.policy_service = policy_service
+    app.state.policy_ok = policy_service is not None
+
+    tool_service = build_tools(settings, identity.session_factory, policy_service)
+    app.state.tool_service = tool_service
+    app.state.tools_ok = tool_service is not None
+
+    app.state.agent = build_agent(settings, engine, tool_service)
+
+    # --- Memory retention (M8) --------------------------------------------------
+    # Wires the documented NEXUS_MEMORY_EPISODIC_RETENTION_DAYS knob: a daily
+    # task reaps expired episodic memories. Disabled (0/unset) by default.
+    app.state.memory_retention_task = start_memory_retention(
+        settings, app.state.agent.memory
+    )
+
+    # --- A2A task expiry sweeper ------------------------------------------------
+    # Flips past-expires_at, non-terminal tasks to EXPIRED once an hour, so
+    # TaskStatus.EXPIRED is actually reached instead of only raised about.
+    from app.a2a.maintenance import start_task_expiry_sweeper
+
+    app.state.task_expiry_sweeper = start_task_expiry_sweeper(
+        identity.session_factory
+    )
+
+    a2a_service, gateway_client = build_a2a(
+        settings, identity, policy_service, app.state.agent, tool_service
+    )
+    # Stored BEFORE the client starts, so shutdown can always find it even
+    # if a later builder raises.
+    app.state.gateway_client = gateway_client
+    if gateway_client is not None:
+        await gateway_client.start()
+        logger.info("gateway_relay_active url=%s", settings.nexus_gateway_url)
+    app.state.a2a_service = a2a_service
+    app.state.a2a_ok = a2a_service is not None
+    app.state.gateway_ok = gateway_client is not None
+
+    discovery_service = build_discovery(settings, identity, a2a_service)
+    app.state.discovery_service = discovery_service
+    app.state.discovery_ok = discovery_service is not None
+
+    workflow_service = await build_workflows(
+        settings,
+        identity,
+        policy_service,
+        tool_service,
+        a2a_service,
+        app.state.agent,
+    )
+    app.state.workflow_service = workflow_service
+    app.state.workflows_ok = workflow_service is not None
+
+    autonomy_service = await build_autonomy(
+        identity,
+        policy_service,
+        tool_service,
+        a2a_service,
+        workflow_service,
+        app.state.agent,
+    )
+    app.state.autonomy_service = autonomy_service
+    app.state.autonomy_ok = autonomy_service is not None
+
+    orchestrator = build_orchestration(
+        settings,
+        identity,
+        a2a_service,
+        policy_service,
+        discovery_service,
+        app.state.agent,
+        autonomy_service,
+        workflow_service,
+    )
     app.state.orchestrator = orchestrator
     app.state.orchestration_ok = orchestrator is not None
 
-    # --- Durable jobs (M7) ----------------------------------------------------
-    # A Postgres-backed queue (decision D6) so retries, backoff, idempotency and
-    # dead-lettering exist at all. Before this, asynchronous work was either
-    # inline in a request or a fire-and-forget task whose failure was lost.
-    from app.jobs import JobQueue, JobRegistry, JobWorker
-
-    job_queue: JobQueue | None = None
-    job_worker: JobWorker | None = None
-    if session_factory is not None:
-        job_queue = JobQueue(session_factory=session_factory)
-        registry = JobRegistry()
-        app.state.job_registry = registry
-
-        # Handler registration is explicit: a kind is enqueued only if a handler
-        # exists, and an unregistered kind dead-letters with a clear reason.
-        if workflow_service is not None:
-            async def _advance_workflow_job(job) -> None:
-                workflow_id = uuid.UUID(str(job.payload.get("workflow_id")))
-                await workflow_service.advance_workflow(workflow_id)
-
-            registry.register("workflow.advance", _advance_workflow_job)
-
-        job_worker = JobWorker(
-            queue=job_queue,
-            registry=registry,
-            poll_interval_seconds=settings.nexus_job_poll_interval_seconds,
-            batch_size=settings.nexus_job_batch_size,
-            lease_seconds=settings.nexus_job_lease_seconds,
-            job_timeout_seconds=settings.nexus_job_timeout_seconds,
-        )
-        await job_worker.start()
-
+    job_queue, job_worker, job_registry = await build_jobs(
+        settings, identity, workflow_service
+    )
+    if job_registry is not None:
+        app.state.job_registry = job_registry
     app.state.job_queue = job_queue
     app.state.job_worker = job_worker
     app.state.jobs_ok = job_queue is not None
@@ -601,6 +806,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # does not abandon a half-done unit of work.
         if getattr(app.state, "job_worker", None) is not None:
             await app.state.job_worker.stop()
+        retention_task = getattr(app.state, "memory_retention_task", None)
+        if retention_task is not None:
+            retention_task.cancel()
+        expiry_sweeper = getattr(app.state, "task_expiry_sweeper", None)
+        if expiry_sweeper is not None:
+            expiry_sweeper.cancel()
         if getattr(app.state, "gateway_client", None) is not None:
             await app.state.gateway_client.stop()
         await app.state.agent.aclose()
@@ -615,8 +826,9 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="Nexus Runtime",
         description=(
-            "Personal AI agent core (Part 2): persistent conversational "
-            "sessions and long-term personal memory on PostgreSQL + pgvector."
+            "Personal AI agent runtime: conversational sessions, long-term "
+            "memory, cryptographic identity, policy-gated tools, A2A "
+            "communication, workflows, autonomy, and orchestration."
         ),
         version=__version__,
         lifespan=lifespan,
@@ -805,4 +1017,21 @@ def create_app() -> FastAPI:
 app = create_app()
 
 
-__all__ = ["app", "build_agent", "configure_logging", "create_app"]
+__all__ = [
+    "app",
+    "build_agent",
+    "build_a2a",
+    "build_auth",
+    "build_autonomy",
+    "build_discovery",
+    "build_identity",
+    "build_jobs",
+    "build_orchestration",
+    "build_policy",
+    "build_tools",
+    "build_workflows",
+    "configure_logging",
+    "create_app",
+    "lifespan",
+    "start_memory_retention",
+]

@@ -51,7 +51,7 @@ from sqlalchemy.ext.compiler import compiles
 
 from app.a2a.models import A2ATask, TaskStatus, TrustedAgent, TrustStatus
 from app.a2a import signing
-from app.a2a.errors import A2AError
+from app.a2a.errors import A2AError, A2AErrorCode
 from app.a2a.repository import TaskRepository, TrustedAgentRepository
 from app.a2a.service import A2AService
 from app.a2a.gateway_client import GatewayA2ATransport, GatewayClient
@@ -975,11 +975,10 @@ async def test_context_db_persistence_across_instances(session_factory, test_own
 @pytest.mark.asyncio
 async def test_workflow_step_queued_transitions_waiting(session_factory, test_owner):
     mock_a2a = AsyncMock(spec=A2AService)
-    mock_a2a.delegate_task.return_value = {
-        "status": "queued",
-        "task_id": "wf_task_queued",
-        "payload": {},
-    }
+    # New contract: delegate_task raises QUEUED for an offline recipient.
+    mock_a2a.delegate_task.side_effect = A2AError(
+        A2AErrorCode.QUEUED, "Recipient offline; queued on the gateway."
+    )
 
     handler = A2ATaskStepHandler()
     ctx = WorkflowStepContext(
@@ -998,7 +997,9 @@ async def test_workflow_step_queued_transitions_waiting(session_factory, test_ow
         "task_type": "meeting_proposal",
     })
     assert res.status == StepStatus.WAITING
-    assert res.task_id == "wf_task_queued"
+    # The QUEUED error carries no task_id (it is raised, not returned), so the
+    # step waits without one; the task row itself is parked as WAITING_REMOTE.
+    assert res.task_id is None
 
 
 # =============================================================================
@@ -1066,6 +1067,8 @@ def test_orchestration_run_response_schema_fields():
 # =============================================================================
 @pytest.mark.asyncio
 async def test_gateway_client_inbound_response_dispatch():
+    from app.a2a.gateway_translate import to_gateway_envelope
+
     inbound_mock = AsyncMock(return_value={"status": "handled"})
     client = GatewayClient(
         gateway_url="wss://gateway.example.com",
@@ -1074,29 +1077,36 @@ async def test_gateway_client_inbound_response_dispatch():
         inbound_handler=inbound_mock,
     )
 
-    # Deliver complete, valid A2A response frame
+    # Deliver a 0.3 delivery frame carrying a nested signed 0.2 envelope
+    # (the C1 wire format): the client must unwrap and dispatch the inner
+    # envelope to the inbound handler.
+    inner_02 = {
+        "protocol": "nexus-a2a",
+        "version": "0.1",
+        "message_id": "msg_resp_1",
+        "task_id": "t1",
+        "sender": "nexus:ed25519:22222222222222222222222222222222",
+        "recipient": "nexus:ed25519:11111111111111111111111111111111",
+        "timestamp": "2026-09-15T10:00:00Z",
+        "expires_at": "2026-09-15T10:05:00Z",
+        "message_type": "response",
+        "purpose": "scheduling",
+        "payload": {"status": "ok"},
+        "signature": "mock_signature",
+    }
     frame = {
         "type": "delivery",
         "relay_id": "relay_1",
-        "envelope": {
-            "protocol": "nexus-a2a",
-            "version": "0.1",
-            "message_id": "msg_resp_1",
-            "task_id": "t1",
-            "sender": "nexus:ed25519:22222222222222222222222222222222",
-            "recipient": "nexus:ed25519:11111111111111111111111111111111",
-            "timestamp": "2026-09-15T10:00:00Z",
-            "expires_at": "2026-09-15T10:05:00Z",
-            "message_type": "response",
-            "purpose": "scheduling",
-            "payload": {"status": "ok"},
-            "signature": "mock_signature",
-        },
+        "envelope": to_gateway_envelope(inner_02),
     }
 
     mock_ws = AsyncMock()
     await client._handle_frame(mock_ws, frame)
     inbound_mock.assert_awaited_once()
+    # The unwrapped 0.2 envelope is what the handler receives.
+    dispatched = inbound_mock.call_args[0][0]
+    assert dispatched.message_id == "msg_resp_1"
+    assert dispatched.task_id == "t1"
     called_env = inbound_mock.await_args[0][0]
     assert getattr(called_env, "message_id", None) == "msg_resp_1" or (isinstance(called_env, dict) and called_env.get("message_id") == "msg_resp_1")
 
@@ -1155,12 +1165,12 @@ async def test_end_to_end_meeting_coordination_simulated(session_factory, test_o
         await session.commit()
 
     mock_a2a = AsyncMock(spec=A2AService)
-    # Target is offline on gateway initially -> queued
-    mock_a2a.delegate_task.return_value = {
-        "status": "queued",
-        "task_id": "sim_task_123",
-        "payload": {},
-    }
+    # Target is offline on gateway initially -> delegate_task raises QUEUED
+    mock_a2a.delegate_task.side_effect = A2AError(
+        A2AErrorCode.QUEUED,
+        "Recipient offline; queued on the gateway.",
+        details={"task_id": "sim_task_123", "relay_id": "relay_1"},
+    )
 
     mock_policy = MagicMock(spec=PolicyService)
     mock_policy.evaluate = AsyncMock(return_value=EvaluationResult(decision=PolicyDecision.ALLOW, reason="Allowed"))
