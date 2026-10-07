@@ -91,11 +91,17 @@ class OrchestrationExecutor:
                     )
                     step_results.append(res)
                 except A2AError as exc:
-                    if exc.code == A2AErrorCode.TRANSPORT_ERROR and "queued" in str(exc).lower():
+                    if exc.code == A2AErrorCode.QUEUED:
+                        details: dict[str, Any] = {
+                            "task_type": task_type,
+                            "target": target_name,
+                        }
+                        if exc.details.get("task_id"):
+                            details["task_id"] = exc.details["task_id"]
                         return {
                             "status": "queued",
                             "message": f"{target_name}'s agent is currently offline. Your request has been queued on the Gateway.",
-                            "details": {"task_type": task_type, "target": target_name},
+                            "details": details,
                         }
                     raise OrchestrationExecutionError(str(exc), user_message=self._friendly_a2a_error(exc, target_name)) from exc
 

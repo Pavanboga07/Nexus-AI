@@ -278,6 +278,14 @@ class A2ATaskStepHandler(BaseWorkflowStepHandler):
                 endpoint=endpoint,
             )
         except A2AError as exc:
+            if exc.code == A2AErrorCode.QUEUED:
+                # The gateway holds the envelope for an offline recipient:
+                # the step waits, it did not fail.
+                logger.info("A2A delegation queued on gateway: %s", exc)
+                return StepResult(
+                    status=StepStatus.WAITING,
+                    output_payload={"queued": True},
+                )
             transient = exc.code in _TRANSIENT_A2A_CODES
             logger.error("A2A delegation failed: %s", exc)
             return StepResult(

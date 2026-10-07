@@ -553,7 +553,11 @@ async def test_gateway_client_auth_response_includes_card_and_handle():
 async def test_gateway_transport_routing_and_offline_queue():
     client = MagicMock(spec=GatewayClient)
     client.is_connected = True
-    client.send_relay_envelope = AsyncMock(return_value={"status": "queued", "relay_id": "relay_123"})
+    # New contract: an offline recipient surfaces as a raised QUEUED error,
+    # not a {"status": "queued"} dict (which callers mistook for completion).
+    client.send_relay_envelope = AsyncMock(
+        side_effect=A2AError(A2AErrorCode.QUEUED, "Recipient offline; queued.")
+    )
 
     mock_http = MagicMock()
     transport = GatewayA2ATransport(http_transport=mock_http, gateway_client=client)
@@ -570,9 +574,9 @@ async def test_gateway_transport_routing_and_offline_queue():
         "payload": {},
     }
 
-    result = await transport.send("wss://gateway.example.com/ws", envelope)
-    assert result["status"] == "queued"
-    assert result["relay_id"] == "relay_123"
+    with pytest.raises(A2AError) as exc_info:
+        await transport.send("wss://gateway.example.com/ws", envelope)
+    assert exc_info.value.code == A2AErrorCode.QUEUED
     client.send_relay_envelope.assert_called_once_with(envelope)
 
 

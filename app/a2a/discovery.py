@@ -162,12 +162,16 @@ class DiscoveryService:
     ) -> dict[str, Any]:
         """Fetch and cryptographically verify an agent card from the Gateway directory."""
         base_http = (
-            gateway_url.replace("wss://", "https://")
-            .replace("ws://", "http://")
-            .rstrip("/ws")
-            .rstrip("/")
+            gateway_url.replace("wss://", "https://").replace("ws://", "http://")
         )
-        url = f"{base_http}/agents/{agent_id}/card"
+        # Strip a trailing "/ws" path SUFFIX (not str.rstrip, which strips
+        # characters — it would mangle hosts like ".../news").
+        if base_http.endswith("/ws"):
+            base_http = base_http[: -len("/ws")]
+        base_http = base_http.rstrip("/")
+        # The gateway serves GET /directory/{agent_id} (relay/routes.py) and
+        # wraps the card as {"agent_id": ..., "card": {...}}.
+        url = f"{base_http}/directory/{agent_id}"
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             resp = await client.get(url)
             if resp.status_code != 200:
@@ -175,7 +179,18 @@ class DiscoveryService:
                     A2AErrorCode.NOT_FOUND,
                     f"Agent card not found on Gateway for agent_id {agent_id} (HTTP {resp.status_code})",
                 )
-            card = resp.json()
+            data = resp.json()
+            card = data.get("card") if isinstance(data, dict) else None
+            if not isinstance(card, dict):
+                raise A2AError(
+                    A2AErrorCode.INVALID_CARD,
+                    "Gateway directory response has no 'card' object.",
+                )
+            if isinstance(data.get("agent_id"), str) and data["agent_id"] != agent_id:
+                raise A2AError(
+                    A2AErrorCode.INVALID_CARD,
+                    "Gateway directory wrapper agent_id does not match the request.",
+                )
             return self.verify_card(card, expected_agent_id=agent_id)
 
     async def register_verified_card(
