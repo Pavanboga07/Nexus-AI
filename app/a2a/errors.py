@@ -7,6 +7,7 @@ credentials.
 from __future__ import annotations
 
 import enum
+from typing import Any
 
 
 class A2AErrorCode(str, enum.Enum):
@@ -36,6 +37,11 @@ class A2AErrorCode(str, enum.Enum):
     NEGOTIATION_LIMIT_EXCEEDED = "NEGOTIATION_LIMIT_EXCEEDED"
     TASK_NOT_PENDING = "TASK_NOT_PENDING"
     TASK_EXPIRED = "TASK_EXPIRED"
+    # Gateway offline buffering: the message was accepted and queued by the
+    # relay for a currently-offline recipient; no response will arrive on
+    # this call. Raised (not returned) so callers cannot mistake it for a
+    # completed delegation.
+    QUEUED = "QUEUED"
     # M6: capability contracts (0.2)
     UNSUPPORTED_CAPABILITY = "UNSUPPORTED_CAPABILITY"
     UNSUPPORTED_VERSION = "UNSUPPORTED_VERSION"
@@ -68,6 +74,7 @@ _HTTP_STATUS = {
     A2AErrorCode.NEGOTIATION_LIMIT_EXCEEDED: 400,
     A2AErrorCode.TASK_NOT_PENDING: 409,
     A2AErrorCode.TASK_EXPIRED: 410,
+    A2AErrorCode.QUEUED: 202,
     # M6
     A2AErrorCode.UNSUPPORTED_CAPABILITY: 400,
     A2AErrorCode.UNSUPPORTED_VERSION: 400,
@@ -77,10 +84,18 @@ _HTTP_STATUS = {
 class A2AError(Exception):
     """An expected A2A failure with a stable code and HTTP status."""
 
-    def __init__(self, code: A2AErrorCode, message: str) -> None:
+    def __init__(
+        self,
+        code: A2AErrorCode,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        #: Structured context (e.g. task_id/relay_id on QUEUED) so handlers
+        #: can act on it without parsing the human-readable message.
+        self.details: dict[str, Any] = details or {}
         self.http_status = _HTTP_STATUS.get(code, 400)
 
     def to_dict(self) -> dict[str, str]:

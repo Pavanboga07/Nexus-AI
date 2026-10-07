@@ -18,16 +18,23 @@ import base64
 import json
 import logging
 import uuid
-from typing import Any, Callable, Coroutine
+from collections.abc import Callable, Coroutine
+from typing import Any
 
 import websockets
 
 try:
     from websockets.asyncio.client import ClientConnection as WSClient
 except ImportError:
-    from websockets.client import WebSocketClientProtocol as WSClient  # type: ignore
+    from websockets.client import WebSocketClientProtocol as WSClient
 
 from app.a2a.errors import A2AError, A2AErrorCode
+from app.a2a.gateway_translate import (
+    GatewayTranslationError,
+    from_gateway_envelope,
+    sign_gateway_envelope,
+    to_gateway_envelope,
+)
 from app.a2a.schemas import A2AEnvelope
 from app.a2a.transport import A2ATransport
 from app.identity.service import IdentityService
@@ -70,6 +77,10 @@ class GatewayClient:
         self._pending_responses: dict[str, asyncio.Future[dict[str, Any]]] = {}
         # Pending delivery acks: relay_id -> asyncio.Future
         self._pending_acks: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        # Gateway error frames carry correlation_id (not relay_id); this maps
+        # them back to the in-flight ack future so a rejection fails the send
+        # immediately instead of burning the ack timeout.
+        self._ack_correlation: dict[str, str] = {}
 
     @property
     def is_connected(self) -> bool:
@@ -122,13 +133,45 @@ class GatewayClient:
             self._connected = True
             logger.info("Authenticated and connected to gateway successfully.")
 
-            # Run reader loop until disconnect
-            await self._read_loop(ws)
+            # Proactive heartbeats: the gateway only refreshes presence on
+            # client-initiated heartbeats, so without this loop the presence
+            # written at auth goes permanently stale.
+            heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
+            try:
+                await self._read_loop(ws)
+            finally:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+
+    async def _heartbeat_loop(self, ws: WSClient) -> None:
+        """Send {"type": "heartbeat"} every heartbeat_interval seconds."""
+        try:
+            while self._connected:
+                await asyncio.sleep(self._heartbeat_interval)
+                if not self._connected:
+                    break
+                try:
+                    await ws.send(json.dumps({"type": "heartbeat"}))
+                except Exception as exc:
+                    logger.debug("gateway heartbeat send failed: %s", exc)
+                    break
+        except asyncio.CancelledError:
+            pass
 
     async def _authenticate(self, ws: WSClient) -> None:
         """Execute cryptographic challenge-response authentication with gateway."""
-        # 1. Receive challenge
-        raw = await ws.recv()
+        # 1. Receive challenge (bounded: a gateway without a server-side auth
+        #    timeout must not hang us forever).
+        try:
+            raw = await asyncio.wait_for(ws.recv(), timeout=15.0)
+        except TimeoutError:
+            raise A2AError(
+                A2AErrorCode.TRANSPORT_ERROR,
+                "Timed out waiting for gateway auth_challenge.",
+            ) from None
         data = json.loads(raw)
         if data.get("type") != "auth_challenge":
             raise A2AError(
@@ -174,7 +217,13 @@ class GatewayClient:
         await ws.send(json.dumps(auth_response))
 
         # 4. Receive auth_result
-        raw_result = await ws.recv()
+        try:
+            raw_result = await asyncio.wait_for(ws.recv(), timeout=15.0)
+        except TimeoutError:
+            raise A2AError(
+                A2AErrorCode.TRANSPORT_ERROR,
+                "Timed out waiting for gateway auth_result.",
+            ) from None
         result_data = json.loads(raw_result)
         if result_data.get("type") != "auth_result" or not result_data.get("success"):
             error_msg = result_data.get("error", "Unknown auth failure")
@@ -197,42 +246,12 @@ class GatewayClient:
         frame_type = frame.get("type")
 
         if frame_type == "delivery":
-            relay_id = frame.get("relay_id")
-            envelope_data = frame.get("envelope", {})
-
-            # 1. Send delivery_ack back to gateway
-            if relay_id:
-                ack = {"type": "delivery_ack", "relay_id": relay_id}
-                await ws.send(json.dumps(ack))
-
-            # 2. Check if this is a response to an outbound request we sent
-            msg_type = envelope_data.get("message_type")
-            task_id = envelope_data.get("task_id")
-            if msg_type in {"response", "task_response"} and task_id in self._pending_responses:
-                fut = self._pending_responses.pop(task_id)
-                if not fut.done():
-                    fut.set_result(envelope_data)
-
-            # 3. In all cases, dispatch to local inbound handler so DB and workflows are updated
-            if self._inbound_handler:
-                try:
-                    envelope = A2AEnvelope.model_validate(envelope_data)
-                    response_envelope = await self._inbound_handler(envelope)
-                    if response_envelope and msg_type not in {"response", "task_response"}:
-                        # Relay the signed response back to the sender
-                        response_frame = {
-                            "type": "relay_envelope",
-                            "relay_id": f"relay_{uuid.uuid4().hex}",
-                            "recipient": response_envelope.recipient,
-                            "envelope": response_envelope.model_dump(),
-                        }
-                        await ws.send(json.dumps(response_frame))
-                except Exception as exc:
-                    logger.error("Inbound handler failure for delivered envelope: %s", exc)
+            await self._handle_delivery(ws, frame)
 
         elif frame_type == "delivery_ack":
             relay_id = frame.get("relay_id")
             logger.debug("Gateway delivery_ack received: %s", frame)
+            self._ack_correlation.pop(frame.get("correlation_id", ""), None)
             if relay_id and relay_id in self._pending_acks:
                 fut = self._pending_acks.pop(relay_id)
                 if not fut.done():
@@ -241,6 +260,7 @@ class GatewayClient:
         elif frame_type == "delivery_failed":
             relay_id = frame.get("relay_id")
             logger.warning("Gateway delivery_failed received: %s", frame)
+            self._ack_correlation.pop(frame.get("correlation_id", ""), None)
             if relay_id and relay_id in self._pending_acks:
                 fut = self._pending_acks.pop(relay_id)
                 if not fut.done():
@@ -248,59 +268,211 @@ class GatewayClient:
                         A2AError(A2AErrorCode.TRANSPORT_ERROR, frame.get("reason", "Delivery failed"))
                     )
 
+        elif frame_type == "error":
+            # Gateway rejection (e.g. INVALID_ENVELOPE): surface it with its
+            # correlation id instead of silently ignoring it, and fail the
+            # in-flight send it answers so the caller learns immediately.
+            code = frame.get("code")
+            correlation_id = frame.get("correlation_id")
+            logger.warning(
+                "gateway error frame code=%s correlation_id=%s message=%s",
+                code,
+                correlation_id,
+                frame.get("message"),
+            )
+            relay_id = self._ack_correlation.pop(correlation_id, None) if correlation_id else None
+            if relay_id and relay_id in self._pending_acks:
+                fut = self._pending_acks.pop(relay_id)
+                if not fut.done():
+                    fut.set_exception(
+                        A2AError(
+                            A2AErrorCode.TRANSPORT_ERROR,
+                            f"Gateway rejected envelope: {code}: {frame.get('message')}",
+                        )
+                    )
+
         elif frame_type == "heartbeat":
             # Echo pong back
             pong = {"type": "heartbeat"}
             await ws.send(json.dumps(pong))
+
+        elif frame_type == "heartbeat_ack":
+            logger.debug("Gateway heartbeat_ack received")
+
+    async def _handle_delivery(self, ws: WSClient, frame: dict[str, Any]) -> None:
+        """Process one gateway delivery frame.
+
+        Order matters: unwrap the 0.3 envelope to the nested signed 0.2
+        envelope, VALIDATE it, dispatch it, and only then ack. A malformed
+        envelope is dead-lettered (acked so the gateway does not redeliver
+        poison forever, with message_id/sender in the log line) — never
+        acked-then-silently-dropped.
+        """
+        relay_id = frame.get("relay_id")
+        envelope_data = frame.get("envelope", {})
+
+        async def ack_delivery() -> None:
+            if relay_id:
+                await ws.send(json.dumps({"type": "delivery_ack", "relay_id": relay_id}))
+
+        # 1. Unwrap 0.3 -> 0.2.
+        try:
+            inner_data = from_gateway_envelope(envelope_data)
+        except GatewayTranslationError as exc:
+            logger.warning(
+                "delivery_untranslatable message_id=%s sender=%s detail=%s; dead-lettering",
+                envelope_data.get("message_id"),
+                envelope_data.get("sender"),
+                exc,
+            )
+            await ack_delivery()
+            return
+
+        # 2. Validate the 0.2 envelope BEFORE acking.
+        try:
+            envelope = A2AEnvelope.model_validate(inner_data)
+        except Exception as exc:
+            logger.warning(
+                "delivery_malformed_envelope message_id=%s sender=%s detail=%s; dead-lettering",
+                inner_data.get("message_id"),
+                inner_data.get("sender"),
+                exc,
+            )
+            await ack_delivery()
+            return
+
+        # 3. Correlate responses to outbound requests we are awaiting.
+        msg_type = envelope.message_type
+        task_id = envelope.task_id
+        if msg_type in {"response", "task_response"} and task_id in self._pending_responses:
+            fut = self._pending_responses.pop(task_id)
+            if not fut.done():
+                fut.set_result(envelope.model_dump())
+
+        # 4. Dispatch to the local inbound handler (full verification pipeline).
+        response_envelope: A2AEnvelope | None = None
+        if self._inbound_handler:
+            try:
+                response_envelope = await self._inbound_handler(envelope)
+            except Exception as exc:
+                # Validated but not dispatchable: ack anyway, so the gateway
+                # does not redeliver a message that fails identically forever.
+                logger.error(
+                    "inbound handler failure for delivered envelope "
+                    "message_id=%s sender=%s: %s",
+                    envelope.message_id,
+                    envelope.sender,
+                    exc,
+                )
+        if response_envelope is not None and msg_type not in {"response", "task_response"}:
+            # Relay the signed 0.2 response back through the gateway as 0.3.
+            gateway_envelope = to_gateway_envelope(response_envelope.model_dump())
+            signed = await sign_gateway_envelope(self._identity, gateway_envelope)
+            response_frame = {
+                "type": "relay_envelope",
+                "relay_id": f"relay_{uuid.uuid4().hex}",
+                "recipient": response_envelope.recipient,
+                "correlation_id": signed["correlation_id"],
+                "envelope": signed,
+            }
+            await ws.send(json.dumps(response_frame))
+
+        # 5. Ack only after successful validation + dispatch.
+        await ack_delivery()
 
     async def send_relay_envelope(
         self,
         envelope: dict[str, Any],
         timeout: float = 30.0,
     ) -> dict[str, Any]:
-        """Send a signed envelope through the gateway and await response envelope."""
+        """Send a signed 0.2 envelope through the gateway; await the response.
+
+        The 0.2 envelope is translated to the gateway's 0.3 wire format at
+        this boundary (see ``app.a2a.gateway_translate``) and the outer 0.3
+        envelope is signed with the local identity.
+
+        Raises A2AError(QUEUED) when the gateway accepts the envelope for an
+        offline recipient — no response will arrive on this call, so returning
+        a dict would let callers mistake it for a completed delegation.
+        """
         if not self.is_connected or self._ws is None:
             raise A2AError(
                 A2AErrorCode.TRANSPORT_ERROR,
                 "Gateway client is not connected.",
             )
 
+        task_id = envelope.get("task_id")
+        if not task_id:
+            # Fail fast: without a task_id no response can ever be correlated
+            # back to this call, so awaiting would just burn the timeout.
+            raise A2AError(
+                A2AErrorCode.INVALID_ENVELOPE,
+                "Cannot relay an envelope without a task_id.",
+            )
+
+        gateway_envelope = to_gateway_envelope(envelope)
+        signed_envelope = await sign_gateway_envelope(
+            self._identity, gateway_envelope
+        )
+        correlation_id = signed_envelope["correlation_id"]
+
         relay_id = f"relay_{uuid.uuid4().hex}"
-        task_id = envelope.get("task_id", "")
         frame = {
             "type": "relay_envelope",
             "relay_id": relay_id,
             "recipient": envelope.get("recipient"),
-            "envelope": envelope,
+            "correlation_id": correlation_id,
+            "envelope": signed_envelope,
         }
 
         # Setup response future
-        resp_fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
-        if task_id:
-            self._pending_responses[task_id] = resp_fut
+        loop = asyncio.get_running_loop()
+        resp_fut: asyncio.Future[dict[str, Any]] = loop.create_future()
+        self._pending_responses[task_id] = resp_fut
 
-        ack_fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        ack_fut: asyncio.Future[dict[str, Any]] = loop.create_future()
         self._pending_acks[relay_id] = ack_fut
+        self._ack_correlation[correlation_id] = relay_id
 
-        await self._ws.send(json.dumps(frame))
+        try:
+            await self._ws.send(json.dumps(frame))
+        except Exception:
+            self._pending_responses.pop(task_id, None)
+            self._pending_acks.pop(relay_id, None)
+            self._ack_correlation.pop(correlation_id, None)
+            raise
 
-        # Wait for delivery ack first
+        # Wait for delivery ack first; fail fast when it times out instead of
+        # burning the full response timeout on a message the gateway never
+        # accepted. (An "error" frame from the gateway fails ack_fut via
+        # _handle_frame with the gateway's rejection reason.)
         try:
             ack = await asyncio.wait_for(ack_fut, timeout=10.0)
-            logger.debug("send_relay_envelope received ack: %s", ack)
-            if ack.get("status") == "queued":
-                # Recipient is offline, envelope queued
-                if task_id in self._pending_responses:
-                    self._pending_responses.pop(task_id, None)
-                return {"status": "queued", "relay_id": relay_id}
-        except asyncio.TimeoutError:
-            logger.warning("Timed out waiting for delivery_ack (relay_id=%s)", relay_id)
+        except TimeoutError:
             self._pending_acks.pop(relay_id, None)
+            self._pending_responses.pop(task_id, None)
+            self._ack_correlation.pop(correlation_id, None)
+            raise A2AError(
+                A2AErrorCode.TRANSPORT_ERROR,
+                "Timed out waiting for gateway delivery_ack.",
+            ) from None
+        self._ack_correlation.pop(correlation_id, None)
+        logger.debug("send_relay_envelope received ack: %s", ack)
+        if ack.get("status") == "queued":
+            # Recipient is offline; the gateway holds the envelope. Nothing
+            # will arrive on resp_fut, so raise rather than return a dict.
+            self._pending_responses.pop(task_id, None)
+            raise A2AError(
+                A2AErrorCode.QUEUED,
+                f"Recipient is offline; envelope queued on the gateway "
+                f"(relay_id={relay_id}, task_id={task_id}).",
+                details={"relay_id": relay_id, "task_id": task_id},
+            )
 
         # Wait for the response envelope from remote agent
         try:
             return await asyncio.wait_for(resp_fut, timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._pending_responses.pop(task_id, None)
             raise A2AError(
                 A2AErrorCode.TRANSPORT_ERROR,

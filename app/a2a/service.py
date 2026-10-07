@@ -28,21 +28,22 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from datetime import UTC, datetime
 from typing import Any
-
-from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.a2a import signing
-from app.a2a.disclosure import build_disclosure
 from app.a2a.capabilities import (
     CapabilityPayloadError,
     CapabilitySpec,
     validate_payload_against_schema,
     version_compatible,
 )
+from app.a2a.delegation import TaskDelegationService
+from app.a2a.disclosure import build_disclosure
 from app.a2a.errors import A2AError, A2AErrorCode
+from app.a2a.gateway_translate import new_correlation_id
 from app.a2a.handlers import (
     TaskContext,
     TaskHandlerRegistry,
@@ -56,6 +57,8 @@ from app.a2a.models import (
     TrustStatus,
 )
 from app.a2a.negotiation import (
+    is_terminal_status,
+    map_response_status,
     validate_negotiation_round,
     validate_task_active,
 )
@@ -77,12 +80,14 @@ from app.a2a.schemas import (
 )
 from app.a2a.tracing import trace_context_for_outbound
 from app.a2a.transport import A2ATransport, validate_endpoint
-from app.observability import A2A_OUTCOMES
+from app.config.settings import get_settings
 from app.identity.service import IdentityService
 from app.memory.manager import MemoryManager
+from app.observability import A2A_OUTCOMES
 from app.policy.engine import EvaluationRequest
 from app.policy.models import DisclosureScope, PolicyDecision
 from app.policy.service import PolicyService
+from app.search import SearchError, get_provider_from_settings
 
 logger = logging.getLogger("nexus.a2a")
 
@@ -133,6 +138,7 @@ class A2AService:
         #: than being accepted unvalidated.
         self._capabilities: dict[str, CapabilitySpec] = {}
         self._register_default_capabilities()
+        self._delegation = TaskDelegationService(self)
 
     def register_task_completion_callback(self, callback: Any) -> None:
         """Register an async callback (task_id, payload) invoked upon remote task response."""
@@ -396,11 +402,16 @@ class A2AService:
                 f"Task {envelope.task_id} not found locally.",
             )
 
-        # 2. Check sender matches task recipient
-        if envelope.sender != task.recipient_agent_id:
+        # 2. Check sender is a party to the task. Normally this is the
+        #    recipient we delegated to; it can also be the original sender
+        #    when the "response" is the ack answering a one-way status
+        #    notification (approval_granted/denied, task_cancel(led)) we sent.
+        #    The signature is still verified against the sender's registered
+        #    key below, so this widening grants nothing to a third party.
+        if envelope.sender not in {task.sender_agent_id, task.recipient_agent_id}:
             raise A2AError(
                 A2AErrorCode.INVALID_RESPONSE,
-                f"Response sender {envelope.sender} does not match expected {task.recipient_agent_id}",
+                f"Response sender {envelope.sender} is not a party to task {envelope.task_id}",
             )
 
         # 3. Verify sender trust and signature
@@ -450,31 +461,51 @@ class A2AService:
                 return None
             await session.commit()
 
-        # 6. Update local task status
-        resp_status = (envelope.payload or {}).get("status")
-        final_status = TaskStatus.COMPLETED
-        if resp_status in {"rejected", "failed"}:
-            final_status = TaskStatus.REJECTED
+        # 6. Update local task status. Terminal-state guard: a late or
+        #    duplicated response (new message_id, so it passes replay
+        #    protection) must not resurrect a task that already reached a
+        #    terminal state, nor clobber its payload/completed_at.
+        if is_terminal_status(task.status):
+            logger.info(
+                "ignoring response for terminal task %s (status=%s)",
+                envelope.task_id,
+                task.status,
+            )
+            return None
+
+        # Shared with delegate_task/negotiate_task (fast path): one mapping
+        # table, so a late pending_approval can no longer mark the task
+        # COMPLETED here while the fast path says PENDING_APPROVAL.
+        final_status = map_response_status(
+            envelope.payload, default=TaskStatus.COMPLETED
+        )
 
         async with self._session_factory() as session:
             task.status = final_status.value
             task.response_payload = envelope.payload
-            task.completed_at = datetime.now(timezone.utc)
+            if final_status is TaskStatus.COMPLETED:
+                task.completed_at = datetime.now(UTC)
             await self._tasks.upsert(session, task)
             await session.commit()
 
         # 7. Notify callbacks (e.g. workflows and orchestration runs).
         #    Callbacks may be sync or async; both are supported, and a
         #    failing callback must not corrupt the response handling above.
+        await self._fire_completion_callbacks(envelope.task_id, envelope.payload)
+
+        return None
+
+    async def _fire_completion_callbacks(
+        self, task_id: str, payload: dict[str, Any] | None
+    ) -> None:
+        """Wake every waiter registered for a task's terminal outcome."""
         for callback in self._task_completion_callbacks:
             try:
-                result = callback(envelope.task_id, envelope.payload)
+                result = callback(task_id, payload)
                 if asyncio.iscoroutine(result):
                     await result
             except Exception as exc:
-                logger.error("Task completion callback error for %s: %s", envelope.task_id, exc)
-
-        return None
+                logger.error("Task completion callback error for %s: %s", task_id, exc)
 
     async def handle_inbound(
         self,
@@ -518,10 +549,30 @@ class A2AService:
                 "Message is not addressed to this agent.",
             )
 
-        if envelope.message_type not in {"request", "task_request", "task_proposal"}:
+        if envelope.message_type not in {
+            "request",
+            "task_request",
+            "task_proposal",
+            # Status updates for tasks we (co-)own: approval and cancel
+            # notifications, answered with a signed ack, not a task execution.
+            "approval_required",
+            "approval_granted",
+            "approval_denied",
+            "task_cancel",
+            "task_cancelled",
+            # Informational / discovery vocabulary: accepted, then handled by
+            # dedicated branches below (never silently rejected).
+            "error",
+            "task_progress",
+            "capability_query",
+            "capability_response",
+        }:
             raise A2AError(
                 A2AErrorCode.INVALID_ENVELOPE,
-                "Only 'request', 'task_request', or 'task_proposal' messages are accepted on this endpoint.",
+                "Only request/task_request/task_proposal, task status updates "
+                "(approval_*/task_cancel(led)), and informational "
+                "(error/task_progress/capability_*) messages are accepted on "
+                "this endpoint.",
             )
 
         # Rate limit per sender.
@@ -585,6 +636,62 @@ class A2AService:
         # ---- Route between standard Part 6 request and Part 8 task delegation
         if envelope.message_type in {"task_request", "task_proposal"}:
             return await self._handle_inbound_task(owner_id, envelope, local_agent_id)
+
+        # ---- Task status updates (approval / cancel notifications) -----------
+        # Verified exactly like requests above (trust, signature, replay all
+        # ran); they update the task row and fire completion callbacks, then
+        # answer with a signed ack so the notifier's transport send() resolves.
+        if envelope.message_type in {
+            "approval_required",
+            "approval_granted",
+            "approval_denied",
+            "task_cancel",
+            "task_cancelled",
+        }:
+            return await self._handle_inbound_status_update(
+                owner_id, envelope, local_agent_id
+            )
+
+        # ---- Capability discovery --------------------------------------------
+        if envelope.message_type == "capability_query":
+            return await self._handle_capability_query(owner_id, envelope)
+
+        # ---- Informational: log, maybe stash, acknowledge --------------------
+        if envelope.message_type == "task_progress":
+            async with self._session_factory() as session:
+                task = await self._tasks.get(session, owner_id, envelope.task_id)
+                if task is not None and not is_terminal_status(task.status):
+                    task.response_payload = envelope.payload
+                    await session.commit()
+            logger.info(
+                "task_progress task=%s sender=%s payload_status=%s",
+                envelope.task_id,
+                envelope.sender,
+                (envelope.payload or {}).get("status"),
+            )
+            return await self._sign_response(
+                envelope,
+                TaskStatus.COMPLETED,
+                {"status": "acknowledged"},
+                message_type="task_response",
+            )
+
+        if envelope.message_type in {"error", "capability_response"}:
+            # Nothing to do locally beyond noting it; the ack keeps the
+            # notifier's transport send() from hanging.
+            logger.info(
+                "inbound_%s task=%s sender=%s payload=%s",
+                envelope.message_type,
+                envelope.task_id,
+                envelope.sender,
+                envelope.payload,
+            )
+            return await self._sign_response(
+                envelope,
+                TaskStatus.COMPLETED,
+                {"status": "acknowledged"},
+                message_type="task_response",
+            )
 
         # ---- Standard Part 6 request flow
         try:
@@ -694,6 +801,116 @@ class A2AService:
             envelope, disclosure.task_status, disclosure.to_payload()
         )
 
+    async def _handle_inbound_status_update(
+        self, owner_id: uuid.UUID, envelope: A2AEnvelope, local_agent_id: str
+    ) -> A2AEnvelope:
+        """Apply an approval/cancel notification to our task row.
+
+        Runs after the full verification pipeline (recipient, trust,
+        signature, time window, replay). Updates the task, fires completion
+        callbacks so waiting orchestrations wake, and returns a signed ack —
+        the notifier's ``transport.send()`` awaits a response envelope, so
+        this must never return None.
+        """
+        async with self._session_factory() as session:
+            task = await self._tasks.get(session, owner_id, envelope.task_id)
+
+        if task is None:
+            logger.warning(
+                "status update for unknown task %s from %s (type=%s)",
+                envelope.task_id,
+                envelope.sender,
+                envelope.message_type,
+            )
+            return await self._sign_response(
+                envelope,
+                TaskStatus.PENDING,
+                {"status": "acknowledged", "task_known": False},
+                message_type="task_response",
+            )
+
+        if envelope.sender not in {task.sender_agent_id, task.recipient_agent_id}:
+            raise A2AError(
+                A2AErrorCode.INVALID_RESPONSE,
+                f"Status update sender {envelope.sender} is not a party to task {envelope.task_id}",
+            )
+
+        if is_terminal_status(task.status):
+            logger.info(
+                "ignoring status update for terminal task %s (status=%s type=%s)",
+                envelope.task_id,
+                task.status,
+                envelope.message_type,
+            )
+            return await self._sign_response(
+                envelope,
+                TaskStatus.COMPLETED,
+                {"status": "acknowledged"},
+                message_type="task_response",
+            )
+
+        message_type = envelope.message_type
+        if message_type == "approval_granted":
+            new_status = TaskStatus.COMPLETED
+        elif message_type == "approval_denied":
+            new_status = TaskStatus.REJECTED
+        elif message_type == "approval_required":
+            new_status = TaskStatus.PENDING_APPROVAL
+        else:  # task_cancel / task_cancelled
+            new_status = TaskStatus.CANCELLED
+
+        payload = envelope.payload or {}
+        failure_reason = payload.get("reason")
+        async with self._session_factory() as session:
+            task.status = new_status.value
+            task.response_payload = payload
+            if new_status in {TaskStatus.REJECTED, TaskStatus.CANCELLED}:
+                task.failure_reason = (
+                    failure_reason if isinstance(failure_reason, str) else None
+                )
+            if new_status is TaskStatus.COMPLETED:
+                task.completed_at = datetime.now(UTC)
+            await self._tasks.upsert(session, task)
+            await session.commit()
+
+        logger.info(
+            "task status updated via %s task=%s new_status=%s",
+            message_type,
+            envelope.task_id,
+            new_status.value,
+        )
+        await self._fire_completion_callbacks(envelope.task_id, payload)
+        return await self._sign_response(
+            envelope,
+            TaskStatus.COMPLETED,
+            {
+                "status": "acknowledged",
+                "task_id": envelope.task_id,
+                "new_status": new_status.value,
+            },
+            message_type="task_response",
+        )
+
+    async def _handle_capability_query(
+        self, owner_id: uuid.UUID, envelope: A2AEnvelope
+    ) -> A2AEnvelope:
+        """Answer a capability_query with this agent's capability catalogue."""
+        catalogue = [
+            spec.to_dict() for spec in self._capabilities.values()
+        ]
+        logger.info(
+            "capability_query answered task=%s sender=%s capabilities=%d",
+            envelope.task_id,
+            envelope.sender,
+            len(catalogue),
+        )
+        return await self._sign_response(
+            envelope,
+            TaskStatus.COMPLETED,
+            {"status": "completed", "capabilities": catalogue},
+            message_type="capability_response",
+        )
+
     async def _handle_information_search(
         self, owner_id: uuid.UUID, envelope: A2AEnvelope
     ) -> A2AEnvelope:
@@ -702,9 +919,6 @@ class A2AService:
         Runs only after policy ALLOW, so the provider is never touched on
         DENY/ASK. The response carries results only, never memory.
         """
-        from app.config.settings import get_settings
-        from app.search import SearchError, get_provider_from_settings
-
         payload = envelope.payload or {}
         query = payload.get("query", "")
         count = payload.get("count", 5)
@@ -828,6 +1042,32 @@ class A2AService:
                 message_type="task_response",
             )
 
+        # Idempotency for retried proposals: a (task_id, round) pair already
+        # processed returns the cached response without re-executing the
+        # handler. The sender stamps the round in the payload (see
+        # TaskDelegationService.negotiate_task); without the stamp a retried
+        # proposal (new message_id) is indistinguishable from a new round and
+        # would desync the round counter.
+        if envelope.message_type == "task_proposal" and existing_task is not None:
+            proposed_round = (envelope.payload or {}).get("a2a_negotiation_round")
+            if (
+                isinstance(proposed_round, int)
+                and proposed_round <= (existing_task.negotiation_round or 0)
+                and existing_task.response_payload
+            ):
+                logger.info(
+                    "duplicate proposal round ignored task=%s round=%s",
+                    envelope.task_id,
+                    proposed_round,
+                )
+                await self._finalize(owner_id, envelope, "accepted", "ALLOW", None)
+                return await self._sign_response(
+                    envelope,
+                    TaskStatus(existing_task.status),
+                    existing_task.response_payload,
+                    message_type="task_response",
+                )
+
         # Negotiation state validation
         if envelope.message_type == "task_proposal":
             if existing_task is None:
@@ -923,13 +1163,27 @@ class A2AService:
             _tool_service=self._tool_service,
         )
 
-        handler_result = await handler.execute(context, envelope.payload)
+        try:
+            handler_result = await handler.execute(context, envelope.payload)
+        except Exception as exc:
+            # Without this the sender hangs until its response timeout: answer
+            # promptly with a signed failure instead, and always finalize the
+            # message record below.
+            logger.exception(
+                "a2a handler failed task=%s type=%s", envelope.task_id, task_type
+            )
+            handler_result = {
+                "status": "failed",
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
 
         final_status = TaskStatus.COMPLETED
         if handler_result.get("status") == "counter_proposal":
             final_status = TaskStatus.ACCEPTED
         elif handler_result.get("status") == "rejected":
             final_status = TaskStatus.REJECTED
+        elif handler_result.get("status") == "failed":
+            final_status = TaskStatus.FAILED
 
         response_payload = {
             "status": final_status.value,
@@ -950,12 +1204,18 @@ class A2AService:
                     request_payload=envelope.payload,
                     response_payload=response_payload,
                     negotiation_round=round_num,
-                    completed_at=datetime.now(timezone.utc) if final_status is TaskStatus.COMPLETED else None,
+                    completed_at=datetime.now(UTC) if final_status is TaskStatus.COMPLETED else None,
                 ),
             )
             await session.commit()
 
-        await self._finalize(owner_id, envelope, "accepted", "ALLOW", None)
+        await self._finalize(
+            owner_id,
+            envelope,
+            "failed" if final_status is TaskStatus.FAILED else "accepted",
+            "ALLOW",
+            None,
+        )
         return await self._sign_response(
             envelope,
             final_status,
@@ -991,17 +1251,24 @@ class A2AService:
         message_type: str = "response",
     ) -> A2AEnvelope:
         local_agent_id = await self.local_agent_id()
+        message_id = new_message_id()
         response = A2AEnvelope(
-            message_id=new_message_id(),
+            message_id=message_id,
             task_id=request.task_id,
             sender=local_agent_id,
             recipient=request.sender,
             timestamp=utc_now_iso(),
             expires_at=utc_iso_in(self._message_ttl),
-            message_type=message_type,
+            message_type=message_type,  # type: ignore[arg-type]
             purpose=request.purpose,
             task_type=request.task_type,
             payload=payload,
+            # Responses join the request's exchange; when the requester never
+            # set one (0.1 peers), derive it deterministically so the gateway
+            # can still group the exchange.
+            correlation_id=request.correlation_id
+            or new_correlation_id(request.task_id, message_id),
+            reply_to=request.message_id,
             trace=trace_context_for_outbound(),
         )
         return await signing.sign_envelope(self._identity, response)
@@ -1044,6 +1311,7 @@ class A2AService:
 
         local_agent_id = await self.local_agent_id()
         task_id = new_task_id()
+        message_id = new_message_id()
         full_payload: dict[str, Any] = {
             "action": action,
             "data_category": data_category,
@@ -1051,7 +1319,7 @@ class A2AService:
         }
 
         request = A2AEnvelope(
-            message_id=new_message_id(),
+            message_id=message_id,
             task_id=task_id,
             sender=local_agent_id,
             recipient=recipient_agent_id,
@@ -1060,6 +1328,7 @@ class A2AService:
             message_type="request",
             purpose=purpose,
             payload=full_payload,
+            correlation_id=new_correlation_id(task_id, message_id),
             trace=trace_context_for_outbound(),
         )
         signed_request = await signing.sign_envelope(self._identity, request)
@@ -1085,11 +1354,14 @@ class A2AService:
             task_id,
             purpose,
         )
-        response_data = await self._transport.send(
-            target_endpoint, signed_request.model_dump()
-        )
-
-        if isinstance(response_data, dict) and response_data.get("status") == "queued":
+        try:
+            response_data = await self._transport.send(
+                target_endpoint, signed_request.model_dump()
+            )
+        except A2AError as exc:
+            if exc.code is not A2AErrorCode.QUEUED:
+                raise
+            # Gateway accepted the envelope for an offline recipient.
             async with self._session_factory() as session:
                 await self._tasks.upsert(
                     session,
@@ -1102,12 +1374,7 @@ class A2AService:
                     ),
                 )
                 await session.commit()
-            return {
-                "task_id": task_id,
-                "recipient": recipient_agent_id,
-                "status": "queued",
-                "relay_id": response_data.get("relay_id"),
-            }
+            raise
 
         # Verify the response envelope.
         try:
@@ -1168,6 +1435,11 @@ class A2AService:
 
     # --------------------------------------------------- TASK DELEGATION (Part 8)
 
+    # --- Task delegation (see app.a2a.delegation) --------------------------------
+    # delegate_task / negotiate_task / approve_task / reject_task / cancel_task /
+    # list_tasks / get_task live on TaskDelegationService. These thin wrappers
+    # keep the public surface stable for existing callers.
+
     async def delegate_task(
         self,
         owner_id: uuid.UUID,
@@ -1179,160 +1451,14 @@ class A2AService:
         endpoint: str | None = None,
     ) -> dict[str, Any]:
         """Delegate a task to a trusted remote agent and await its response."""
-        handler = self._task_registry.get(task_type)
-        if handler is None:
-            raise A2AError(
-                A2AErrorCode.UNSUPPORTED_TASK_TYPE,
-                f"Unsupported task type: {task_type}",
-            )
-        try:
-            handler.validate(payload or {})
-        except ValueError as exc:
-            raise A2AError(A2AErrorCode.INVALID_ENVELOPE, str(exc)) from exc
-
-        async with self._session_factory() as session:
-            recipient = await self._trusted.get(session, owner_id, recipient_agent_id)
-        if recipient is None:
-            raise A2AError(
-                A2AErrorCode.NOT_FOUND,
-                "Recipient is not a registered trusted agent.",
-            )
-        if recipient.status == TrustStatus.REVOKED.value:
-            raise A2AError(
-                A2AErrorCode.REVOKED_SENDER,
-                "Recipient trust has been revoked.",
-            )
-
-        target_endpoint = endpoint or recipient.endpoint
-        validate_endpoint(target_endpoint, allow_local=self._allow_local)
-
-        local_agent_id = await self.local_agent_id()
-        task_id = new_task_id()
-        expires_at_iso = utc_iso_in(self._task_ttl)
-
-        request = A2AEnvelope(
-            message_id=new_message_id(),
-            task_id=task_id,
-            sender=local_agent_id,
-            recipient=recipient_agent_id,
-            timestamp=utc_now_iso(),
-            expires_at=expires_at_iso,
-            message_type="task_request",
+        return await self._delegation.delegate_task(
+            owner_id,
+            recipient_agent_id=recipient_agent_id,
             task_type=task_type,
             purpose=purpose,
-            payload=payload or {},
-            trace=trace_context_for_outbound(),
+            payload=payload,
+            endpoint=endpoint,
         )
-        signed_request = await signing.sign_envelope(self._identity, request)
-
-        # Record outbound task
-        async with self._session_factory() as session:
-            await self._tasks.upsert(
-                session,
-                A2ATask(
-                    owner_id=owner_id,
-                    task_id=task_id,
-                    sender_agent_id=local_agent_id,
-                    recipient_agent_id=recipient_agent_id,
-                    status=TaskStatus.PENDING.value,
-                    task_type=task_type,
-                    purpose=purpose,
-                    request_payload=payload or {},
-                    expires_at=parse_iso(expires_at_iso),
-                ),
-            )
-            await session.commit()
-
-        logger.info(
-            "a2a_task_delegated recipient=%s task=%s type=%s purpose=%s",
-            recipient_agent_id,
-            task_id,
-            task_type,
-            purpose,
-        )
-        response_data = await self._transport.send(
-            target_endpoint, signed_request.model_dump()
-        )
-
-        if isinstance(response_data, dict) and response_data.get("status") == "queued":
-            async with self._session_factory() as session:
-                await self._tasks.upsert(
-                    session,
-                    A2ATask(
-                        owner_id=owner_id,
-                        task_id=task_id,
-                        sender_agent_id=local_agent_id,
-                        recipient_agent_id=recipient_agent_id,
-                        status=TaskStatus.WAITING_REMOTE.value,
-                        task_type=task_type,
-                        purpose=purpose,
-                        request_payload=payload or {},
-                        expires_at=parse_iso(expires_at_iso),
-                    ),
-                )
-                await session.commit()
-            return {
-                "task_id": task_id,
-                "recipient": recipient_agent_id,
-                "status": "queued",
-                "relay_id": response_data.get("relay_id"),
-            }
-
-        try:
-            response = A2AEnvelope.model_validate(response_data)
-        except Exception as exc:
-            raise A2AError(
-                A2AErrorCode.INVALID_RESPONSE,
-                "Remote response failed schema validation.",
-            ) from exc
-
-        if response.sender != recipient_agent_id:
-            raise A2AError(
-                A2AErrorCode.INVALID_RESPONSE,
-                "Response came from a different agent than expected.",
-            )
-        if response.task_id != task_id:
-            raise A2AError(
-                A2AErrorCode.INVALID_RESPONSE,
-                "Response task_id does not match the request.",
-            )
-        if response.message_type not in {"task_response", "response"}:
-            raise A2AError(
-                A2AErrorCode.INVALID_RESPONSE,
-                "Expected a task_response message.",
-            )
-        if not signing.verify_envelope_signature(response, recipient.public_key):
-            raise A2AError(
-                A2AErrorCode.INVALID_RESPONSE,
-                "Response signature verification failed.",
-            )
-
-        resp_status = response.payload.get("status")
-        final_status = TaskStatus.COMPLETED
-        if resp_status == "rejected":
-            final_status = TaskStatus.REJECTED
-        elif resp_status in {"pending_approval", "approval_required"}:
-            final_status = TaskStatus.PENDING_APPROVAL
-        elif resp_status == "counter_proposal":
-            final_status = TaskStatus.ACCEPTED
-
-        async with self._session_factory() as session:
-            await self._tasks.update_status(
-                session,
-                owner_id,
-                task_id,
-                status=final_status.value,
-                response_payload=response.payload,
-                completed_at=datetime.now(timezone.utc) if final_status is TaskStatus.COMPLETED else None,
-            )
-            await session.commit()
-
-        return {
-            "task_id": task_id,
-            "recipient": recipient_agent_id,
-            "status": final_status.value,
-            "payload": response.payload,
-        }
 
     async def negotiate_task(
         self,
@@ -1343,185 +1469,38 @@ class A2AService:
         purpose: str | None = None,
     ) -> dict[str, Any]:
         """Submit a counter-proposal / next negotiation round for an existing task."""
-        async with self._session_factory() as session:
-            task = await self._tasks.get(session, owner_id, task_id)
-        if task is None:
-            raise A2AError(A2AErrorCode.NOT_FOUND, "Task not found.")
-
-        validate_task_active(task)
-        validate_negotiation_round(task.negotiation_round, self._max_negotiation_rounds)
-
-        local_agent_id = await self.local_agent_id()
-        recipient_id = (
-            task.recipient_agent_id
-            if task.sender_agent_id == local_agent_id
-            else task.sender_agent_id
+        return await self._delegation.negotiate_task(
+            owner_id,
+            task_id=task_id,
+            proposal_payload=proposal_payload,
+            purpose=purpose,
         )
-
-        async with self._session_factory() as session:
-            recipient = await self._trusted.get(session, owner_id, recipient_id)
-        if recipient is None:
-            raise A2AError(A2AErrorCode.NOT_FOUND, "Remote agent is not trusted.")
-        if recipient.status == TrustStatus.REVOKED.value:
-            raise A2AError(A2AErrorCode.REVOKED_SENDER, "Remote agent trust revoked.")
-
-        target_endpoint = recipient.endpoint
-        validate_endpoint(target_endpoint, allow_local=self._allow_local)
-
-        round_num = task.negotiation_round + 1
-        request = A2AEnvelope(
-            message_id=new_message_id(),
-            task_id=task.task_id,
-            sender=local_agent_id,
-            recipient=recipient_id,
-            timestamp=utc_now_iso(),
-            expires_at=utc_iso_in(self._task_ttl),
-            message_type="task_proposal",
-            task_type=task.task_type,
-            purpose=purpose or task.purpose or "negotiation",
-            payload=proposal_payload,
-            trace=trace_context_for_outbound(),
-        )
-        signed_request = await signing.sign_envelope(self._identity, request)
-
-        response_data = await self._transport.send(target_endpoint, signed_request.model_dump())
-        try:
-            response = A2AEnvelope.model_validate(response_data)
-        except Exception as exc:
-            raise A2AError(A2AErrorCode.INVALID_RESPONSE, "Invalid response schema.") from exc
-
-        if response.sender != recipient_id or response.task_id != task.task_id:
-            raise A2AError(A2AErrorCode.INVALID_RESPONSE, "Mismatched response.")
-        if not signing.verify_envelope_signature(response, recipient.public_key):
-            raise A2AError(A2AErrorCode.INVALID_RESPONSE, "Response signature invalid.")
-
-        resp_status = response.payload.get("status")
-        final_status = TaskStatus.ACCEPTED
-        if resp_status in {"completed", "accepted"}:
-            final_status = TaskStatus.COMPLETED
-        elif resp_status == "rejected":
-            final_status = TaskStatus.REJECTED
-        elif resp_status in {"pending_approval", "approval_required"}:
-            final_status = TaskStatus.PENDING_APPROVAL
-        elif resp_status == "counter_proposal":
-            final_status = TaskStatus.ACCEPTED
-
-        async with self._session_factory() as session:
-            task.status = final_status.value
-            task.response_payload = response.payload
-            task.negotiation_round = round_num
-            if final_status is TaskStatus.COMPLETED:
-                task.completed_at = datetime.now(timezone.utc)
-            await self._tasks.upsert(session, task)
-            await session.commit()
-
-        return {
-            "task_id": task_id,
-            "recipient": recipient_id,
-            "status": final_status.value,
-            "negotiation_round": round_num,
-            "payload": response.payload,
-        }
 
     async def approve_task(
         self, owner_id: uuid.UUID, task_id: str, notes: str | None = None
     ) -> A2ATask:
         """Manually approve a task in PENDING_APPROVAL and execute it."""
-        async with self._session_factory() as session:
-            task = await self._tasks.get(session, owner_id, task_id)
-        if task is None:
-            raise A2AError(A2AErrorCode.NOT_FOUND, "Task not found.")
-
-        if task.status != TaskStatus.PENDING_APPROVAL.value:
-            raise A2AError(
-                A2AErrorCode.TASK_NOT_PENDING,
-                f"Task is in status '{task.status}', expected '{TaskStatus.PENDING_APPROVAL.value}'.",
-            )
-
-        validate_task_active(task)
-
-        handler = self._task_registry.get(task.task_type or "")
-        if handler is None:
-            raise A2AError(
-                A2AErrorCode.UNSUPPORTED_TASK_TYPE,
-                f"Unsupported task type: {task.task_type}",
-            )
-
-        context = TaskContext(
-            owner_id=owner_id,
-            requester_agent_id=task.sender_agent_id,
-            task_id=task.task_id,
-            purpose=task.purpose or "delegation",
-            disclosure_scope=DisclosureScope.EXACT,
-            _memory_manager=self._memory,
-            _tool_service=self._tool_service,
-        )
-
-        result_payload = await handler.execute(context, task.request_payload or {})
-
-        async with self._session_factory() as session:
-            updated = await self._tasks.update_status(
-                session,
-                owner_id,
-                task_id,
-                status=TaskStatus.COMPLETED.value,
-                response_payload=result_payload,
-                completed_at=datetime.now(timezone.utc),
-            )
-            await session.commit()
-            return updated  # type: ignore[return-value]
+        return await self._delegation.approve_task(owner_id, task_id, notes=notes)
 
     async def reject_task(
         self, owner_id: uuid.UUID, task_id: str, reason: str | None = None
     ) -> A2ATask:
         """Reject a task."""
-        async with self._session_factory() as session:
-            task = await self._tasks.get(session, owner_id, task_id)
-        if task is None:
-            raise A2AError(A2AErrorCode.NOT_FOUND, "Task not found.")
+        return await self._delegation.reject_task(owner_id, task_id, reason=reason)
 
-        async with self._session_factory() as session:
-            updated = await self._tasks.update_status(
-                session,
-                owner_id,
-                task_id,
-                status=TaskStatus.REJECTED.value,
-                failure_reason=reason or "Rejected by owner",
-            )
-            await session.commit()
-            return updated  # type: ignore[return-value]
-
-    async def cancel_task(
-        self, owner_id: uuid.UUID, task_id: str
-    ) -> A2ATask:
+    async def cancel_task(self, owner_id: uuid.UUID, task_id: str) -> A2ATask:
         """Cancel an active task."""
-        async with self._session_factory() as session:
-            task = await self._tasks.get(session, owner_id, task_id)
-        if task is None:
-            raise A2AError(A2AErrorCode.NOT_FOUND, "Task not found.")
-
-        async with self._session_factory() as session:
-            updated = await self._tasks.update_status(
-                session,
-                owner_id,
-                task_id,
-                status=TaskStatus.CANCELLED.value,
-                failure_reason="Cancelled by owner",
-            )
-            await session.commit()
-            return updated  # type: ignore[return-value]
+        return await self._delegation.cancel_task(owner_id, task_id)
 
     async def list_tasks(
         self, owner_id: uuid.UUID, status: str | None = None, limit: int = 100
     ) -> list[A2ATask]:
-        async with self._session_factory() as session:
-            return await self._tasks.list_for_owner(session, owner_id, status=status, limit=limit)
+        return await self._delegation.list_tasks(
+            owner_id, status=status, limit=limit
+        )
 
-    async def get_task(
-        self, owner_id: uuid.UUID, task_id: str
-    ) -> A2ATask | None:
-        async with self._session_factory() as session:
-            return await self._tasks.get(session, owner_id, task_id)
+    async def get_task(self, owner_id: uuid.UUID, task_id: str) -> A2ATask | None:
+        return await self._delegation.get_task(owner_id, task_id)
 
     # ------------------------------------------------------------- AUDIT
 
