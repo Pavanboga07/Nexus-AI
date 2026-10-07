@@ -3,19 +3,21 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.a2a.models import (
     A2AMessageRecord,
     A2ATask,
+    TaskStatus,
     TrustedAgent,
     TrustedAgentCard,
     TrustStatus,
 )
+from app.a2a.negotiation import TERMINAL_TASK_STATUSES
 
 
 class TrustedAgentRepository:
@@ -98,7 +100,7 @@ class TaskRepository:
                 found.negotiation_round = task.negotiation_round
             if task.expires_at is not None:
                 found.expires_at = task.expires_at
-            found.updated_at = datetime.now(timezone.utc)
+            found.updated_at = datetime.now(UTC)
             await session.flush()
             return found
         if task.negotiation_round is None:
@@ -153,9 +155,64 @@ class TaskRepository:
             task.failure_reason = failure_reason
         if completed_at is not None:
             task.completed_at = completed_at
-        task.updated_at = datetime.now(timezone.utc)
+        task.updated_at = datetime.now(UTC)
         await session.flush()
         return task
+
+    async def compare_and_set_status(
+        self,
+        session: AsyncSession,
+        owner_id: uuid.UUID,
+        task_id: str,
+        expected_status: str,
+        *,
+        status: str,
+        response_payload: dict | None = None,
+        failure_reason: str | None = None,
+        completed_at: datetime | None = None,
+    ) -> bool:
+        """Atomically transition a task's status iff it is still ``expected``.
+
+        Returns True when this caller won the race. Used by approve_task's
+        read-execute-write: two concurrent approvals must not both execute the
+        handler and both mark the task COMPLETED.
+        """
+        result = await session.execute(
+            update(A2ATask)
+            .where(
+                A2ATask.owner_id == owner_id,
+                A2ATask.task_id == task_id,
+                A2ATask.status == expected_status,
+            )
+            .values(
+                status=status,
+                response_payload=response_payload,
+                failure_reason=failure_reason,
+                completed_at=completed_at,
+                updated_at=datetime.now(UTC),
+            )
+        )
+        return bool(result.rowcount)
+
+    async def expire_overdue_tasks(
+        self, session: AsyncSession, *, now: datetime | None = None
+    ) -> int:
+        """Flip past-expires_at, non-terminal tasks to EXPIRED.
+
+        Returns the number of tasks transitioned. Terminal tasks are never
+        touched; tasks without an expires_at are left alone.
+        """
+        now = now or datetime.now(UTC)
+        result = await session.execute(
+            update(A2ATask)
+            .where(
+                A2ATask.expires_at.is_not(None),
+                A2ATask.expires_at <= now,
+                A2ATask.status.not_in(TERMINAL_TASK_STATUSES),
+            )
+            .values(status=TaskStatus.EXPIRED.value, updated_at=now)
+        )
+        return int(result.rowcount or 0)
 
 
 class TrustedAgentCardRepository:
@@ -215,7 +272,7 @@ class TrustedAgentCardRepository:
         if not include_expired:
             stmt = stmt.where(
                 (TrustedAgentCard.card_expires_at.is_(None))
-                | (TrustedAgentCard.card_expires_at > datetime.now(timezone.utc))
+                | (TrustedAgentCard.card_expires_at > datetime.now(UTC))
             )
         stmt = stmt.order_by(TrustedAgentCard.verified_at.desc()).limit(limit)
         result = await session.execute(stmt)
@@ -274,7 +331,7 @@ class MessageRecordRepository:
         record.status = status
         record.policy_decision = policy_decision
         record.error_code = error_code
-        record.processed_at = datetime.now(timezone.utc)
+        record.processed_at = datetime.now(UTC)
         await session.flush()
         return record
 

@@ -25,8 +25,8 @@ The card never contains private keys, memory, or policy details.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.a2a.schemas import AGENT_ID_PATTERN, PROTOCOL, PROTOCOL_VERSION
@@ -110,7 +110,7 @@ def build_card(
     dict
         Unsigned card dict.  Pass to ``sign_card()`` to add a signature.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     issued_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
     expires_at = (now + timedelta(seconds=ttl_seconds)).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
@@ -221,12 +221,18 @@ def validate_card_schema(card: dict[str, Any]) -> None:
     # peer that has not upgraded yet can still be discovered. (Exact-equality
     # against PROTOCOL_VERSION would make every 0.1 card undiscoverable the
     # moment we bumped to 0.2.)
+    #
+    # "0.3" is accepted for CARDS (not envelopes): the gateway directory
+    # serves 0.3 cards whose field layout is identical to 0.2 cards. The 0.3
+    # ENVELOPE is a different schema and stays rejected by A2AEnvelope.
     from app.a2a.schemas import SUPPORTED_PROTOCOL_VERSIONS
 
+    SUPPORTED_CARD_VERSIONS = SUPPORTED_PROTOCOL_VERSIONS + ("0.3",)
+
     card_version = card.get("version")
-    if card_version not in SUPPORTED_PROTOCOL_VERSIONS:
+    if card_version not in SUPPORTED_CARD_VERSIONS:
         raise CardValidationError(
-            f"Card version must be one of {SUPPORTED_PROTOCOL_VERSIONS}, "
+            f"Card version must be one of {SUPPORTED_CARD_VERSIONS}, "
             f"got {card_version!r}."
         )
 
@@ -273,12 +279,12 @@ def validate_card_time_window(
     Raises CardValidationError when the card is expired or issued
     too far in the future.
     """
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     issued_at = datetime.strptime(card["issued_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
-        tzinfo=timezone.utc
+        tzinfo=UTC
     )
     expires_at = datetime.strptime(card["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
-        tzinfo=timezone.utc
+        tzinfo=UTC
     )
 
     if expires_at <= now:
